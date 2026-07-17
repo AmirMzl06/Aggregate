@@ -16,13 +16,18 @@ from utils.min_distance import min_l2_distance
 import os
 import numpy as np
 # names = ['buddy']
-names = ['cicero', 'gatsby','buddy', 'achilles']
+names = ['achilles',
+         # 'gatsby',
+         # 'buddy',
+         # 'cicero'
+        ]
 adv =  True
 
 for adv in [True, False]:
     adv_epsilon = 0.5
-    epochs = 2500 if adv else 2500
+    epochs = 1500 if adv else 1500
     for name in names:
+        print(f"rat = {rat} , adv_mode = {adv}")
         
         model = CEBRA(
             batch_size=1024,
@@ -89,24 +94,38 @@ for name in names:
 # names = list(map(str, [False, True]))
 
 
+import os
 import matplotlib.pyplot as plt
+
+os.makedirs("images", exist_ok=True)
+
 fig, axes = plt.subplots(1, 1, figsize=(15, 8))
-# axes = axes.flatten()
 axes = [axes]
+
 model_name = "ACORN" if adv else "CEBRA"
+
 ims = []
 for ax, name in zip(axes, names):
     result = results[name]
     jf = abs(result['jf']).mean(0)
     _, N = jf.shape
-    im = ax.matshow(jf / jf.sum(), aspect="auto", cmap='cividis', )
+
+    im = ax.matshow(
+        jf / jf.sum(),
+        aspect="auto",
+        cmap="cividis",
+    )
     ims.append(im)
     ax.set_title(name)
 
-fig.subplots_adjust(right=0.85, top=0.9)  
-cbar_ax = fig.add_axes([0.88, 0.15, 0.03, 0.7])  
+fig.subplots_adjust(right=0.85, top=0.9)
+cbar_ax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
 fig.colorbar(ims[0], cax=cbar_ax)
 
 fig.suptitle(model_name, fontsize=14)
-plt.savefig(f"{model_name}x.png")
+
+plt.savefig(os.path.join("images", f"{model_name}x.png"),
+            dpi=300,
+            bbox_inches="tight")
+
 plt.show()
