@@ -19,14 +19,6 @@ import numpy as np
 names = ['cicero', 'gatsby','buddy', 'achilles']
 adv =  True
 
-import cebra
-print(cebra.__file__)
-
-import inspect
-from cebra import CEBRA
-
-print(inspect.signature(CEBRA.__init__))
-
 for adv in [True, False]:
     adv_epsilon = 0.5
     epochs = 2500 if adv else 2500
