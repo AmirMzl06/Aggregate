@@ -5,7 +5,7 @@ from typing import Tuple, Dict
 import gdown
 import numpy as np
 
-DATA_DIR = "/data/hossein/data"
+DATA_DIR = "./data""
 CACHE_DIR = "./weights_cache/"
 
 
