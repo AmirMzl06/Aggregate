@@ -83,12 +83,14 @@ for name in names:
     model = CEBRA.load(path, weights_only=False)
     model = model.solver_.model.to(device)
     
+    input_data = train_data.clone().detach().requires_grad_(True)
     method = cebra.attribution.init(
         name="jacobian-based",
         model=model,
-        input_data=torch.from_numpy(train_data).requires_grad_(True),
+        input_data=input_data,
         output_dimension=model.num_output
     )
+    
     result = method.compute_attribution_map()
     results[name] = result
 # names = list(map(str, [False, True]))
