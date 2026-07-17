@@ -3,7 +3,7 @@ if "cebra" in sys.modules:
     del sys.modules["cebra"]
 
 from utils.constants import CEBRA_DIR
-sys.path.append(str(CEBRA_DIR))
+sys.path.insert(0, str(CEBRA_DIR))
 import cebra 
 import itertools
 import torch
