@@ -27,7 +27,7 @@ for adv in [True, False]:
     adv_epsilon = 0.5
     epochs = 1500 if adv else 1500
     for name in names:
-        print(f"rat = {rat} , adv_mode = {adv}")
+        print(f"rat = {name} , adv_mode = {adv}")
         
         model = CEBRA(
             batch_size=1024,
