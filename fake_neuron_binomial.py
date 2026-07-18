@@ -21,8 +21,8 @@ from utils.min_distance import min_l2_distance
 
 names = [
     # 'achilles',
-    'gatsby',
-    'buddy',
+    # 'gatsby',
+    # 'buddy',
     'cicero'
 ]
 
