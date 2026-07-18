@@ -20,10 +20,10 @@ from utils.normalization import normalize_to_target
 from utils.min_distance import min_l2_distance
 
 names = [
-    'achilles',
-    # 'gatsby',
-    # 'buddy',
-    # 'cicero'
+    # 'achilles',
+    'gatsby',
+    'buddy',
+    'cicero'
 ]
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
