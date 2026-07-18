@@ -109,7 +109,11 @@ for name in names:
         jf = abs(result['jf']).mean(0)
         jf_normalized = jf / jf.sum()
         
-        jf_normalized_cpu = jf_normalized.detach().cpu().numpy()
+
+        if hasattr(jf_normalized, 'detach'):
+            jf_normalized_cpu = jf_normalized.detach().cpu().numpy()
+        else:
+            jf_normalized_cpu = np.array(jf_normalized)
         
         fake_jf = jf_normalized_cpu[:, fake_indices] 
         mean_fake_latents = fake_jf.mean(axis=0)
