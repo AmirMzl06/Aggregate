@@ -20,9 +20,9 @@ from utils.normalization import normalize_to_target
 from utils.min_distance import min_l2_distance
 
 names = [
-    # 'achilles',
-    # 'gatsby',
-    # 'buddy',
+    'achilles',
+    'gatsby',
+    'buddy',
     'cicero'
 ]
 
