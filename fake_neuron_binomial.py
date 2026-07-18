@@ -94,17 +94,20 @@ for name in names:
         model = CEBRA.load(path, weights_only=False)
         model = model.solver_.model.to(device)
         
-        input_data = train_data.clone().detach().to(device).requires_grad_(True)
+        input_data = train_data.clone().detach().float().to(device)
+        input_data.requires_grad_(True)
+        
         method = cebra.attribution.init(
-            name="jacobian-based",
+            name="jacobian-based-batched",
             model=model,
             input_data=input_data,
-            output_dimension=model.num_output
+            output_dimension=model.num_output,
+            num_samples=min(2000, len(input_data))
         )
-        
-        print(f"Computing Jacobian Map for {model_name}...")
-        result = method.compute_attribution_map()
 
+        print(f"Computing Jacobian Map for {model_name}...")
+        result = method.compute_attribution_map(batch_size=32)
+        
         # --- 3. Extracting Mean Latents and Plotting ---
         jf = abs(result['jf']).mean(0)
         jf_normalized = jf / jf.sum()
