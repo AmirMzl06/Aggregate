@@ -15,8 +15,8 @@ from cebra import CEBRA
 # -----------------------------
 # Config
 # -----------------------------
-dataset_name = "Mihili_RT_2013_2014_npz"
-target_file = "Mihili_20131207_001_RT.mat.npz"
+dataset_name = "Mihili_CO_2014_npz"
+target_file = "Mihili_20140203_001.mat.npz"
 out_dir = "outputs"
 img_dir = "images"
 
