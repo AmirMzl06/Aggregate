@@ -15,8 +15,8 @@ from cebra import CEBRA
 # -----------------------------
 # Config
 # -----------------------------
-dataset_name = "Chewie_CO_2016_npz"
-target_file = "Chewie_20160927_001.mat.npz"
+dataset_name = "Mihili_RT_2013_2014_npz"
+target_file = "Mihili_20131207_001_RT.mat.npz"
 out_dir = "outputs"
 img_dir = "images"
 
@@ -72,7 +72,7 @@ for adv in [False, True]:
         temperature=0.4,
         model_architecture="offset36-model-more-dropout",
         time_offsets=4,
-        max_iterations=1500,
+        max_iterations=2000,
         output_dimension=48,
         verbose=True,
         training_mode="adversarial" if adv else "clean",
