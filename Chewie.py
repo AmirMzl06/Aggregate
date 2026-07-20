@@ -15,8 +15,12 @@ from cebra import CEBRA
 # -----------------------------
 # Config
 # -----------------------------
-dataset_name = "Jango_ISO_2015_npz"
-target_file = "Jango_20150730_001.mat.npz"
+# dataset_name = "Jango_ISO_2015_npz"
+# target_file = "Jango_20150730_001.mat.npz"
+
+dataset_name = "Mihili_CO_2014_npz"
+target_file = "Mihili_20140203_001.mat.npz"
+
 out_dir = "outputs"
 img_dir = "images"
 
@@ -72,7 +76,7 @@ for adv in [False, True]:
         temperature=0.4,
         model_architecture="offset36-model-more-dropout",
         time_offsets=4,
-        max_iterations=2000,
+        max_iterations=2500,
         output_dimension=48,
         verbose=True,
         training_mode="adversarial" if adv else "clean",
