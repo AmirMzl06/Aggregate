@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
+from utils.min_distance import min_l2_distance
 
 from utils.constants import CEBRA_DIR, DATA_DIR
 from utils.dataset_loader import DatasetLoader
@@ -265,9 +266,9 @@ for adv in [False, True]:
 
     model_name = "ACORN" if adv else "CEBRA"
     print(f"\n==================== Training {model_name} ====================")
-
+    adv_epsilon = min_l2_distance(train_data) / 2
     model = CEBRA(
-        batch_size=1024,
+        batch_size=2048,
         temperature=0.4,
         model_architecture="offset36-model-more-dropout",
         time_offsets=4,
@@ -278,7 +279,8 @@ for adv in [False, True]:
         adv_alpha=adv_ep / 5,
         adv_epsilon=adv_ep,
         adv_steps=10,
-        attack_norm="l2",
+        attack_norm="linf",
+        num_hidden_units=32
     )
 
     model.fit(train_data, train_continuous_label)
@@ -349,7 +351,7 @@ print("=" * 40)
 # -----------------------------
 # Plot and save Jacobians
 # -----------------------------
-fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+fig, axes = plt.subplots(1, 2, figsize=(15, 8)) 
 model_names = ["CEBRA", "ACORN"]
 ims = []
 
@@ -360,27 +362,20 @@ for ax, name in zip(axes, model_names):
 
     n_rows, n_cols = jf.shape
 
-    im = ax.imshow(
+    im = ax.matshow(
         jf,
-        cmap="cividis",
-        interpolation="nearest",
-        aspect="equal",
-        origin="upper",
+        aspect="auto", 
     )
-
     ims.append(im)
 
-    ax.set_title(f"{name}\nR2={r2_results[name]['mean_r2']:.3f}")
-
-    ax.set_xlim(-0.5, n_cols - 0.5)
-    ax.set_ylim(n_rows - 0.5, -0.5)
+    ax.set_title(f"{name}\nR2={r2_results[name]['mean_r2']:.3f}", pad=20) 
 
     ax.set_xlabel(f"Latent Dimension ({n_cols})")
     ax.set_ylabel(f"Neuron ({n_rows})")
 
-fig.subplots_adjust(right=0.88)
+fig.subplots_adjust(right=0.85, top=0.85) 
 
-cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
+cbar_ax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
 fig.colorbar(ims[0], cax=cbar_ax)
 
 safe_target = target_file.replace(".mat.npz", "").replace(".", "_")
@@ -399,6 +394,7 @@ plt.show()
 
 print("Saved figure to:", fig_path)
 print("Decoder scores:", r2_results)
+
 # import os
 # import sys
 # import numpy as np
