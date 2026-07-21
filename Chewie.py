@@ -1,6 +1,7 @@
 import os
 import sys
 import copy
+import gc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,11 +22,11 @@ from cebra import CEBRA
 # Config
 # -----------------------------
 
-dataset_name = "Mihili_RT_2013_2014_npz"
-target_file = "Mihili_20131207_001_RT.mat.npz"
+# dataset_name = "Mihili_RT_2013_2014_npz"
+# target_file = "Mihili_20131207_001_RT.mat.npz"
 
-# dataset_name = "Jango_ISO_2015_npz"
-# target_file = "Jango_20150730_001.mat.npz"
+dataset_name = "Jango_ISO_2015_npz"
+target_file = "Jango_20150730_001.mat.npz"
 
 # dataset_name = "Mihili_CO_2014_npz"
 # target_file = "Mihili_20140203_001.mat.npz"
@@ -88,6 +89,18 @@ def get_embeddings(cebra_model, x_np):
     x_t = torch.from_numpy(x_np).float()
     emb = cebra_model.transform(x_t)
     return to_numpy(emb)
+
+
+def cleanup_cuda(*objs):
+    for obj in objs:
+        try:
+            del obj
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def train_decoder_with_same_arch(
@@ -196,6 +209,15 @@ def train_decoder_with_same_arch(
         test_true = y_test.cpu().numpy()
 
     mean_test_r2, per_dim_r2 = mean_r2_score(test_true, test_preds)
+
+    cleanup_cuda(
+        z_train, z_val, z_test,
+        y_train, y_val, y_test,
+        decoder, optimizer,
+        z_full, y_full,
+        neural_train, neural_val, label_train, label_val
+    )
+
     return decoder, mean_test_r2, per_dim_r2
 
 
@@ -236,6 +258,8 @@ r2_results = {}
 # Train CEBRA / ACORN, decoder, and attribution
 # -----------------------------
 for adv in [False, True]:
+    cleanup_cuda()
+
     model_name = "ACORN" if adv else "CEBRA"
     print(f"\n==================== Training {model_name} ====================")
 
@@ -262,7 +286,12 @@ for adv in [False, True]:
 
     # Attribution
     trained_model = model.solver_.model.to(device)
-    input_tensor = torch.from_numpy(train_data).float().to(device).requires_grad_(True)
+
+    N_ATTR = min(512, len(train_data))
+    attr_idx = np.random.choice(len(train_data), N_ATTR, replace=False)
+    attr_data = train_data[attr_idx]
+
+    input_tensor = torch.from_numpy(attr_data).float().to(device).requires_grad_(True)
 
     output_dim = int(getattr(trained_model, "num_output", 48))
     method = cebra.attribution.init(
@@ -273,6 +302,8 @@ for adv in [False, True]:
     )
     result = method.compute_attribution_map()
     results[model_name] = result
+
+    cleanup_cuda(method, trained_model, input_tensor, attr_data)
 
     # Decoder R2
     print(f"\n--- Training Decoder for {model_name} ---")
@@ -298,6 +329,8 @@ for adv in [False, True]:
 
     print(f"** Final mean R2 Score for {model_name}: {mean_r2:.4f} **")
     print(f"** Per-dimension R2 for {model_name}: {[round(v, 4) for v in per_dim_r2]} **\n")
+
+    cleanup_cuda(model, decoder)
 
 
 # -----------------------------
