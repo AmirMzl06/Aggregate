@@ -43,7 +43,7 @@ os.environ["CEBRA_DATADIR"] = os.path.abspath(DATA_DIR)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = DatasetLoader(data_root_dir=DATA_DIR, cache_dir="./weights_cache/")
-adv_ep = 5
+adv_ep = 15
 
 
 # -----------------------------
