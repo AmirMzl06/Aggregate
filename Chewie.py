@@ -349,34 +349,56 @@ print("=" * 40)
 # -----------------------------
 # Plot and save Jacobians
 # -----------------------------
-fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+fig, axes = plt.subplots(1, 2, figsize=(16, 8))
 model_names = ["CEBRA", "ACORN"]
 ims = []
 
 for ax, name in zip(axes, model_names):
     result = results[name]
     jf = abs(result["jf"]).mean(0)
+    jf = jf / jf.sum()
 
-    im = ax.matshow(
-        jf / jf.sum(),
-        aspect="auto",
+    n_rows, n_cols = jf.shape
+
+    im = ax.imshow(
+        jf,
         cmap="cividis",
+        interpolation="nearest",
+        aspect="equal",
+        origin="upper",
     )
+
     ims.append(im)
+
     ax.set_title(f"{name}\nR2={r2_results[name]['mean_r2']:.3f}")
 
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_ylim(n_rows - 0.5, -0.5)
+
+    ax.set_xlabel(f"Latent Dimension ({n_cols})")
+    ax.set_ylabel(f"Neuron ({n_rows})")
+
 fig.subplots_adjust(right=0.88)
+
 cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
 fig.colorbar(ims[0], cax=cbar_ax)
 
 safe_target = target_file.replace(".mat.npz", "").replace(".", "_")
-fig_path = os.path.join(img_dir, f"{safe_target}_CEBRA_vs_ACORN.png")
-plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+fig_path = os.path.join(
+    img_dir,
+    f"{safe_target}_CEBRA_vs_ACORN.png",
+)
+
+plt.savefig(
+    fig_path,
+    dpi=300,
+    bbox_inches="tight",
+)
+
 plt.show()
 
 print("Saved figure to:", fig_path)
 print("Decoder scores:", r2_results)
-
 # import os
 # import sys
 # import numpy as np
