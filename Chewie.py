@@ -12,6 +12,7 @@ from sklearn.model_selection import train_test_split
 from utils.constants import CEBRA_DIR, DATA_DIR
 from utils.dataset_loader import DatasetLoader
 
+# اول مسیر CEBRA خودت را اضافه کن، بعد import cebra
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 from cebra import CEBRA
@@ -36,7 +37,7 @@ adv_ep = 5
 
 
 # -----------------------------
-# Same TwoLayerMLP architecture as the repo
+# Local TwoLayerMLP (no extra import)
 # -----------------------------
 class TwoLayerMLP(nn.Module):
     def __init__(self, input_dim=32, hidden_dim=64, output_dim=2, dropout_rate=0.4):
@@ -49,7 +50,6 @@ class TwoLayerMLP(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
         self._initialize_weights()
-        self.random_id = np.random.randint(0, 1000)
 
     def _initialize_weights(self):
         for layer in self.net:
@@ -80,10 +80,7 @@ def mean_r2_score(y_true, y_pred):
 
 def get_embeddings(cebra_model, x_np):
     x_t = torch.from_numpy(x_np).float()
-    try:
-        emb = cebra_model.transform(x_t)
-    except Exception:
-        emb = cebra_model.transform(x_np)
+    emb = cebra_model.transform(x_t)
     return to_numpy(emb)
 
 
@@ -165,8 +162,8 @@ def train_decoder_with_same_arch(
 
         if (epoch + 1) % 2000 == 0:
             print(
-                f"Decoder Epoch [{epoch + 1}/{decoder_iters}], "
-                f"Loss: {loss.item():.4f}, Val R2: {current_r2:.4f}"
+                f"Decoder Epoch [{epoch + 1}/{decoder_iters}] | "
+                f"Loss: {loss.item():.4f} | Val R2: {current_r2:.4f}"
             )
 
     decoder.load_state_dict(best_decoder_state)
@@ -197,7 +194,7 @@ def train_decoder_with_same_arch(
 
 
 # -----------------------------
-# Find the exact file index
+# Find the exact day index for the file
 # -----------------------------
 dataset_dir = os.path.join(DATA_DIR, dataset_name)
 files = sorted(os.listdir(dataset_dir))
@@ -220,16 +217,11 @@ else:
     y_cebra = y_np.reshape(-1, 1)
 
 split_idx = int(0.8 * len(x_np))
-train_data = x_np[:split_idx]
-valid_data = x_np[split_idx:]
+train_data = x_np[:split_idx].astype(np.float32)
+valid_data = x_np[split_idx:].astype(np.float32)
 
-train_continuous_label = y_cebra[:split_idx]
-valid_continuous_label = y_cebra[split_idx:]
-
-train_data = train_data.astype(np.float32)
-train_continuous_label = train_continuous_label.astype(np.float32)
-valid_data = valid_data.astype(np.float32)
-valid_continuous_label = valid_continuous_label.astype(np.float32)
+train_continuous_label = y_cebra[:split_idx].astype(np.float32)
+valid_continuous_label = y_cebra[split_idx:].astype(np.float32)
 
 results = {}
 r2_results = {}
@@ -281,9 +273,9 @@ for adv in [False, True]:
     decoder, mean_r2, per_dim_r2 = train_decoder_with_same_arch(
         cebra_model=model,
         train_x_np=train_data,
-        train_y_np=y_np[:split_idx],   # full labels for decoder
+        train_y_np=y_np[:split_idx].astype(np.float32),
         test_x_np=valid_data,
-        test_y_np=y_np[split_idx:],
+        test_y_np=y_np[split_idx:].astype(np.float32),
         input_dim=48,
         hidden_dim=64,
         dropout_rate=0.4,
