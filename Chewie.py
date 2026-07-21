@@ -276,8 +276,8 @@ for adv in [False, True]:
         output_dimension=48,
         verbose=True,
         training_mode="adversarial" if adv else "clean",
-        adv_alpha=adv_ep / 5,
-        adv_epsilon=adv_ep,
+        adv_alpha=adv_epsilon / 5,
+        adv_epsilon=adv_epsilon,
         adv_steps=10,
         attack_norm="linf",
         num_hidden_units=32
