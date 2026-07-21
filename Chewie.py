@@ -12,7 +12,6 @@ from sklearn.model_selection import train_test_split
 from utils.constants import CEBRA_DIR, DATA_DIR
 from utils.dataset_loader import DatasetLoader
 
-# اول مسیر CEBRA خودت را اضافه کن، بعد import cebra
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 from cebra import CEBRA
@@ -20,9 +19,11 @@ from cebra import CEBRA
 
 # -----------------------------
 # Config
-# -----------------------------
-dataset_name = "Mihili_CO_2014_npz"
-target_file = "Mihili_20140203_001.mat.npz"
+-----------------------------
+dataset_name = "Jango_ISO_2015_npz"
+target_file = "Jango_20150730_001.mat.npz"
+# dataset_name = "Mihili_CO_2014_npz"
+# target_file = "Mihili_20140203_001.mat.npz"
 
 out_dir = "outputs"
 img_dir = "images"
