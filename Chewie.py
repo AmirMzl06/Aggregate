@@ -77,7 +77,7 @@ for adv in [False, True]:
         temperature=0.4,
         model_architecture="offset36-model-more-dropout",
         time_offsets=4,
-        max_iterations=3000,
+        max_iterations=2500,
         output_dimension=48,
         verbose=True,
         training_mode="adversarial" if adv else "clean",
