@@ -3,40 +3,201 @@ import sys
 import copy
 import numpy as np
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
+
 from sklearn.metrics import r2_score
+from sklearn.model_selection import train_test_split
 
 from utils.constants import CEBRA_DIR, DATA_DIR
 from utils.dataset_loader import DatasetLoader
-from utils.cebra_decoder import TwoLayerMLP
 
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 from cebra import CEBRA
 
+
 # -----------------------------
 # Config
 # -----------------------------
-# dataset_name = "Jango_ISO_2015_npz"
-# target_file = "Jango_20150730_001.mat.npz"
-
 dataset_name = "Mihili_CO_2014_npz"
 target_file = "Mihili_20140203_001.mat.npz"
 
 out_dir = "outputs"
 img_dir = "images"
-
 os.makedirs(out_dir, exist_ok=True)
 os.makedirs(img_dir, exist_ok=True)
 
 os.environ["CEBRA_DATADIR"] = os.path.abspath(DATA_DIR)
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = DatasetLoader(data_root_dir=DATA_DIR, cache_dir="./weights_cache/")
-
 adv_ep = 5
 
+
 # -----------------------------
-# Find the exact day index for the file
+# Same TwoLayerMLP architecture as the repo
+# -----------------------------
+class TwoLayerMLP(nn.Module):
+    def __init__(self, input_dim=32, hidden_dim=64, output_dim=2, dropout_rate=0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self._initialize_weights()
+        self.random_id = np.random.randint(0, 1000)
+
+    def _initialize_weights(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def mean_r2_score(y_true, y_pred):
+    scores = []
+    for i in range(y_true.shape[1]):
+        scores.append(r2_score(y_true[:, i], y_pred[:, i]))
+    return float(np.mean(scores)), scores
+
+
+def get_embeddings(cebra_model, x_np):
+    x_t = torch.from_numpy(x_np).float()
+    try:
+        emb = cebra_model.transform(x_t)
+    except Exception:
+        emb = cebra_model.transform(x_np)
+    return to_numpy(emb)
+
+
+def train_decoder_with_same_arch(
+    cebra_model,
+    train_x_np,
+    train_y_np,
+    test_x_np,
+    test_y_np,
+    input_dim,
+    hidden_dim=64,
+    dropout_rate=0.4,
+    decoder_iters=10000,
+):
+    neural_train, neural_val, label_train, label_val = train_test_split(
+        train_x_np,
+        train_y_np,
+        test_size=0.125,
+        random_state=42,
+        shuffle=False,
+    )
+
+    z_train = torch.from_numpy(get_embeddings(cebra_model, neural_train)).float().to(device)
+    z_val = torch.from_numpy(get_embeddings(cebra_model, neural_val)).float().to(device)
+    z_test = torch.from_numpy(get_embeddings(cebra_model, test_x_np)).float().to(device)
+
+    y_train = torch.from_numpy(label_train).float().to(device)
+    y_val = torch.from_numpy(label_val).float().to(device)
+    y_test = torch.from_numpy(test_y_np).float().to(device)
+
+    decoder = TwoLayerMLP(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        output_dim=y_train.shape[1],
+        dropout_rate=dropout_rate,
+    ).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
+
+    initial_state = copy.deepcopy(decoder.state_dict())
+
+    best_r2 = -1e18
+    best_epoch = 1
+    best_decoder_state = copy.deepcopy(decoder.state_dict())
+
+    patience = 1000
+    bad_epochs = 0
+    min_epochs = 4000
+
+    # Phase 1: early stopping on validation
+    for epoch in range(decoder_iters):
+        decoder.train()
+        optimizer.zero_grad()
+        outputs = decoder(z_train)
+        loss = criterion(outputs, y_train)
+        loss.backward()
+        optimizer.step()
+
+        decoder.eval()
+        with torch.no_grad():
+            val_preds = decoder(z_val).cpu().numpy()
+            val_true = y_val.cpu().numpy()
+
+        current_r2, _ = mean_r2_score(val_true, val_preds)
+
+        if current_r2 > best_r2:
+            best_r2 = current_r2
+            best_epoch = epoch + 1
+            bad_epochs = 0
+            best_decoder_state = copy.deepcopy(decoder.state_dict())
+        else:
+            if epoch > min_epochs - patience:
+                bad_epochs += 1
+
+        if bad_epochs >= patience:
+            print(f"Early stopping decoder at epoch {epoch + 1}")
+            break
+
+        if (epoch + 1) % 2000 == 0:
+            print(
+                f"Decoder Epoch [{epoch + 1}/{decoder_iters}], "
+                f"Loss: {loss.item():.4f}, Val R2: {current_r2:.4f}"
+            )
+
+    decoder.load_state_dict(best_decoder_state)
+
+    # Phase 2: retrain on train+val for best_epoch
+    z_full = torch.cat([z_train, z_val], dim=0)
+    y_full = torch.cat([y_train, y_val], dim=0)
+
+    decoder.load_state_dict(initial_state)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
+
+    for _ in range(best_epoch):
+        decoder.train()
+        optimizer.zero_grad()
+        outputs = decoder(z_full)
+        loss = criterion(outputs, y_full)
+        loss.backward()
+        optimizer.step()
+
+    # Final test R2
+    decoder.eval()
+    with torch.no_grad():
+        test_preds = decoder(z_test).cpu().numpy()
+        test_true = y_test.cpu().numpy()
+
+    mean_test_r2, per_dim_r2 = mean_r2_score(test_true, test_preds)
+    return decoder, mean_test_r2, per_dim_r2
+
+
+# -----------------------------
+# Find the exact file index
 # -----------------------------
 dataset_dir = os.path.join(DATA_DIR, dataset_name)
 files = sorted(os.listdir(dataset_dir))
@@ -52,26 +213,25 @@ x_np, y_np = loader.load_dataset_day(day_idx, dataset_name, cache=True)
 print("x shape:", x_np.shape)
 print("y shape:", y_np.shape)
 
+# CEBRA labels: first 2 dims
 if y_np.ndim > 1 and y_np.shape[1] >= 2:
-    y_np = y_np[:, :2]
+    y_cebra = y_np[:, :2]
 else:
-    y_np = y_np.reshape(-1, 1)
+    y_cebra = y_np.reshape(-1, 1)
 
 split_idx = int(0.8 * len(x_np))
 train_data = x_np[:split_idx]
 valid_data = x_np[split_idx:]
 
-train_continuous_label = y_np[:split_idx]
-valid_continuous_label = y_np[split_idx:]
+train_continuous_label = y_cebra[:split_idx]
+valid_continuous_label = y_cebra[split_idx:]
 
-# -----------------------------
-# Train + Jacobian + Decoder for clean/adv
-# -----------------------------
 results = {}
-r2_results = {}  # برای ذخیره نتایج R2 هر مدل
+r2_results = {}
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+# -----------------------------
+# Train CEBRA / ACORN, decoder, and attribution
+# -----------------------------
 for adv in [False, True]:
     model_name = "ACORN" if adv else "CEBRA"
     print(f"\n==================== Training {model_name} ====================")
@@ -97,99 +257,60 @@ for adv in [False, True]:
     model.save(save_path)
     print("Saved model to:", save_path)
 
-    # load trained model for attribution
-    loaded = CEBRA.load(save_path, weights_only=False)
-    trained_model = loaded.solver_.model.to("cuda")
+    # Attribution
+    trained_model = model.solver_.model.to(device)
+    input_tensor = torch.from_numpy(train_data).float().to(device).requires_grad_(True)
 
+    output_dim = int(getattr(trained_model, "num_output", 48))
     method = cebra.attribution.init(
         name="jacobian-based",
         model=trained_model,
-        input_data=torch.from_numpy(train_data).float().requires_grad_(True),
-        output_dimension=trained_model.num_output,
+        input_data=input_tensor,
+        output_dimension=output_dim,
     )
-
     result = method.compute_attribution_map()
     results[model_name] = result
 
-    # -------------------------------------------------------------
-    # -------------------------------------------------------------
+    # Decoder R2
     print(f"\n--- Training Decoder for {model_name} ---")
-    
-    z_train = model.transform(train_data)
-    z_valid = model.transform(valid_data)
-    
-    X_train_t = torch.from_numpy(z_train).float().to(device)
-    Y_train_t = torch.from_numpy(train_continuous_label).float().to(device)
-    X_valid_t = torch.from_numpy(z_valid).float().to(device)
-    Y_valid_t = torch.from_numpy(valid_continuous_label).float().to(device)
-    
-    decoder = TwoLayerMLP(
-        input_dim=model.output_dimension, 
-        hidden_dim=64, 
-        output_dim=train_continuous_label.shape[1],
-        dropout_rate=0.4
-    ).to(device)
-    
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=0.001, weight_decay=2e-4)
-    
-    best_r2 = -1e9
-    patience = 1000
-    bad_epochs = 0
-    min_epochs = 4000
-    best_decoder_state = None
-    
-    for epoch in range(10000):
-        decoder.train()
-        optimizer.zero_grad()
-        outputs = decoder(X_train_t)
-        loss = criterion(outputs, Y_train_t)
-        loss.backward()
-        optimizer.step()
-        
-        decoder.eval()
-        with torch.no_grad():
-            val_preds = decoder(X_valid_t).cpu().numpy()
-            val_true = Y_valid_t.cpu().numpy()
-            
-            r2_scores = [r2_score(val_true[:, i], val_preds[:, i]) for i in range(val_true.shape[1])]
-            current_r2 = sum(r2_scores) / len(r2_scores)
-            
-        if current_r2 > best_r2:
-            best_r2 = current_r2
-            bad_epochs = 0
-            best_decoder_state = copy.deepcopy(decoder.state_dict())
-        else:
-            if epoch > min_epochs - patience:
-                bad_epochs += 1
-                
-        if bad_epochs >= patience:
-            print(f"Early stopping decoder at epoch {epoch + 1}")
-            break
-            
-        if (epoch + 1) % 2000 == 0:
-            print(f"Epoch [{epoch + 1}/10000], Loss: {loss.item():.4f}, Val R2: {current_r2:.4f}")
-            
-    if best_decoder_state is not None:
-        decoder.load_state_dict(best_decoder_state)
-    
-    print(f"** Final R2 Score for {model_name}: {best_r2:.4f} **\n")
-    r2_results[model_name] = best_r2
+    decoder, mean_r2, per_dim_r2 = train_decoder_with_same_arch(
+        cebra_model=model,
+        train_x_np=train_data,
+        train_y_np=y_np[:split_idx],   # full labels for decoder
+        test_x_np=valid_data,
+        test_y_np=y_np[split_idx:],
+        input_dim=48,
+        hidden_dim=64,
+        dropout_rate=0.4,
+        decoder_iters=10000,
+    )
+
+    r2_results[model_name] = {
+        "mean_r2": mean_r2,
+        "per_dim_r2": per_dim_r2,
+    }
+
+    decoder_save_path = os.path.join(out_dir, f"decoder_{model_name}_{target_file}.pth")
+    torch.save(decoder.state_dict(), decoder_save_path)
+
+    print(f"** Final mean R2 Score for {model_name}: {mean_r2:.4f} **")
+    print(f"** Per-dimension R2 for {model_name}: {[round(v, 4) for v in per_dim_r2]} **\n")
+
 
 # -----------------------------
-# Print R2 Comparison Summary
+# Print R2 summary
 # -----------------------------
-print("\n" + "="*40)
+print("\n" + "=" * 40)
 print(" SUMMARY OF R2 SCORES ".center(40, "="))
-print("="*40)
-for name, score in r2_results.items():
-    print(f" Model: {name:<6} | R2 Score: {score:.4f}")
-print("="*40)
+print("=" * 40)
+for name, scores in r2_results.items():
+    print(f" Model: {name:<6} | Mean R2: {scores['mean_r2']:.4f}")
+print("=" * 40)
 
 # -----------------------------
-# Plot and save in images/
+# Plot and save Jacobians
 # -----------------------------
-fig, axes = plt.subplots(1, 2, figsize=(18,8))
+fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 model_names = ["CEBRA", "ACORN"]
 ims = []
 
@@ -200,26 +321,22 @@ for ax, name in zip(axes, model_names):
     im = ax.matshow(
         jf / jf.sum(),
         aspect="auto",
-        cmap="cividis"
+        cmap="cividis",
     )
-
     ims.append(im)
-    ax.set_title(name)
+    ax.set_title(f"{name}\nR2={r2_results[name]['mean_r2']:.3f}")
 
 fig.subplots_adjust(right=0.88)
-cbar_ax = fig.add_axes([0.90,0.15,0.02,0.7])
+cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
 fig.colorbar(ims[0], cax=cbar_ax)
 
-plt.savefig(
-    os.path.join(
-        img_dir,
-        "Chewie_20160927_CEBRA_vs_ACORN.png"
-    ),
-    dpi=300,
-    bbox_inches="tight"
-)
-
+safe_target = target_file.replace(".mat.npz", "").replace(".", "_")
+fig_path = os.path.join(img_dir, f"{safe_target}_CEBRA_vs_ACORN.png")
+plt.savefig(fig_path, dpi=300, bbox_inches="tight")
 plt.show()
+
+print("Saved figure to:", fig_path)
+print("Decoder scores:", r2_results)
 
 # import os
 # import sys
