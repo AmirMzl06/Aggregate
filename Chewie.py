@@ -220,11 +220,10 @@ else:
     y_cebra = y_np.reshape(-1, 1)
 
 split_idx = int(0.8 * len(x_np))
-train_data = x_np[:split_idx]
-valid_data = x_np[split_idx:]
-
-train_continuous_label = y_cebra[:split_idx]
-valid_continuous_label = y_cebra[split_idx:]
+train_data = train_data.astype(np.float32)
+train_continuous_label = train_continuous_label.astype(np.float32)
+valid_data = valid_data.astype(np.float32)
+valid_continuous_label = valid_continuous_label.astype(np.float32)
 
 results = {}
 r2_results = {}
