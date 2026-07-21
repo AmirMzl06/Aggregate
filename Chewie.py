@@ -19,7 +19,7 @@ from cebra import CEBRA
 
 # -----------------------------
 # Config
------------------------------
+# -----------------------------
 dataset_name = "Jango_ISO_2015_npz"
 target_file = "Jango_20150730_001.mat.npz"
 # dataset_name = "Mihili_CO_2014_npz"
