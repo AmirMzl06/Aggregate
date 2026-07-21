@@ -28,7 +28,7 @@ names = [
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-NUM_FAKE_NEURONS = 5
+NUM_FAKE_NEURONS = 0
 
 for name in names:
     print(f"\n========== Processing Rat: {name} ==========")
@@ -64,8 +64,8 @@ for name in names:
     # --- 2. Train & Evaluate for both Clean and Adversarial ---
     for adv in [False, True]:
         model_name = "ACORN" if adv else "CEBRA"
-        adv_epsilon = 0.5
-        epochs = 1500
+        adv_epsilon = 5
+        epochs = 2500
 
         print(f"\n--- Training {model_name} (adv = {adv}) ---")
         
