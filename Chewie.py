@@ -31,6 +31,7 @@ os.environ["CEBRA_DATADIR"] = os.path.abspath(DATA_DIR)
 
 loader = DatasetLoader(data_root_dir=DATA_DIR, cache_dir="./weights_cache/")
 
+adv_ep = 5
 
 # -----------------------------
 # Find the exact day index for the file
@@ -80,8 +81,8 @@ for adv in [False, True]:
         output_dimension=48,
         verbose=True,
         training_mode="adversarial" if adv else "clean",
-        adv_alpha=0.5 / 5,
-        adv_epsilon=0.5,
+        adv_alpha=adv_ep / 5,
+        adv_epsilon=adv_ep,
         adv_steps=10,
         attack_norm="l2",
     )
