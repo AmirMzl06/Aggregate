@@ -21,11 +21,11 @@ from cebra import CEBRA
 # 1. Synthetic Data Config & Generation Functions
 # -----------------------------
 T = 100_000  
-D1 = 24
-D2 = 24
+D1 = 2
+D2 = 2
 D_LATENT = D1 + D2
-N1 = 24
-N2 = 24
+N1 = 3
+N2 = 3
 D_OBS = N1 + N2 
 N_MLP_LAYERS = 4
 SIGMA_EPS = 0.03
@@ -150,7 +150,7 @@ for adv in [False, True]:
         model_architecture="offset36-model-more-dropout",
         time_offsets=4,
         max_iterations=2500,
-        output_dimension=48,
+        output_dimension=4,
         verbose=True,
         training_mode="adversarial" if adv else "clean",
         adv_alpha=adv_epsilon / 5,
