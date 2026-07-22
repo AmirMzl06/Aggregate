@@ -323,31 +323,31 @@ for method_name in ["jf", "jfinv", "jfconvabsinv"]:
         f"adv={adv_pack['auc'][method_name]:.2f}"
     )
 
-# Save heatmaps
-save_heatmaps("clean", clean_pack, clean_pack["auc"])
-save_heatmaps("adv", adv_pack, adv_pack["auc"])
+# # Save heatmaps
+# save_heatmaps("clean", clean_pack, clean_pack["auc"])
+# save_heatmaps("adv", adv_pack, adv_pack["auc"])
 
-# Save AUROC bar plot
-methods = ["jf", "jfinv", "jfconvabsinv"]
-x = np.arange(len(methods))
-width = 0.35
+# # Save AUROC bar plot
+# methods = ["jf", "jfinv", "jfconvabsinv"]
+# x = np.arange(len(methods))
+# width = 0.35
 
-fig, ax = plt.subplots(figsize=(9, 5))
-ax.bar(x - width / 2, [clean_pack["auc"][m] for m in methods], width, label="clean")
-ax.bar(x + width / 2, [adv_pack["auc"][m] for m in methods], width, label="adv")
+# fig, ax = plt.subplots(figsize=(9, 5))
+# ax.bar(x - width / 2, [clean_pack["auc"][m] for m in methods], width, label="clean")
+# ax.bar(x + width / 2, [adv_pack["auc"][m] for m in methods], width, label="adv")
 
-ax.set_xticks(x)
-ax.set_xticklabels(methods)
-ax.set_ylim(0.0, 1.0)
-ax.set_ylabel("ROC AUC")
-ax.set_title("RatInABox AUROC: clean vs adv")
-ax.legend()
+# ax.set_xticks(x)
+# ax.set_xticklabels(methods)
+# ax.set_ylim(0.0, 1.0)
+# ax.set_ylabel("ROC AUC")
+# ax.set_title("RatInABox AUROC: clean vs adv")
+# ax.legend()
 
-auc_path = IMG_DIR / "ratinabox_auc_clean_vs_adv.png"
-plt.savefig(auc_path, dpi=300, bbox_inches="tight")
-plt.show()
+# auc_path = IMG_DIR / "ratinabox_auc_clean_vs_adv.png"
+# plt.savefig(auc_path, dpi=300, bbox_inches="tight")
+# plt.show()
 
-print(f"Saved AUROC plot: {auc_path}")
+# print(f"Saved AUROC plot: {auc_path}")
 
-cleanup(clean_solver, adv_solver, clean_model, adv_model, clean_pack, adv_pack)
-print("Done.")
+# cleanup(clean_solver, adv_solver, clean_model, adv_model, clean_pack, adv_pack)
+# print("Done.")
