@@ -12,7 +12,11 @@ import matplotlib.pyplot as plt
 from cebra.data import DatasetxCEBRA, ContrastiveMultiObjectiveLoader
 from cebra.solver import MultiObjectiveConfig
 from cebra.solver.schedulers import LinearRampUp
+
+
+sys.path.insert(0, str(CEBRA_DIR))
 import cebra
+from cebra import CEBRA
 
 from utils.min_distance import min_l2_distance
 
