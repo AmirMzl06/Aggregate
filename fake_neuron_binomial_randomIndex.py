@@ -43,7 +43,12 @@ datasets = [
     # ("Jango_ISO_2015_npz", "Jango_20150806_001.mat.npz"),
     # ("Jango_ISO_2015_npz", "Jango_20150807_001.mat.npz"),
     # ("Jango_ISO_2015_npz", "Jango_20150808_001.mat.npz"),
-    # ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz")
+    # ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140211_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140217_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140218_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140225_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140227_001.mat.npz"),
 ]
 
 out_dir = "outputs"
