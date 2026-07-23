@@ -25,9 +25,14 @@ from cebra import CEBRA
 # -----------------------------
 datasets = [
     ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz"),
-    ("Mihili_RT_2013_2014_npz", "Mihili_20131207_001_RT.mat.npz"),
-    ("Jango_ISO_2015_npz", "Jango_20150730_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz")
+    ("Chewie_CO_2016_npz", "Chewie_20160928_001.mat.npz"),
+    ("Chewie_CO_2016_npz", "Chewie_20160929_001.mat.npz"),
+    ("Chewie_CO_2016_npz", "Chewie_20160930_001.mat.npz"),
+    ("Chewie_CO_2016_npz", "Chewie_20161006_001.mat.npz"),
+    ("Chewie_CO_2016_npz", "Chewie_20161007_001.mat.npz"),
+    # ("Mihili_RT_2013_2014_npz", "Mihili_20131207_001_RT.mat.npz"),
+    # ("Jango_ISO_2015_npz", "Jango_20150730_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz")
 ]
 
 out_dir = "outputs"
@@ -41,7 +46,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = DatasetLoader(data_root_dir=DATA_DIR, cache_dir="./weights_cache/")
 adv_ep = 5
 
-NUM_FAKE_NEURONS = 40
+NUM_FAKE_NEURONS = 0
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
