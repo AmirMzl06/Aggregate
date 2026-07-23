@@ -24,7 +24,7 @@ from cebra import CEBRA
 # Config
 # -----------------------------
 datasets = [
-    # ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz"),
+    ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz"),
     # ("Chewie_CO_2016_npz", "Chewie_20160928_001.mat.npz"),
     # ("Chewie_CO_2016_npz", "Chewie_20160929_001.mat.npz"),
     # ("Chewie_CO_2016_npz", "Chewie_20160930_001.mat.npz"),
@@ -43,12 +43,12 @@ datasets = [
     # ("Jango_ISO_2015_npz", "Jango_20150806_001.mat.npz"),
     # ("Jango_ISO_2015_npz", "Jango_20150807_001.mat.npz"),
     # ("Jango_ISO_2015_npz", "Jango_20150808_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140211_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140217_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140218_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140225_001.mat.npz"),
-    ("Mihili_CO_2014_npz", "Mihili_20140227_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140211_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140217_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140218_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140225_001.mat.npz"),
+    # ("Mihili_CO_2014_npz", "Mihili_20140227_001.mat.npz"),
 ]
 
 out_dir = "outputs"
@@ -370,13 +370,22 @@ for dataset_name, target_file in datasets:
             input_data=input_tensor,
             output_dimension=output_dim,
         )
-        result = method.compute_attribution_map()
+        # result = method.compute_attribution_map()
 
-        jf_cpu = result["jf"].detach().cpu() if torch.is_tensor(result["jf"]) else torch.tensor(result["jf"])
-        results[model_name] = {"jf": jf_cpu}
+        # jf_cpu = result["jf"].detach().cpu() if torch.is_tensor(result["jf"]) else torch.tensor(result["jf"])
+        # results[model_name] = {"jf": jf_cpu}
+        result = method.compute_attribution_map()
+        jf_inv_cpu = (
+            result["jf-inv-svd"].detach().cpu()
+            if torch.is_tensor(result["jf-inv-svd"])
+            else torch.tensor(result["jf-inv-svd"])
+        )        
+        results[model_name] = {"jf": jf_inv_cpu}
+
 
         if NUM_FAKE_NEURONS > 0:
-            jf_normalized = torch.abs(jf_cpu).mean(0)
+            # jf_normalized = torch.abs(jf_cpu).mean(0)
+            jf_normalized = torch.abs(jf_inv_cpu).mean(0)
             jf_normalized = jf_normalized / jf_normalized.sum()
             jf_normalized_cpu = jf_normalized.detach().cpu().numpy()
 
