@@ -381,7 +381,7 @@ for dataset_name, target_file in datasets:
         jfinv_tensor = torch.tensor(jfinv) if not torch.is_tensor(jfinv) else jfinv.detach().cpu()
         results[model_name] = {"jf-inv": jfinv_tensor}
 
-         if NUM_FAKE_NEURONS > 0:
+        if NUM_FAKE_NEURONS > 0:
             jfinv_mean = torch.abs(jfinv_tensor).mean(0)
             jfinv_normalized = jfinv_mean / jfinv_mean.sum()
             jfinv_normalized_cpu = jfinv_normalized.numpy()
