@@ -457,20 +457,22 @@ for dataset_name, target_file in datasets:
     # -----------------------------
     # Plot and save Jacobians
     # -----------------------------
+
     fig, axes = plt.subplots(1, 2, figsize=(15, 8))
     model_names = ["CEBRA", "ACORN"]
     ims = []
 
     for ax, name in zip(axes, model_names):
         result = results[name]
-        jf = torch.abs(result["jf"]).mean(0)
-        jf = jf / jf.sum()
-        jf = jf.detach().cpu().numpy()
+        
+        jfinv = torch.abs(result["jf-inv"]).mean(0)
+        jfinv = jfinv / jfinv.sum()
+        jfinv_np = jfinv.numpy()
 
-        n_rows, n_cols = jf.shape
+        n_rows, n_cols = jfinv_np.shape 
 
         im = ax.matshow(
-            jf,
+            jfinv_np,
             aspect="auto",
         )
         ims.append(im)
@@ -482,7 +484,35 @@ for dataset_name, target_file in datasets:
 
         if NUM_FAKE_NEURONS > 0:
             for global_idx in fake_indices:
-                ax.axvline(x=global_idx, color='red', linestyle='--', alpha=0.8, linewidth=1)
+                ax.axhline(y=global_idx, color='red', linestyle='--', alpha=0.8, linewidth=1)
+
+    
+    # fig, axes = plt.subplots(1, 2, figsize=(15, 8))
+    # model_names = ["CEBRA", "ACORN"]
+    # ims = []
+
+    # for ax, name in zip(axes, model_names):
+    #     result = results[name]
+    #     jf = torch.abs(result["jf"]).mean(0)
+    #     jf = jf / jf.sum()
+    #     jf = jf.detach().cpu().numpy()
+
+    #     n_rows, n_cols = jf.shape
+
+    #     im = ax.matshow(
+    #         jf,
+    #         aspect="auto",
+    #     )
+    #     ims.append(im)
+
+    #     ax.set_title(f"{name}\nR2={r2_results[name]['mean_r2']:.3f}", pad=20)
+
+    #     ax.set_xlabel(f"Latent Dimension ({n_cols})")
+    #     ax.set_ylabel(f"Neuron ({n_rows})")
+
+    #     if NUM_FAKE_NEURONS > 0:
+    #         for global_idx in fake_indices:
+    #             ax.axvline(x=global_idx, color='red', linestyle='--', alpha=0.8, linewidth=1)
 
     fig.subplots_adjust(right=0.85, top=0.85)
 
