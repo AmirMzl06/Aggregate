@@ -365,7 +365,8 @@ for dataset_name, target_file in datasets:
 
         output_dim = int(getattr(trained_model, "num_output", 48))
         method = cebra.attribution.init(
-            name="jacobian-based",
+            # name="jacobian-based",
+            name = "jacobian-based-batched"
             model=trained_model,
             input_data=input_tensor,
             output_dimension=output_dim,
@@ -373,15 +374,20 @@ for dataset_name, target_file in datasets:
         
         result = method.compute_attribution_map()
 
-        jf_cpu = result["jf"].detach().cpu() if torch.is_tensor(result["jf"]) else torch.tensor(result["jf"])
-        results[model_name] = {"jf": jf_cpu}
+        # jf_cpu = result["jf"].detach().cpu() if torch.is_tensor(result["jf"]) else torch.tensor(result["jf"])
+        # results[model_name] = {"jf": jf_cpu}
+        
+        jfinv = result["jf-inv-svd"]
+        jfinv_tensor = torch.tensor(jfinv) if not torch.is_tensor(jfinv) else jfinv.detach().cpu()
+        results[model_name] = {"jf-inv": jfinv_tensor}
 
-        if NUM_FAKE_NEURONS > 0:
-            jf_normalized = torch.abs(jf_cpu).mean(0)
-            jf_normalized = jf_normalized / jf_normalized.sum()
-            jf_normalized_cpu = jf_normalized.detach().cpu().numpy()
+         if NUM_FAKE_NEURONS > 0:
+            jfinv_mean = torch.abs(jfinv_tensor).mean(0)
+            jfinv_normalized = jfinv_mean / jfinv_mean.sum()
+            jfinv_normalized_cpu = jfinv_normalized.numpy()
 
-            mean_all_neurons = jf_normalized_cpu.mean(axis=0)
+            mean_all_neurons = jfinv_normalized_cpu.mean(axis=1) 
+            
             sorted_indices = np.argsort(mean_all_neurons)[::-1]
             ranks = np.empty_like(sorted_indices)
             ranks[sorted_indices] = np.arange(1, len(mean_all_neurons) + 1)
@@ -389,11 +395,30 @@ for dataset_name, target_file in datasets:
             fake_ranks = ranks[fake_indices]
             mean_fake_latents = mean_all_neurons[fake_indices]
 
-            print(f"\n>>> [{model_name}] Average Latent Attribution for Fake Neurons:")
+            print(f"\n>>> [{model_name}] Average Inverse Attribution for Fake Neurons:")
             for idx_order, global_idx in enumerate(fake_indices):
                 print(f"    Fake Neuron #{idx_order+1} (Index: {global_idx}): {mean_fake_latents[idx_order]:.6e} | Rank: {fake_ranks[idx_order]} / {total_neurons}")
 
-        cleanup_cuda(method, trained_model, input_tensor, result, jf_cpu, attr_data)
+        cleanup_cuda(method, trained_model, input_tensor, jfinv_tensor, attr_data)
+        
+        # if NUM_FAKE_NEURONS > 0:
+        #     jf_normalized = torch.abs(jf_cpu).mean(0)
+        #     jf_normalized = jf_normalized / jf_normalized.sum()
+        #     jf_normalized_cpu = jf_normalized.detach().cpu().numpy()
+
+        #     mean_all_neurons = jf_normalized_cpu.mean(axis=0)
+        #     sorted_indices = np.argsort(mean_all_neurons)[::-1]
+        #     ranks = np.empty_like(sorted_indices)
+        #     ranks[sorted_indices] = np.arange(1, len(mean_all_neurons) + 1)
+            
+        #     fake_ranks = ranks[fake_indices]
+        #     mean_fake_latents = mean_all_neurons[fake_indices]
+
+        #     print(f"\n>>> [{model_name}] Average Latent Attribution for Fake Neurons:")
+        #     for idx_order, global_idx in enumerate(fake_indices):
+        #         print(f"    Fake Neuron #{idx_order+1} (Index: {global_idx}): {mean_fake_latents[idx_order]:.6e} | Rank: {fake_ranks[idx_order]} / {total_neurons}")
+
+        # cleanup_cuda(method, trained_model, input_tensor, result, jf_cpu, attr_data)
 
         # Decoder R2
         print(f"\n--- Training Decoder for {model_name} ---")
