@@ -370,22 +370,14 @@ for dataset_name, target_file in datasets:
             input_data=input_tensor,
             output_dimension=output_dim,
         )
-        # result = method.compute_attribution_map()
-
-        # jf_cpu = result["jf"].detach().cpu() if torch.is_tensor(result["jf"]) else torch.tensor(result["jf"])
-        # results[model_name] = {"jf": jf_cpu}
+        
         result = method.compute_attribution_map()
-        jf_inv_cpu = (
-            result["jf-inv-svd"].detach().cpu()
-            if torch.is_tensor(result["jf-inv-svd"])
-            else torch.tensor(result["jf-inv-svd"])
-        )        
-        results[model_name] = {"jf": jf_inv_cpu}
 
+        jf_cpu = result["jf"].detach().cpu() if torch.is_tensor(result["jf"]) else torch.tensor(result["jf"])
+        results[model_name] = {"jf": jf_cpu}
 
         if NUM_FAKE_NEURONS > 0:
-            # jf_normalized = torch.abs(jf_cpu).mean(0)
-            jf_normalized = torch.abs(jf_inv_cpu).mean(0)
+            jf_normalized = torch.abs(jf_cpu).mean(0)
             jf_normalized = jf_normalized / jf_normalized.sum()
             jf_normalized_cpu = jf_normalized.detach().cpu().numpy()
 
