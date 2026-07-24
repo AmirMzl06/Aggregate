@@ -20,12 +20,12 @@ from cebra import CEBRA
 # 1) Synthetic Data Config & Generation
 # ============================================================
 T = 100_000
-D1 = 2
-D2 = 2
+D1 = 3
+D2 = 3
 D_LATENT = D1 + D2
 
-N1 = 3
-N2 = 3
+N1 = 2
+N2 = 2
 D_OBS = N1 + N2
 
 N_MLP_LAYERS = 4
