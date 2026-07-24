@@ -366,7 +366,7 @@ for dataset_name, target_file in datasets:
         output_dim = int(getattr(trained_model, "num_output", 48))
         method = cebra.attribution.init(
             # name="jacobian-based",
-            name = "jacobian-based-batched"
+            name = "jacobian-based-batched",
             model=trained_model,
             input_data=input_tensor,
             output_dimension=output_dim,
