@@ -45,7 +45,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-RANDOM_SEED = 42
+RANDOM_SEED = 88
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
