@@ -25,6 +25,7 @@ datasets = [
     ("Mihili_RT_2013_2014_npz", "Mihili_20131207_001_RT.mat.npz"),
     ("Jango_ISO_2015_npz", "Jango_20150730_001.mat.npz"),
     ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz"),
+    ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz")
 ]
 
 out_dir = "outputs"
