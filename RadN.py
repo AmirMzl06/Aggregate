@@ -451,12 +451,12 @@ for dataset_name, target_file in datasets:
     adv_res = cross_results["ACORN"]
     clean_res = cross_results["CEBRA"]
     
-    print(f"adv base:   {adv_res['base']:>7.4f} | adv with radN adv:   {adv_res['with_radN_acorn_jf']:>7.4f} | adv with radN clean:   {adv_res['with_radN_cebra_jf']:>7.4f}")
-    print(f"clean base: {clean_res['base']:>7.4f} | clean with radN adv: {clean_res['with_radN_acorn_jf']:>7.4f} | clean with radN clean: {clean_res['with_radN_cebra_jf']:>7.4f}")
+    print(f"adv base:   {adv_res['base']:>7.4f} | adv using adv top-K:   {adv_res['with_radN_acorn_jf']:>7.4f} | adv using clean top-K:   {adv_res['with_radN_cebra_jf']:>7.4f}")
+    print(f"clean base: {clean_res['base']:>7.4f} | clean using adv top-K: {clean_res['with_radN_acorn_jf']:>7.4f} | clean using clean top-K: {clean_res['with_radN_cebra_jf']:>7.4f}")
 
     print("\n--- [Inverse Jacobian / Jf-inv Results] ---")
-    print(f"adv base:   {adv_res['base']:>7.4f} | adv with radN adv:   {adv_res['with_radN_acorn_jfinv']:>7.4f} | adv with radN clean:   {adv_res['with_radN_cebra_jfinv']:>7.4f}")
-    print(f"clean base: {clean_res['base']:>7.4f} | clean with radN adv: {clean_res['with_radN_acorn_jfinv']:>7.4f} | clean with radN clean: {clean_res['with_radN_cebra_jfinv']:>7.4f}")
+    print(f"adv base:   {adv_res['base']:>7.4f} | adv using adv top-K:   {adv_res['with_radN_acorn_jfinv']:>7.4f} | adv using clean top-K:   {adv_res['with_radN_cebra_jfinv']:>7.4f}")
+    print(f"clean base: {clean_res['base']:>7.4f} | clean using adv top-K: {clean_res['with_radN_acorn_jfinv']:>7.4f} | clean using clean top-K: {clean_res['with_radN_cebra_jfinv']:>7.4f}")
     print("#" * 80 + "\n")
 
     # -----------------------------
