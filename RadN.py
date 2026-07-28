@@ -352,6 +352,9 @@ for dataset_name, target_file in datasets:
         topk_jfinv_indices = torch.topk(jfinv_scores, k_neurons).indices.numpy()
         
         print(f"[{model_name}] Selected Top K={k_neurons} out of {total_neurons} neurons.")
+        print(f"[{model_name}] Top K Neuron Indices (Jf): {topk_jf_indices.tolist()}")
+        print(f"[{model_name}] Top K Neuron Indices (Jf-inv): {topk_jfinv_indices.tolist()}")
+        
         topk_store[model_name] = {
             "jf": topk_jf_indices,
             "jfinv": topk_jfinv_indices
@@ -433,6 +436,12 @@ for dataset_name, target_file in datasets:
     print(f" FINAL CROSS-LESION SUMMARY FOR: {dataset_name} (K = {k_neurons}) ".center(80, "#"))
     print("#" * 80)
     
+    print("\n--- [Top K Neuron Indices] ---")
+    print(f"CEBRA Top K (Jf)    : {topk_store['CEBRA']['jf'].tolist()}")
+    print(f"CEBRA Top K (Jf-inv): {topk_store['CEBRA']['jfinv'].tolist()}")
+    print(f"ACORN Top K (Jf)    : {topk_store['ACORN']['jf'].tolist()}")
+    print(f"ACORN Top K (Jf-inv): {topk_store['ACORN']['jfinv'].tolist()}")
+
     print("\n--- [Jacobian / Jf Results] ---")
     adv_res = cross_results["ACORN"]
     clean_res = cross_results["CEBRA"]
