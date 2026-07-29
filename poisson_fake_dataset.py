@@ -20,7 +20,7 @@ from cebra import CEBRA
 # ============================================================
 T = 100_000
 D_LATENT = 2       # Z1 and Z2 (Position in 2D space)
-N_NEURONS = 3      # Total observed neurons
+N_NEURONS = 50      # Total observed neurons
 OUTPUT_DIM = D_LATENT  # 2
 
 BATCH_SIZE = 2048
