@@ -1,4 +1,506 @@
-###monkey
+#AUROC
+import os
+import sys
+import copy
+import gc
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import r2_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+from utils.min_distance import min_l2_distance
+
+from utils.constants import CEBRA_DIR, DATA_DIR
+from utils.dataset_loader import DatasetLoader
+
+sys.path.insert(0, str(CEBRA_DIR))
+import cebra
+from cebra import CEBRA
+
+
+# -----------------------------
+# Config
+# -----------------------------
+datasets = [
+    ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz"),
+    ("Mihili_RT_2013_2014_npz", "Mihili_20131207_001_RT.mat.npz"),
+    ("Jango_ISO_2015_npz", "Jango_20150730_001.mat.npz"),
+    ("Mihili_CO_2014_npz", "Mihili_20140203_001.mat.npz"),
+]
+
+out_dir = "outputs"
+img_dir = "images"
+os.makedirs(out_dir, exist_ok=True)
+os.makedirs(img_dir, exist_ok=True)
+
+os.environ["CEBRA_DATADIR"] = os.path.abspath(DATA_DIR)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+loader = DatasetLoader(data_root_dir=DATA_DIR, cache_dir="./weights_cache/")
+adv_ep = 5
+
+NUM_FAKE_NEURONS = 96
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+
+# -----------------------------
+# Local TwoLayerMLP
+# -----------------------------
+class TwoLayerMLP(nn.Module):
+    def __init__(self, input_dim=32, hidden_dim=64, output_dim=2, dropout_rate=0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def mean_r2_score(y_true, y_pred):
+    scores = []
+    for i in range(y_true.shape[1]):
+        scores.append(r2_score(y_true[:, i], y_pred[:, i]))
+    return float(np.mean(scores)), scores
+
+
+def get_embeddings(cebra_model, x_np):
+    x_t = torch.from_numpy(x_np).float()
+    emb = cebra_model.transform(x_t)
+    return to_numpy(emb)
+
+
+def cleanup_cuda(*objs):
+    for obj in objs:
+        try:
+            del obj
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def add_fake_neurons(neural_data: torch.Tensor, num_fake_neurons: int):
+    neural_data = neural_data.detach().cpu().float()
+    num_samples, num_real_neurons = neural_data.shape
+
+    if num_fake_neurons <= 0:
+        return neural_data, np.array([], dtype=int)
+
+    fake_data = torch.tensor(
+        np.random.binomial(
+            n=1,
+            p=0.5,
+            size=(num_samples, num_fake_neurons)
+        ),
+        dtype=neural_data.dtype,
+    )
+
+    total_neurons = num_real_neurons + num_fake_neurons
+    fake_indices = np.sort(
+        np.random.choice(total_neurons, num_fake_neurons, replace=False)
+    )
+    real_indices = np.setdiff1d(np.arange(total_neurons), fake_indices)
+
+    combined_neural = torch.zeros(
+        (num_samples, total_neurons),
+        dtype=neural_data.dtype
+    )
+
+    real_idx_t = torch.as_tensor(real_indices, dtype=torch.long)
+    fake_idx_t = torch.as_tensor(fake_indices, dtype=torch.long)
+
+    combined_neural[:, real_idx_t] = neural_data
+    combined_neural[:, fake_idx_t] = fake_data
+
+    return combined_neural, fake_indices
+
+
+def train_decoder_with_same_arch(
+    cebra_model,
+    train_x_np,
+    train_y_np,
+    test_x_np,
+    test_y_np,
+    input_dim,
+    hidden_dim=64,
+    dropout_rate=0.4,
+    decoder_iters=10000,
+):
+    neural_train, neural_val, label_train, label_val = train_test_split(
+        train_x_np,
+        train_y_np,
+        test_size=0.125,
+        random_state=42,
+        shuffle=False,
+    )
+
+    z_train = torch.from_numpy(get_embeddings(cebra_model, neural_train)).float().to(device)
+    z_val = torch.from_numpy(get_embeddings(cebra_model, neural_val)).float().to(device)
+    z_test = torch.from_numpy(get_embeddings(cebra_model, test_x_np)).float().to(device)
+
+    y_train = torch.from_numpy(label_train).float().to(device)
+    y_val = torch.from_numpy(label_val).float().to(device)
+    y_test = torch.from_numpy(test_y_np).float().to(device)
+
+    decoder = TwoLayerMLP(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        output_dim=y_train.shape[1],
+        dropout_rate=dropout_rate,
+    ).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
+
+    initial_state = copy.deepcopy(decoder.state_dict())
+
+    best_r2 = -1e18
+    best_epoch = 1
+    best_decoder_state = copy.deepcopy(decoder.state_dict())
+
+    patience = 1000
+    bad_epochs = 0
+    min_epochs = 4000
+
+    for epoch in range(decoder_iters):
+        decoder.train()
+        optimizer.zero_grad()
+        outputs = decoder(z_train)
+        loss = criterion(outputs, y_train)
+        loss.backward()
+        optimizer.step()
+
+        decoder.eval()
+        with torch.no_grad():
+            val_preds = decoder(z_val).cpu().numpy()
+            val_true = y_val.cpu().numpy()
+
+        current_r2, _ = mean_r2_score(val_true, val_preds)
+
+        if current_r2 > best_r2:
+            best_r2 = current_r2
+            best_epoch = epoch + 1
+            bad_epochs = 0
+            best_decoder_state = copy.deepcopy(decoder.state_dict())
+        else:
+            if epoch > min_epochs - patience:
+                bad_epochs += 1
+
+        if bad_epochs >= patience:
+            print(f"Early stopping decoder at epoch {epoch + 1}")
+            break
+
+        if (epoch + 1) % 2000 == 0:
+            print(
+                f"Decoder Epoch [{epoch + 1}/{decoder_iters}] | "
+                f"Loss: {loss.item():.4f} | Val R2: {current_r2:.4f}"
+            )
+
+    decoder.load_state_dict(best_decoder_state)
+
+    z_full = torch.cat([z_train, z_val], dim=0)
+    y_full = torch.cat([y_train, y_val], dim=0)
+
+    decoder.load_state_dict(initial_state)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
+
+    for _ in range(best_epoch):
+        decoder.train()
+        optimizer.zero_grad()
+        outputs = decoder(z_full)
+        loss = criterion(outputs, y_full)
+        loss.backward()
+        optimizer.step()
+
+    decoder.eval()
+    with torch.no_grad():
+        test_preds = decoder(z_test).cpu().numpy()
+        test_true = y_test.cpu().numpy()
+
+    mean_test_r2, per_dim_r2 = mean_r2_score(test_true, test_preds)
+
+    cleanup_cuda(
+        z_train, z_val, z_test,
+        y_train, y_val, y_test,
+        decoder, optimizer,
+        z_full, y_full,
+        neural_train, neural_val, label_train, label_val
+    )
+
+    return decoder, mean_test_r2, per_dim_r2
+
+
+# -----------------------------
+# Main Loop for all datasets
+# -----------------------------
+for dataset_name, target_file in datasets:
+    print(f"\n{'#'*60}")
+    print(f"Processing Dataset: {dataset_name} | File: {target_file}")
+    print(f"{'#'*60}")
+
+    dataset_dir = os.path.join(DATA_DIR, dataset_name)
+    files = sorted(os.listdir(dataset_dir))
+    day_idx = files.index(target_file)
+    print("Selected day index:", day_idx)
+
+    x_np, y_np = loader.load_dataset_day(day_idx, dataset_name, cache=True)
+
+    print("x shape:", x_np.shape)
+    print("y shape:", y_np.shape)
+
+    neural_data = torch.from_numpy(x_np).float() if isinstance(x_np, np.ndarray) else x_np.clone().detach().float()
+    combined_neural, fake_indices = add_fake_neurons(neural_data, NUM_FAKE_NEURONS)
+
+    num_samples, total_neurons = combined_neural.shape
+    print(f"Added {NUM_FAKE_NEURONS} fake neurons. Total neurons now: {total_neurons}")
+
+    if y_np.ndim > 1 and y_np.shape[1] >= 2:
+        y_cebra = y_np[:, :2]
+    else:
+        y_cebra = y_np.reshape(-1, 1)
+
+    split_idx = int(0.8 * len(combined_neural))
+    train_data = combined_neural[:split_idx].contiguous()
+    valid_data = combined_neural[split_idx:].contiguous()
+
+    train_data_np = train_data.detach().cpu().numpy().astype(np.float32)
+    valid_data_np = valid_data.detach().cpu().numpy().astype(np.float32)
+
+    train_continuous_label = y_cebra[:split_idx].astype(np.float32)
+    valid_continuous_label = y_cebra[split_idx:].astype(np.float32)
+    
+    # تعریف برچسب‌ها برای محاسبه AUROC: نورون واقعی = 1، نورون فیک = 0
+    gt_neurons_mask = np.ones(total_neurons, dtype=int)
+    if NUM_FAKE_NEURONS > 0:
+        gt_neurons_mask[fake_indices] = 0
+
+    results = {}
+    r2_results = {}
+    auroc_results = {}
+
+    save_dir = os.path.join(img_dir, target_file.replace(".mat.npz", "").replace(".", "_"))
+    os.makedirs(save_dir, exist_ok=True)
+
+    for adv in [False, True]:
+        cleanup_cuda()
+
+        model_name = "ACORN" if adv else "CEBRA"
+        print(f"\n==================== Training {model_name} ====================")
+
+        adv_epsilon = float(min_l2_distance(train_data)) / 2.0
+        adv_epsilon = max(adv_epsilon, 1e-6)
+
+        model = CEBRA(
+            batch_size=2048,
+            temperature=0.4,
+            model_architecture="offset36-model-more-dropout",
+            time_offsets=4,
+            max_iterations=2500,
+            output_dimension=48,
+            verbose=True,
+            training_mode="adversarial" if adv else "clean",
+            adv_alpha=adv_epsilon / 5,
+            adv_epsilon=adv_epsilon,
+            adv_steps=10,
+            attack_norm="linf",
+            num_hidden_units=32
+        )
+
+        model.fit(train_data_np, train_continuous_label)
+
+        save_path = os.path.join(out_dir, f"{model_name}_{target_file}.pth")
+        model.save(save_path)
+        print("Saved model to:", save_path)
+
+        trained_model = model.solver_.model.to(device)
+
+        input_tensor = torch.from_numpy(train_data_np).float().to(device).requires_grad_(True)
+        attr_batch_size = min(128, len(train_data_np))
+
+        output_dim = int(getattr(trained_model, "num_output", 48))
+        method = cebra.attribution.init(
+            name="jacobian-based-batched",
+            model=trained_model,
+            input_data=input_tensor,
+            output_dimension=output_dim,
+        )
+
+        result = method.compute_attribution_map(batch_size=attr_batch_size)
+        
+        # استخراج Jacobians و تبدیل به CPU
+        jf_tensor = torch.as_tensor(result["jf"]).detach().cpu()
+        jfinv_tensor = torch.as_tensor(result["jf-inv-svd"]).detach().cpu()
+        
+        results[model_name] = {"jf-inv": jfinv_tensor}
+
+        # -----------------------------
+        # محاسبه AUROC برای JF و JF-INV
+        # -----------------------------
+        # 1. Forward Jacobian (jf)
+        # معمولاً شکل (Batch, Latents, Neurons) دارد
+        if jf_tensor.ndim == 3:
+            jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=(0, 1)).numpy()
+        else:
+            jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=0).numpy()
+
+        # 2. Inverse Jacobian (jf-inv-svd)
+        # معمولاً شکل (Batch, Neurons, Latents) دارد
+        if jfinv_tensor.ndim == 3:
+            jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=(0, 2)).numpy()
+        else:
+            jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=1).numpy()
+
+        auc_jf = roc_auc_score(gt_neurons_mask, jf_score_per_neuron)
+        auc_jfinv = roc_auc_score(gt_neurons_mask, jfinv_score_per_neuron)
+        
+        auroc_results[model_name] = {"jf": auc_jf, "jf-inv": auc_jfinv}
+        
+        print(f"\n--- AUROC Metrics for {model_name} ---")
+        print(f"** Forward Jacobian (jf) AUROC:       {auc_jf:.4f} **")
+        print(f"** Inverse Jacobian (jf-inv) AUROC:   {auc_jfinv:.4f} **")
+
+        if NUM_FAKE_NEURONS > 0:
+            jfinv_mean = torch.abs(jfinv_tensor).mean(0)
+            jfinv_normalized = jfinv_mean / jfinv_mean.sum()
+            jfinv_normalized_cpu = jfinv_normalized.numpy()
+
+            mean_all_neurons = jfinv_normalized_cpu.mean(axis=1)
+            
+            sorted_indices = np.argsort(mean_all_neurons)[::-1]
+            ranks = np.empty_like(sorted_indices)
+            ranks[sorted_indices] = np.arange(1, len(mean_all_neurons) + 1)
+
+            fake_ranks = ranks[fake_indices]
+            mean_fake_latents = mean_all_neurons[fake_indices]
+            
+            print(f"\n>>> [{model_name}] Ranks of Fake Neurons (Total: {total_neurons}):")
+            for i in range(min(5, len(fake_indices))):
+                print(f"    Fake Neuron Index {fake_indices[i]:<3} | Score: {mean_fake_latents[i]:.6e} | Rank: {fake_ranks[i]}")
+            if len(fake_indices) > 5:
+                print("    ...")
+
+        cleanup_cuda(method, trained_model, input_tensor, result, jf_tensor, jfinv_tensor)
+
+        # -----------------------------
+        # Train Decoder
+        # -----------------------------
+        print(f"\n--- Training Decoder for {model_name} ---")
+        decoder, mean_r2, per_dim_r2 = train_decoder_with_same_arch(
+            cebra_model=model,
+            train_x_np=train_data_np,
+            train_y_np=y_np[:split_idx].astype(np.float32),
+            test_x_np=valid_data_np,
+            test_y_np=y_np[split_idx:].astype(np.float32),
+            input_dim=48,
+            hidden_dim=64,
+            dropout_rate=0.4,
+            decoder_iters=10000,
+        )
+
+        r2_results[model_name] = {
+            "mean_r2": mean_r2,
+            "per_dim_r2": per_dim_r2,
+        }
+
+        decoder_save_path = os.path.join(out_dir, f"decoder_{model_name}_{target_file}.pth")
+        torch.save(decoder.state_dict(), decoder_save_path)
+
+        print(f"** Final mean R2 Score for {model_name}: {mean_r2:.4f} **")
+        cleanup_cuda(model, decoder)
+
+    print("\n" + "=" * 55)
+    print(f" SUMMARY FOR {dataset_name} ".center(55, "="))
+    print("=" * 55)
+    for name in r2_results.keys():
+        print(f" Model: {name:<6}")
+        print(f"   - Mean R2 Decoder: {r2_results[name]['mean_r2']:.4f}")
+        print(f"   - jf AUROC:        {auroc_results[name]['jf']:.4f}")
+        print(f"   - jf-inv AUROC:    {auroc_results[name]['jf-inv']:.4f}")
+        print("-" * 55)
+
+    # -----------------------------
+    # Plot and save Jacobians
+    # -----------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(15, 8))
+    model_names = ["CEBRA", "ACORN"]
+    ims = []
+
+    for ax, name in zip(axes, model_names):
+        result = results[name]
+
+        jfinv = torch.abs(result["jf-inv"]).mean(0)
+        jfinv = jfinv / jfinv.sum()
+        jfinv_np = jfinv.numpy()
+
+        n_rows, n_cols = jfinv_np.shape
+
+        im = ax.matshow(
+            jfinv_np,
+            aspect="auto",
+        )
+        ims.append(im)
+
+        ax.set_title(f"{name}\nAUROC(inv)={auroc_results[name]['jf-inv']:.3f} | R2={r2_results[name]['mean_r2']:.3f}", pad=20)
+        ax.set_xlabel(f"Neuron ({n_cols})")
+        ax.set_ylabel(f"Latent Dimension ({n_rows})")
+
+        if NUM_FAKE_NEURONS > 0:
+            for global_idx in fake_indices:
+                ax.axvline(x=global_idx, color="red", linestyle="--", alpha=0.8, linewidth=1)
+
+    fig.subplots_adjust(right=0.85, top=0.85)
+
+    cbar_ax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
+    fig.colorbar(ims[0], cax=cbar_ax)
+
+    plot_path = os.path.join(
+        save_dir,
+        f"{target_file.replace('.mat.npz', '').replace('.', '_')}_CEBRA_vs_ACORN.png",
+    )
+
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print("Saved figure to:", plot_path)
+
+
+
+
+
+
+
+
+
+
+####monkey
 # import os
 # import sys
 # import copy
@@ -24,7 +526,7 @@
 # # Config
 # # -----------------------------
 # datasets = [
-#     # ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz"),
+#     ("Chewie_CO_2016_npz", "Chewie_20160927_001.mat.npz"),
 #     # ("Chewie_CO_2016_npz", "Chewie_20160928_001.mat.npz"),
 #     # ("Chewie_CO_2016_npz", "Chewie_20160929_001.mat.npz"),
 #     # ("Chewie_CO_2016_npz", "Chewie_20160930_001.mat.npz"),
@@ -1014,252 +1516,252 @@
 #     print("Decoder scores:", r2_results)
 
 ###Hippocampus
-import sys
-import os
-import gc
-import torch
-import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
+# import sys
+# import os
+# import gc
+# import torch
+# import torch.nn as nn
+# import numpy as np
+# import matplotlib.pyplot as plt
 
-if "cebra" in sys.modules:
-    del sys.modules["cebra"]
+# if "cebra" in sys.modules:
+#     del sys.modules["cebra"]
 
-from utils.constants import CEBRA_DIR
-sys.path.insert(0, str(CEBRA_DIR))
+# from utils.constants import CEBRA_DIR
+# sys.path.insert(0, str(CEBRA_DIR))
 
-import cebra
-from cebra import CEBRA
-from utils.min_distance import min_l2_distance
+# import cebra
+# from cebra import CEBRA
+# from utils.min_distance import min_l2_distance
 
-# ============================================================
-# Config
-# ============================================================
-names = [
-    "achilles",
-    "gatsby",
-    "buddy",
-    "cicero",
-]
+# # ============================================================
+# # Config
+# # ============================================================
+# names = [
+#     "achilles",
+#     "gatsby",
+#     "buddy",
+#     "cicero",
+# ]
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_FAKE_NEURONS = 0
-OUTPUT_DIM = 48
-BATCH_SIZE = 2048
-MAX_ITER = 2500
-ATTR_BATCH_SIZE = 64
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# NUM_FAKE_NEURONS = 0
+# OUTPUT_DIM = 48
+# BATCH_SIZE = 2048
+# MAX_ITER = 2500
+# ATTR_BATCH_SIZE = 64
 
-os.makedirs("images", exist_ok=True)
-os.makedirs("outputs", exist_ok=True)
+# os.makedirs("images", exist_ok=True)
+# os.makedirs("outputs", exist_ok=True)
 
-# ============================================================
-# Helpers
-# ============================================================
-def cleanup_cuda(*objs):
-    for obj in objs:
-        try:
-            del obj
-        except Exception:
-            pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-
-def reduce_attr_map(arr):
-    arr = np.asarray(arr)
-    if arr.ndim == 3:
-        return np.abs(arr).mean(axis=0)
-    if arr.ndim == 2:
-        return np.abs(arr)
-    if arr.ndim == 1:
-        return np.abs(arr)[None, :]
-    raise ValueError(f"Unsupported attribution shape: {arr.shape}")
+# # ============================================================
+# # Helpers
+# # ============================================================
+# def cleanup_cuda(*objs):
+#     for obj in objs:
+#         try:
+#             del obj
+#         except Exception:
+#             pass
+#     gc.collect()
+#     if torch.cuda.is_available():
+#         torch.cuda.empty_cache()
+#         torch.cuda.ipc_collect()
 
 
-def normalize_map(x):
-    x = np.asarray(x, dtype=np.float64)
-    s = x.sum()
-    if abs(s) < 1e-12:
-        return x
-    return x / s
+# def reduce_attr_map(arr):
+#     arr = np.asarray(arr)
+#     if arr.ndim == 3:
+#         return np.abs(arr).mean(axis=0)
+#     if arr.ndim == 2:
+#         return np.abs(arr)
+#     if arr.ndim == 1:
+#         return np.abs(arr)[None, :]
+#     raise ValueError(f"Unsupported attribution shape: {arr.shape}")
 
 
-# ============================================================
-# Main loop
-# ============================================================
-for name in names:
-    print(f"\n========== Processing Rat: {name} ==========")
+# def normalize_map(x):
+#     x = np.asarray(x, dtype=np.float64)
+#     s = x.sum()
+#     if abs(s) < 1e-12:
+#         return x
+#     return x / s
 
-    # load processed dataset
-    dataset = cebra.datasets.init(f"rat-hippocampus-single-{name}")
 
-    neural_data = (
-        dataset.neural.clone()
-        if torch.is_tensor(dataset.neural)
-        else torch.tensor(dataset.neural)
-    ).float()
+# # ============================================================
+# # Main loop
+# # ============================================================
+# for name in names:
+#     print(f"\n========== Processing Rat: {name} ==========")
 
-    continuous_index = (
-        dataset.continuous_index.clone()
-        if torch.is_tensor(dataset.continuous_index)
-        else torch.tensor(dataset.continuous_index)
-    ).float()
+#     # load processed dataset
+#     dataset = cebra.datasets.init(f"rat-hippocampus-single-{name}")
 
-    num_samples, num_real_neurons = neural_data.shape
+#     neural_data = (
+#         dataset.neural.clone()
+#         if torch.is_tensor(dataset.neural)
+#         else torch.tensor(dataset.neural)
+#     ).float()
 
-    # fake neurons are optional; keep block in place
-    if NUM_FAKE_NEURONS > 0:
-        fake_data = torch.tensor(
-            np.random.binomial(
-                n=1, p=0.5, size=(num_samples, NUM_FAKE_NEURONS)
-            ),
-            dtype=neural_data.dtype,
-        )
+#     continuous_index = (
+#         dataset.continuous_index.clone()
+#         if torch.is_tensor(dataset.continuous_index)
+#         else torch.tensor(dataset.continuous_index)
+#     ).float()
 
-        total_neurons = num_real_neurons + NUM_FAKE_NEURONS
-        fake_indices = np.sort(
-            np.random.choice(total_neurons, NUM_FAKE_NEURONS, replace=False)
-        )
-        real_indices = np.setdiff1d(np.arange(total_neurons), fake_indices)
+#     num_samples, num_real_neurons = neural_data.shape
 
-        combined_neural = torch.zeros((num_samples, total_neurons), dtype=neural_data.dtype)
-        combined_neural[:, real_indices] = neural_data
-        combined_neural[:, fake_indices] = fake_data
-        print(f"Added {NUM_FAKE_NEURONS} fake neurons at indices: {fake_indices.tolist()}")
-    else:
-        combined_neural = neural_data
-        fake_indices = np.array([], dtype=int)
-        print("Added 0 fake neurons.")
+#     # fake neurons are optional; keep block in place
+#     if NUM_FAKE_NEURONS > 0:
+#         fake_data = torch.tensor(
+#             np.random.binomial(
+#                 n=1, p=0.5, size=(num_samples, NUM_FAKE_NEURONS)
+#             ),
+#             dtype=neural_data.dtype,
+#         )
 
-    split_idx = int(0.8 * len(combined_neural))
-    train_data = combined_neural[:split_idx].contiguous()
-    valid_data = combined_neural[split_idx:].contiguous()
+#         total_neurons = num_real_neurons + NUM_FAKE_NEURONS
+#         fake_indices = np.sort(
+#             np.random.choice(total_neurons, NUM_FAKE_NEURONS, replace=False)
+#         )
+#         real_indices = np.setdiff1d(np.arange(total_neurons), fake_indices)
 
-    train_continuous_label = continuous_index[:split_idx, :2].cpu().numpy()
-    valid_continuous_label = continuous_index[split_idx:, :2].cpu().numpy()
+#         combined_neural = torch.zeros((num_samples, total_neurons), dtype=neural_data.dtype)
+#         combined_neural[:, real_indices] = neural_data
+#         combined_neural[:, fake_indices] = fake_data
+#         print(f"Added {NUM_FAKE_NEURONS} fake neurons at indices: {fake_indices.tolist()}")
+#     else:
+#         combined_neural = neural_data
+#         fake_indices = np.array([], dtype=int)
+#         print("Added 0 fake neurons.")
 
-    save_dir = os.path.join("images", name)
-    os.makedirs(save_dir, exist_ok=True)
+#     split_idx = int(0.8 * len(combined_neural))
+#     train_data = combined_neural[:split_idx].contiguous()
+#     valid_data = combined_neural[split_idx:].contiguous()
 
-    # current setup adv epsilon
-    adv_epsilon = float(min_l2_distance(train_data)) / 2.0
-    adv_epsilon = max(adv_epsilon, 1e-6)
-    print(f"adv_epsilon = {adv_epsilon:.6f} (min_l2_distance / 2)")
+#     train_continuous_label = continuous_index[:split_idx, :2].cpu().numpy()
+#     valid_continuous_label = continuous_index[split_idx:, :2].cpu().numpy()
 
-    # train both clean and adversarial
-    for adv in [False, True]:
-        model_name = "ACORN" if adv else "CEBRA"
-        training_mode = "adversarial" if adv else "clean"
+#     save_dir = os.path.join("images", name)
+#     os.makedirs(save_dir, exist_ok=True)
 
-        print(f"\n--- Training {model_name} (adv = {adv}) ---")
+#     # current setup adv epsilon
+#     adv_epsilon = float(min_l2_distance(train_data)) / 2.0
+#     adv_epsilon = max(adv_epsilon, 1e-6)
+#     print(f"adv_epsilon = {adv_epsilon:.6f} (min_l2_distance / 2)")
 
-        model = CEBRA(
-            batch_size=BATCH_SIZE,
-            temperature=0.4,
-            model_architecture="offset36-model-more-dropout",
-            time_offsets=4,
-            max_iterations=MAX_ITER,
-            output_dimension=OUTPUT_DIM,
-            verbose=True,
-            training_mode=training_mode,
-            adv_alpha=adv_epsilon / 5 if adv else 0.0,
-            adv_epsilon=adv_epsilon if adv else 0.0,
-            adv_steps=10 if adv else 0,
-            attack_norm="linf",
-            num_hidden_units=32,
-        )
+#     # train both clean and adversarial
+#     for adv in [False, True]:
+#         model_name = "ACORN" if adv else "CEBRA"
+#         training_mode = "adversarial" if adv else "clean"
 
-        path = f"{name}_adv.pth" if adv else f"{name}.pth"
+#         print(f"\n--- Training {model_name} (adv = {adv}) ---")
 
-        # Fit and save
-        model.fit(train_data, train_continuous_label)
-        model.save(path)
-        print(f"Saved model to: {path}")
+#         model = CEBRA(
+#             batch_size=BATCH_SIZE,
+#             temperature=0.4,
+#             model_architecture="offset36-model-more-dropout",
+#             time_offsets=4,
+#             max_iterations=MAX_ITER,
+#             output_dimension=OUTPUT_DIM,
+#             verbose=True,
+#             training_mode=training_mode,
+#             adv_alpha=adv_epsilon / 5 if adv else 0.0,
+#             adv_epsilon=adv_epsilon if adv else 0.0,
+#             adv_steps=10 if adv else 0,
+#             attack_norm="linf",
+#             num_hidden_units=32,
+#         )
 
-        # Load model and compute attribution
-        loaded = CEBRA.load(path, weights_only=False)
-        torch_model = loaded.solver_.model.to(device)
-        if hasattr(torch_model, "split_outputs"):
-            torch_model.split_outputs = False
-        torch_model.eval()
+#         path = f"{name}_adv.pth" if adv else f"{name}.pth"
 
-        input_data = train_data.clone().detach().float().to(device)
-        input_data.requires_grad_(True)
+#         # Fit and save
+#         model.fit(train_data, train_continuous_label)
+#         model.save(path)
+#         print(f"Saved model to: {path}")
 
-        method = cebra.attribution.init(
-            name="jacobian-based-batched",
-            model=torch_model,
-            input_data=input_data,
-            output_dimension=int(getattr(torch_model, "num_output", OUTPUT_DIM)),
-        )
+#         # Load model and compute attribution
+#         loaded = CEBRA.load(path, weights_only=False)
+#         torch_model = loaded.solver_.model.to(device)
+#         if hasattr(torch_model, "split_outputs"):
+#             torch_model.split_outputs = False
+#         torch_model.eval()
 
-        print(f"Computing attribution maps for {model_name}...")
-        result = method.compute_attribution_map(batch_size=ATTR_BATCH_SIZE)
-        print("Attribution keys:", list(result.keys()))
+#         input_data = train_data.clone().detach().float().to(device)
+#         input_data.requires_grad_(True)
 
-        # reduce to 2D maps
-        jf = reduce_attr_map(result["jf"])
-        jfinv = reduce_attr_map(result["jf-inv-svd"])
-        jfconv = reduce_attr_map(result["jf-convabs-inv-svd"])
+#         method = cebra.attribution.init(
+#             name="jacobian-based-batched",
+#             model=torch_model,
+#             input_data=input_data,
+#             output_dimension=int(getattr(torch_model, "num_output", OUTPUT_DIM)),
+#         )
 
-        # normalize
-        jf_n = normalize_map(jf)
-        jfinv_n = normalize_map(jfinv)
-        jfconv_n = normalize_map(jfconv)
+#         print(f"Computing attribution maps for {model_name}...")
+#         result = method.compute_attribution_map(batch_size=ATTR_BATCH_SIZE)
+#         print("Attribution keys:", list(result.keys()))
 
-        # print neuron-wise summaries
-        jf_neuron_mean = jf_n.mean(axis=0) if jf_n.ndim == 2 else jf_n
-        jfinv_neuron_mean = jfinv_n.mean(axis=0) if jfinv_n.ndim == 2 else jfinv_n
-        jfconv_neuron_mean = jfconv_n.mean(axis=0) if jfconv_n.ndim == 2 else jfconv_n
+#         # reduce to 2D maps
+#         jf = reduce_attr_map(result["jf"])
+#         jfinv = reduce_attr_map(result["jf-inv-svd"])
+#         jfconv = reduce_attr_map(result["jf-convabs-inv-svd"])
 
-        print(f"\n>>> [{model_name}] Mean attribution per neuron (jf):")
-        for i in range(min(10, len(jf_neuron_mean))):
-            print(f"  neuron {i:>3d}: {jf_neuron_mean[i]:.6e}")
+#         # normalize
+#         jf_n = normalize_map(jf)
+#         jfinv_n = normalize_map(jfinv)
+#         jfconv_n = normalize_map(jfconv)
 
-        print(f"\n>>> [{model_name}] Mean attribution per neuron (jf-inv-svd):")
-        for i in range(min(10, len(jfinv_neuron_mean))):
-            print(f"  neuron {i:>3d}: {jfinv_neuron_mean[i]:.6e}")
+#         # print neuron-wise summaries
+#         jf_neuron_mean = jf_n.mean(axis=0) if jf_n.ndim == 2 else jf_n
+#         jfinv_neuron_mean = jfinv_n.mean(axis=0) if jfinv_n.ndim == 2 else jfinv_n
+#         jfconv_neuron_mean = jfconv_n.mean(axis=0) if jfconv_n.ndim == 2 else jfconv_n
 
-        print(f"\n>>> [{model_name}] Mean attribution per neuron (jf-convabs-inv-svd):")
-        for i in range(min(10, len(jfconv_neuron_mean))):
-            print(f"  neuron {i:>3d}: {jfconv_neuron_mean[i]:.6e}")
+#         print(f"\n>>> [{model_name}] Mean attribution per neuron (jf):")
+#         for i in range(min(10, len(jf_neuron_mean))):
+#             print(f"  neuron {i:>3d}: {jf_neuron_mean[i]:.6e}")
 
-        # plot 3 panels, similar spirit to your current setup
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+#         print(f"\n>>> [{model_name}] Mean attribution per neuron (jf-inv-svd):")
+#         for i in range(min(10, len(jfinv_neuron_mean))):
+#             print(f"  neuron {i:>3d}: {jfinv_neuron_mean[i]:.6e}")
 
-        panels = [
-            (jf_n, "jf"),
-            (jfinv_n, "jf-inv-svd"),
-            (jfconv_n, "jf-convabs-inv-svd"),
-        ]
+#         print(f"\n>>> [{model_name}] Mean attribution per neuron (jf-convabs-inv-svd):")
+#         for i in range(min(10, len(jfconv_neuron_mean))):
+#             print(f"  neuron {i:>3d}: {jfconv_neuron_mean[i]:.6e}")
 
-        ims = []
-        for ax, (mat, title) in zip(axes, panels):
-            im = ax.matshow(mat, aspect="auto", cmap="cividis")
-            ims.append(im)
-            ax.set_title(f"Rat: {name} | {model_name} | {title}", fontsize=11)
-            ax.set_xlabel("Neuron")
-            ax.set_ylabel("Latent")
-            if NUM_FAKE_NEURONS > 0:
-                for global_idx in fake_indices:
-                    ax.axvline(x=global_idx, color="red", linestyle="--", alpha=0.8, linewidth=1)
+#         # plot 3 panels, similar spirit to your current setup
+#         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-        fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.8)
-        fig.tight_layout()
+#         panels = [
+#             (jf_n, "jf"),
+#             (jfinv_n, "jf-inv-svd"),
+#             (jfconv_n, "jf-convabs-inv-svd"),
+#         ]
 
-        plot_path = os.path.join(save_dir, f"{model_name}_jacobians.png")
-        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-        print(f"Plot saved successfully at: {plot_path}")
-        plt.close(fig)
+#         ims = []
+#         for ax, (mat, title) in zip(axes, panels):
+#             im = ax.matshow(mat, aspect="auto", cmap="cividis")
+#             ims.append(im)
+#             ax.set_title(f"Rat: {name} | {model_name} | {title}", fontsize=11)
+#             ax.set_xlabel("Neuron")
+#             ax.set_ylabel("Latent")
+#             if NUM_FAKE_NEURONS > 0:
+#                 for global_idx in fake_indices:
+#                     ax.axvline(x=global_idx, color="red", linestyle="--", alpha=0.8, linewidth=1)
 
-        cleanup_cuda(
-            loaded, torch_model, input_data, method, result,
-            jf, jfinv, jfconv, jf_n, jfinv_n, jfconv_n
-        )
+#         fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.8)
+#         fig.tight_layout()
 
-print("\nDone.")
+#         plot_path = os.path.join(save_dir, f"{model_name}_jacobians.png")
+#         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+#         print(f"Plot saved successfully at: {plot_path}")
+#         plt.close(fig)
+
+#         cleanup_cuda(
+#             loaded, torch_model, input_data, method, result,
+#             jf, jfinv, jfconv, jf_n, jfinv_n, jfconv_n
+#         )
+
+# print("\nDone.")
 
 # import sys
 # import os
