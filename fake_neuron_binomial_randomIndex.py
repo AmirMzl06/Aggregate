@@ -449,22 +449,30 @@ for dataset_name, target_file in datasets:
         print(f"** Inverse Jacobian (jf-inv) AUROC:   {auc_jfinv:.4f} **")
 
         if NUM_FAKE_NEURONS > 0:
-            jfinv_mean = torch.abs(jfinv_tensor).mean(0)
-            jfinv_normalized = jfinv_mean / jfinv_mean.sum()
-            jfinv_normalized_cpu = jfinv_normalized.numpy()
-
-            mean_all_neurons = jfinv_normalized_cpu.mean(axis=1)
-            
+            # Use the same per-neuron score already used for AUROC
+            mean_all_neurons = jfinv_score_per_neuron.copy()
+        
+            # Rank neurons: 1 = highest attribution
             sorted_indices = np.argsort(mean_all_neurons)[::-1]
+        
             ranks = np.empty_like(sorted_indices)
-            ranks[sorted_indices] = np.arange(1, len(mean_all_neurons) + 1)
-
+            ranks[sorted_indices] = np.arange(1, len(sorted_indices) + 1)
+        
             fake_ranks = ranks[fake_indices]
-            mean_fake_latents = mean_all_neurons[fake_indices]
-            
-            print(f"\n>>> [{model_name}] Ranks of Fake Neurons (Total: {total_neurons}):")
+            mean_fake_scores = mean_all_neurons[fake_indices]
+        
+            print(
+                f"\n>>> [{model_name}] Ranks of Fake Neurons "
+                f"(Total: {total_neurons}):"
+            )
+        
             for i in range(min(5, len(fake_indices))):
-                print(f"    Fake Neuron Index {fake_indices[i]:<3} | Score: {mean_fake_latents[i]:.6e} | Rank: {fake_ranks[i]}")
+                print(
+                    f"    Fake Neuron Index {fake_indices[i]:<3} | "
+                    f"Score: {mean_fake_scores[i]:.6e} | "
+                    f"Rank: {fake_ranks[i]} / {total_neurons}"
+                )
+        
             if len(fake_indices) > 5:
                 print("    ...")
 
