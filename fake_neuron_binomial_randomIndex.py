@@ -359,18 +359,88 @@ for dataset_name, target_file in datasets:
         
         results[model_name] = {"jf-inv": jfinv_tensor}
 
-        if jf_tensor.ndim == 3:
-            jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=(0, 1)).numpy()
-        else:
-            jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=0).numpy()
+        # if jf_tensor.ndim == 3:
+        #     jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=(0, 1)).numpy()
+        # else:
+        #     jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=0).numpy()
 
-        if jfinv_tensor.ndim == 3:
-            jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=(0, 2)).numpy()
-        else:
-            jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=1).numpy()
+        # if jfinv_tensor.ndim == 3:
+        #     jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=(0, 2)).numpy()
+        # else:
+        #     jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=1).numpy()
 
-        auc_jf = roc_auc_score(gt_neurons_mask, jf_score_per_neuron)
-        auc_jfinv = roc_auc_score(gt_neurons_mask, jfinv_score_per_neuron)
+        # -------------------------------------------------
+        # Robust per-neuron attribution scores
+        # -------------------------------------------------
+        print("jf tensor shape:", tuple(jf_tensor.shape))
+        print("jf-inv tensor shape:", tuple(jfinv_tensor.shape))
+        
+        def get_per_neuron_score(attr_tensor, total_neurons):
+            attr = torch.abs(attr_tensor)
+        
+            if attr.ndim == 3:
+                # First dimension = samples
+                attr_2d = attr.mean(dim=0)
+        
+            elif attr.ndim == 2:
+                attr_2d = attr
+        
+            else:
+                raise ValueError(
+                    f"Unsupported attribution shape: {tuple(attr.shape)}"
+                )
+        
+            # After removing sample dimension, one axis must be neurons.
+            if attr_2d.shape[0] == total_neurons:
+                # [neurons, latent]
+                scores = attr_2d.mean(dim=1)
+        
+            elif attr_2d.shape[1] == total_neurons:
+                # [latent, neurons]
+                scores = attr_2d.mean(dim=0)
+        
+            else:
+                raise ValueError(
+                    f"Cannot identify neuron axis. "
+                    f"Reduced attribution shape={tuple(attr_2d.shape)}, "
+                    f"total_neurons={total_neurons}"
+                )
+        
+            return scores.cpu().numpy()
+        
+        
+        jf_score_per_neuron = get_per_neuron_score(
+            jf_tensor,
+            total_neurons
+        )
+        
+        jfinv_score_per_neuron = get_per_neuron_score(
+            jfinv_tensor,
+            total_neurons
+        )
+        
+        print("jf score shape:", jf_score_per_neuron.shape)
+        print("jf-inv score shape:", jfinv_score_per_neuron.shape)
+        
+        assert len(jf_score_per_neuron) == total_neurons
+        assert len(jfinv_score_per_neuron) == total_neurons
+        assert len(gt_neurons_mask) == total_neurons
+        
+        # -------------------------------------------------
+        # AUROC
+        # -------------------------------------------------
+        auc_jf = roc_auc_score(
+            gt_neurons_mask,
+            jf_score_per_neuron
+        )
+        
+        auc_jfinv = roc_auc_score(
+            gt_neurons_mask,
+            jfinv_score_per_neuron
+        )
+
+        # auc_jf = roc_auc_score(gt_neurons_mask, jf_score_per_neuron)
+        # auc_jfinv = roc_auc_score(gt_neurons_mask, jfinv_score_per_neuron)
         
         auroc_results[model_name] = {"jf": auc_jf, "jf-inv": auc_jfinv}
         
