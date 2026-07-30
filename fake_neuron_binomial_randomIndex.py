@@ -297,7 +297,6 @@ for dataset_name, target_file in datasets:
     train_continuous_label = y_cebra[:split_idx].astype(np.float32)
     valid_continuous_label = y_cebra[split_idx:].astype(np.float32)
     
-    # تعریف برچسب‌ها برای محاسبه AUROC: نورون واقعی = 1، نورون فیک = 0
     gt_neurons_mask = np.ones(total_neurons, dtype=int)
     if NUM_FAKE_NEURONS > 0:
         gt_neurons_mask[fake_indices] = 0
@@ -355,24 +354,16 @@ for dataset_name, target_file in datasets:
 
         result = method.compute_attribution_map(batch_size=attr_batch_size)
         
-        # استخراج Jacobians و تبدیل به CPU
         jf_tensor = torch.as_tensor(result["jf"]).detach().cpu()
         jfinv_tensor = torch.as_tensor(result["jf-inv-svd"]).detach().cpu()
         
         results[model_name] = {"jf-inv": jfinv_tensor}
 
-        # -----------------------------
-        # محاسبه AUROC برای JF و JF-INV
-        # -----------------------------
-        # 1. Forward Jacobian (jf)
-        # معمولاً شکل (Batch, Latents, Neurons) دارد
         if jf_tensor.ndim == 3:
             jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=(0, 1)).numpy()
         else:
             jf_score_per_neuron = torch.abs(jf_tensor).mean(dim=0).numpy()
 
-        # 2. Inverse Jacobian (jf-inv-svd)
-        # معمولاً شکل (Batch, Neurons, Latents) دارد
         if jfinv_tensor.ndim == 3:
             jfinv_score_per_neuron = torch.abs(jfinv_tensor).mean(dim=(0, 2)).numpy()
         else:
