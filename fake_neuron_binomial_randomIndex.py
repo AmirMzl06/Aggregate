@@ -107,6 +107,42 @@ def cleanup_cuda(*objs):
         torch.cuda.ipc_collect()
 
 
+# def add_fake_neurons(neural_data: torch.Tensor, num_fake_neurons: int):
+#     neural_data = neural_data.detach().cpu().float()
+#     num_samples, num_real_neurons = neural_data.shape
+
+#     if num_fake_neurons <= 0:
+#         return neural_data, np.array([], dtype=int)
+
+#     fake_data = torch.tensor(
+#         np.random.binomial(
+#             n=1,
+#             p=0.5,
+#             size=(num_samples, num_fake_neurons)
+#         ),
+#         dtype=neural_data.dtype,
+#     )
+
+#     total_neurons = num_real_neurons + num_fake_neurons
+#     fake_indices = np.sort(
+#         np.random.choice(total_neurons, num_fake_neurons, replace=False)
+#     )
+#     real_indices = np.setdiff1d(np.arange(total_neurons), fake_indices)
+
+#     combined_neural = torch.zeros(
+#         (num_samples, total_neurons),
+#         dtype=neural_data.dtype
+#     )
+
+#     real_idx_t = torch.as_tensor(real_indices, dtype=torch.long)
+#     fake_idx_t = torch.as_tensor(fake_indices, dtype=torch.long)
+
+#     combined_neural[:, real_idx_t] = neural_data
+#     combined_neural[:, fake_idx_t] = fake_data
+
+#     return combined_neural, fake_indices
+
+
 def add_fake_neurons(neural_data: torch.Tensor, num_fake_neurons: int):
     neural_data = neural_data.detach().cpu().float()
     num_samples, num_real_neurons = neural_data.shape
@@ -114,10 +150,13 @@ def add_fake_neurons(neural_data: torch.Tensor, num_fake_neurons: int):
     if num_fake_neurons <= 0:
         return neural_data, np.array([], dtype=int)
 
+    p_val = (neural_data > 0).float().mean().item()
+    print(f"Calculated binomial 'p' from real data: {p_val:.4f}")
+
     fake_data = torch.tensor(
         np.random.binomial(
             n=1,
-            p=0.5,
+            p=p_val,
             size=(num_samples, num_fake_neurons)
         ),
         dtype=neural_data.dtype,
@@ -141,6 +180,7 @@ def add_fake_neurons(neural_data: torch.Tensor, num_fake_neurons: int):
     combined_neural[:, fake_idx_t] = fake_data
 
     return combined_neural, fake_indices
+
 
 
 def train_decoder_with_same_arch(
