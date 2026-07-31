@@ -42,7 +42,7 @@ loader = DatasetLoader(data_root_dir=DATA_DIR, cache_dir="./weights_cache/")
 adv_ep = 5
 
 NUM_FAKE_NEURONS = 96
-RANDOM_SEED = 42
+RANDOM_SEED = 65
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
