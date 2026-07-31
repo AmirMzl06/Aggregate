@@ -156,7 +156,8 @@ def add_fake_neurons(neural_data: torch.Tensor, num_fake_neurons: int):
     fake_data = torch.tensor(
         np.random.binomial(
             n=1,
-            p=p_val,
+            # p=p_val,
+            p = 0.5,
             size=(num_samples, num_fake_neurons)
         ),
         dtype=neural_data.dtype,
