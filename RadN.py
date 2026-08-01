@@ -36,10 +36,6 @@ MAX_ITER = 2500
 ATTR_BATCH_SIZE = 64
 RANDOM_SEED = 42
 
-# reduced-data experiment uses top-k neurons from this metric:
-# "jf" or "jfinv"
-TOPK_METRIC = "jf"
-
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
@@ -288,6 +284,7 @@ def train_full_model_and_get_topk(
     train_tensor = torch.from_numpy(train_x_np).float()
     adv_epsilon = float(min_l2_distance(train_tensor)) / 2.0
     adv_epsilon = max(adv_epsilon, 1e-6)
+    adv_epsilon = 2
 
     model = build_cebra_model(adv=adv, adv_epsilon=adv_epsilon, output_dim=output_dim)
     model.fit(train_x_np, train_y_np)
@@ -360,9 +357,6 @@ def train_reduced_model_from_scratch(
     train_tensor = torch.from_numpy(reduced_train_x_np).float()
     adv_epsilon = float(min_l2_distance(train_tensor)) / 2.0
     adv_epsilon = max(adv_epsilon, 1e-6)
-    #####
-    adv_epsilon = 2
-    #####
 
     model = build_cebra_model(adv=adv, adv_epsilon=adv_epsilon, output_dim=output_dim)
     model.fit(reduced_train_x_np, reduced_train_y_np)
@@ -444,47 +438,57 @@ for name in names:
         rows.append({
             "dataset": name,
             "setting": "full",
-            "model": model_name,
+            "source_model": model_name,
+            "retrained_model": model_name,
             "neurons": train_data_np.shape[1],
             "base_r2": res["base_r2"],
-            "topk_metric": TOPK_METRIC,
+            "topk_metric": "jf/jfinv",
         })
 
     # --------------------------------------------------------
-    # 2) Reduced datasets (exactly two runs)
+    # 2) Reduced datasets (8 rows total: 2 source models × 2 metrics × 2 retrained models)
     # --------------------------------------------------------
-    reduced_configs = [
-        ("CEBRA_reduced", full_results["CEBRA"]["topk_jf"], False),
-        ("ACORN_reduced", full_results["ACORN"]["topk_jf"], True),
+    retrained_models = [
+        ("CEBRA", False),
+        ("ACORN", True),
     ]
 
-    for reduced_name, idxs, adv in reduced_configs:
-        print(f"\n==================== Reduced dataset: {reduced_name} ====================")
-        print(f"Keeping {len(idxs)} neurons out of {train_data_np.shape[1]}")
+    for source_model_name in ["CEBRA", "ACORN"]:
+        for metric_key in ["jf", "jfinv"]:
+            metric_label = "Jf" if metric_key == "jf" else "Jf-inv"
+            idxs = full_results[source_model_name][f"topk_{metric_key}"]
 
-        reduced_train = train_data_np[:, idxs].astype(np.float32)
-        reduced_valid = valid_data_np[:, idxs].astype(np.float32)
+            print(f"\n==================== Reduced dataset: {source_model_name}_TopK_{metric_label} ====================")
+            print(f"Keeping {len(idxs)} neurons out of {train_data_np.shape[1]}")
 
-        base_r2, per_dim_r2 = train_reduced_model_from_scratch(
-            reduced_train_x_np=reduced_train,
-            reduced_train_y_np=train_continuous_label,
-            reduced_test_x_np=reduced_valid,
-            reduced_test_y_np=valid_continuous_label,
-            adv=adv,
-            output_dim=OUTPUT_DIM,
-        )
+            reduced_train = train_data_np[:, idxs].astype(np.float32)
+            reduced_valid = valid_data_np[:, idxs].astype(np.float32)
 
-        reduced_results.append((reduced_name, base_r2, len(idxs)))
-        rows.append({
-            "dataset": name,
-            "setting": reduced_name,
-            "model": "ACORN" if adv else "CEBRA",
-            "neurons": len(idxs),
-            "base_r2": base_r2,
-            "topk_metric": TOPK_METRIC,
-        })
+            for retrained_name, adv in retrained_models:
+                print(f"\n--- Retraining {retrained_name} on {source_model_name} Top-K ({metric_label}) ---")
 
-        print(f"** {reduced_name} base R2: {base_r2:.4f} **")
+                base_r2, per_dim_r2 = train_reduced_model_from_scratch(
+                    reduced_train_x_np=reduced_train,
+                    reduced_train_y_np=train_continuous_label,
+                    reduced_test_x_np=reduced_valid,
+                    reduced_test_y_np=valid_continuous_label,
+                    adv=adv,
+                    output_dim=OUTPUT_DIM,
+                )
+
+                reduced_results.append((f"{source_model_name}_TopK_{metric_label}", retrained_name, len(idxs), base_r2))
+
+                rows.append({
+                    "dataset": name,
+                    "setting": f"{source_model_name}_TopK_{metric_label}",
+                    "source_model": source_model_name,
+                    "retrained_model": retrained_name,
+                    "neurons": len(idxs),
+                    "base_r2": base_r2,
+                    "topk_metric": metric_key,
+                })
+
+                print(f"** {source_model_name} Top-K ({metric_label}) -> {retrained_name} base R2: {base_r2:.4f} **")
 
     # --------------------------------------------------------
     # 3) Summary
@@ -501,8 +505,11 @@ for name in names:
         )
 
     print("\nReduced dataset results:")
-    for reduced_name, base_r2, n_neurons in reduced_results:
-        print(f"{reduced_name:<28} | neurons={n_neurons:<3d} | base R2={base_r2:.4f}")
+    for source_name, retrained_name, n_neurons, base_r2 in reduced_results:
+        print(
+            f"{source_name}__{retrained_name:<7} | "
+            f"neurons={n_neurons:<3d} | base R2={base_r2:.4f}"
+        )
 
     # --------------------------------------------------------
     # 4) Save CSV
@@ -512,7 +519,6 @@ for name in names:
     print(f"Saved CSV to: {csv_path}")
 
 print("\nPipeline Execution Completed for All Rat Datasets.")
-
 
 
 # import os
