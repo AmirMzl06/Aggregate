@@ -26,8 +26,8 @@ from cebra import CEBRA
 # Config
 # ============================================================
 names = [
-    "achilles",
-    # "buddy",
+    # "achilles",
+    "buddy",
     # "cicero",
     # "gatsby",
 ]
@@ -41,7 +41,7 @@ ATTR_BATCH_SIZE = 128
 RANDOM_SEED = 42
 
 # Smoothness grid (ms). 0.0 means raw / no smoothing.
-SMOOTH_SIGMAS_MS = [75.0]
+SMOOTH_SIGMAS_MS = [100.0]
 
 # The hippocampus dataset is binned in 25ms windows.
 BIN_WIDTH_MS = 25.0
