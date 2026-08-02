@@ -24,8 +24,8 @@ from cebra import CEBRA
 # Config
 # ============================================================
 names = [
-    "achilles",
-    "buddy",
+    # "achilles",
+    # "buddy",
     "cicero",
     "gatsby",
 ]
