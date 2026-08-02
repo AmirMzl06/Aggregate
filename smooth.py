@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
@@ -30,19 +31,16 @@ names = [
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Same setup as your previous rat experiments
 OUTPUT_DIM = 48
 BATCH_SIZE = 2048
 MAX_ITER = 2500
 ATTR_BATCH_SIZE = 128
 RANDOM_SEED = 42
 
-# Smoothing settings
-# Hippocampus data in CEBRA is already binned (25 ms windows), so we
-# smooth the binned spike counts across time with a Gaussian kernel.
+# Hippocampus input is already binned; we smooth the binned spike counts over time.
 BIN_WIDTH_MS = 25.0
-SMOOTH_SIGMA_MS = 100.0   # 100 ms smoothing like your monkey setup
-SMOOTH_TRUNCATE_SIGMA = 4.0  # kernel radius = 4*sigma
+SMOOTH_SIGMA_MS = 100.0
+SMOOTH_TRUNCATE_SIGMA = 4.0
 
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -128,8 +126,8 @@ def gaussian_kernel1d(sigma_bins: float, truncate: float = 4.0):
 
 def smooth_time_series_gaussian(x: np.ndarray, sigma_ms=100.0, bin_width_ms=25.0, truncate=4.0):
     """
-    x: shape (T, N)
     Smooth each neuron's binned spike-count time series with a Gaussian kernel.
+    x: shape (T, N)
     """
     x = np.asarray(x, dtype=np.float32)
     if x.ndim != 2:
@@ -143,7 +141,6 @@ def smooth_time_series_gaussian(x: np.ndarray, sigma_ms=100.0, bin_width_ms=25.0
 
     for n in range(x.shape[1]):
         series = x[:, n].astype(np.float32)
-        # reflect padding to avoid boundary shrinkage
         padded = np.pad(series, (pad, pad), mode="reflect")
         smoothed = np.convolve(padded, kernel, mode="valid")
         x_smooth[:, n] = smoothed.astype(np.float32)
@@ -151,13 +148,10 @@ def smooth_time_series_gaussian(x: np.ndarray, sigma_ms=100.0, bin_width_ms=25.0
     return x_smooth
 
 
-def get_per_neuron_score(attr_tensor, total_neurons):
+def reduce_attr_to_matrix(attr_tensor, total_neurons):
     """
-    Returns one score per neuron regardless of attribution shape:
-    - (samples, latent, neurons)
-    - (samples, neurons, latent)
-    - (latent, neurons)
-    - (neurons, latent)
+    Converts attribution tensor to 2D matrix with shape [latent_dim, neurons]
+    whenever possible.
     """
     attr = torch.abs(attr_tensor)
 
@@ -168,17 +162,40 @@ def get_per_neuron_score(attr_tensor, total_neurons):
     else:
         raise ValueError(f"Unsupported attribution shape: {tuple(attr.shape)}")
 
-    if attr_2d.shape[0] == total_neurons:
-        scores = attr_2d.mean(dim=1)
-    elif attr_2d.shape[1] == total_neurons:
-        scores = attr_2d.mean(dim=0)
+    if attr_2d.shape[1] == total_neurons:
+        matrix = attr_2d
+    elif attr_2d.shape[0] == total_neurons:
+        matrix = attr_2d.T
     else:
         raise ValueError(
             f"Cannot identify neuron axis. Reduced attribution shape={tuple(attr_2d.shape)}, "
             f"total_neurons={total_neurons}"
         )
 
-    return scores.cpu().numpy()
+    return matrix.cpu().numpy()
+
+
+def get_per_neuron_score(attr_tensor, total_neurons):
+    matrix = reduce_attr_to_matrix(attr_tensor, total_neurons)
+    return matrix.mean(axis=0)
+
+
+def save_attr_plot(attr_tensor, total_neurons, save_path, title):
+    matrix = reduce_attr_to_matrix(attr_tensor, total_neurons)
+    matrix = np.asarray(matrix, dtype=np.float32)
+
+    s = float(matrix.sum())
+    if s > 0:
+        matrix = matrix / s
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    im = ax.imshow(matrix, aspect="auto")
+    ax.set_title(title)
+    ax.set_xlabel("Neuron")
+    ax.set_ylabel("Latent dimension")
+    fig.colorbar(im, ax=ax)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def build_cebra_model(adv, adv_epsilon, output_dim=OUTPUT_DIM):
@@ -237,7 +254,6 @@ def train_decoder_with_same_arch(
     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
 
     initial_state = copy.deepcopy(decoder.state_dict())
-
     best_r2 = -1e18
     best_epoch = 1
     best_decoder_state = copy.deepcopy(decoder.state_dict())
@@ -280,8 +296,8 @@ def train_decoder_with_same_arch(
                 f"Loss: {loss.item():.4f} | Val R2: {current_r2:.4f}"
             )
 
-    # Retrain on full train+val set using best_epoch
     decoder.load_state_dict(best_decoder_state)
+
     z_full = torch.cat([z_train, z_val], dim=0)
     y_full = torch.cat([y_train, y_val], dim=0)
 
@@ -311,7 +327,7 @@ def train_decoder_with_same_arch(
         neural_train, neural_val, label_train, label_val
     )
 
-    return decoder, mean_test_r2, per_dim_r2
+    return mean_test_r2, per_dim_r2
 
 
 def train_full_model_and_get_attr(
@@ -366,7 +382,7 @@ def train_full_model_and_get_attr(
     print(f"[{save_name}] Top K (Jf):    {topk_jf_indices.tolist()}")
     print(f"[{save_name}] Top K (Jf-inv): {topk_jfinv_indices.tolist()}")
 
-    decoder, base_r2, per_dim_r2 = train_decoder_with_same_arch(
+    base_r2, per_dim_r2 = train_decoder_with_same_arch(
         cebra_model=model,
         train_x_np=train_x_np,
         train_y_np=train_y_np,
@@ -404,7 +420,6 @@ for name in names:
     print(f" Processing Dataset (Rat): {name} ".center(70, "="))
     print(f"{'='*70}")
 
-    # Load raw hippocampus dataset from CEBRA
     dataset = cebra.datasets.init(f"rat-hippocampus-single-{name}")
 
     neural_data = (
@@ -417,14 +432,12 @@ for name in names:
         else torch.tensor(dataset.continuous_index)
     ).float()
 
-    # Use position + direction like your previous code
+    # position + direction
     y_np = continuous_index[:, :2].numpy().astype(np.float32)
 
     print(f"Raw neural shape: {neural_data.shape} | Labels shape: {y_np.shape}")
 
-    # ------------------------------------------------------------------
-    # Smooth neural data (Gaussian smoothing over time)
-    # ------------------------------------------------------------------
+    # Smooth across time
     neural_np = neural_data.detach().cpu().numpy().astype(np.float32)
     smoothed_neural_np = smooth_time_series_gaussian(
         neural_np,
@@ -447,9 +460,6 @@ for name in names:
 
     full_results = {}
 
-    # --------------------------------------------------------
-    # Train full models (clean / ACORN) and extract Jacobians
-    # --------------------------------------------------------
     for adv in [False, True]:
         cleanup_cuda()
 
@@ -467,7 +477,7 @@ for name in names:
         )
         full_results[model_name] = res
 
-        # Save full attribution tensors / maps
+        # Save tensors/scores
         jf_path = os.path.join(out_dir, f"{name}_{model_name}_jf.npz")
         jfinv_path = os.path.join(out_dir, f"{name}_{model_name}_jfinv.npz")
 
@@ -490,6 +500,26 @@ for name in names:
         print(f"Saved jf tensor to: {jf_path}")
         print(f"Saved jf-inv tensor to: {jfinv_path}")
 
+        # Save plots: 2 per model = 4 per rat
+        jf_plot_path = os.path.join(save_dir, f"{name}_{model_name}_jf.png")
+        jfinv_plot_path = os.path.join(save_dir, f"{name}_{model_name}_jfinv.png")
+
+        save_attr_plot(
+            res["jf_tensor"],
+            total_neurons=train_data_np.shape[1],
+            save_path=jf_plot_path,
+            title=f"{name} | {model_name} | Jf",
+        )
+        save_attr_plot(
+            res["jfinv_tensor"],
+            total_neurons=train_data_np.shape[1],
+            save_path=jfinv_plot_path,
+            title=f"{name} | {model_name} | Jf-inv",
+        )
+
+        print(f"Saved plot to: {jf_plot_path}")
+        print(f"Saved plot to: {jfinv_plot_path}")
+
         rows.append({
             "dataset": name,
             "model": model_name,
@@ -499,11 +529,10 @@ for name in names:
             "adv_epsilon": res["adv_epsilon"],
             "jf_npy": jf_path,
             "jfinv_npy": jfinv_path,
+            "jf_plot": jf_plot_path,
+            "jfinv_plot": jfinv_plot_path,
         })
 
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
     print("\n" + "#" * 80)
     print(f" SUMMARY FOR {name} ".center(80, "#"))
     print("#" * 80)
@@ -515,15 +544,13 @@ for name in names:
             f"topJfinv K = {len(full_results[model_name]['topk_jfinv'])}"
         )
 
-    print("\nSaved attribution outputs:")
+    print("\nSaved outputs:")
     print(f"- {name}_CEBRA_jf.npz")
     print(f"- {name}_CEBRA_jfinv.npz")
     print(f"- {name}_ACORN_jf.npz")
     print(f"- {name}_ACORN_jfinv.npz")
+    print(f"- plots under images/{name}/")
 
-    # --------------------------------------------------------
-    # Save CSV summary
-    # --------------------------------------------------------
     csv_path = os.path.join(out_dir, f"{name}_smoothed_full_results.csv")
     pd.DataFrame(rows).to_csv(csv_path, index=False)
     print(f"Saved CSV to: {csv_path}")
