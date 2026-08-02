@@ -366,7 +366,7 @@ def train_full_model_and_get_attr(
     print(f"[{save_name}] Top K (Jf):    {topk_jf_indices.tolist()}")
     print(f"[{save_name}] Top K (Jf-inv): {topk_jfinv_indices.tolist()}")
 
-    base_r2, per_dim_r2 = train_decoder_with_same_arch(
+    decoder, base_r2, per_dim_r2 = train_decoder_with_same_arch(
         cebra_model=model,
         train_x_np=train_x_np,
         train_y_np=train_y_np,
