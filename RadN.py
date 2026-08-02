@@ -16,7 +16,6 @@ from utils.min_distance import min_l2_distance
 from utils.constants import CEBRA_DIR, DATA_DIR
 
 # Put gaussian_smoothing.py next to this script
-from gaussian_smoothing import gaussian_smooth_spikes
 
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
