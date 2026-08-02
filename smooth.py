@@ -27,8 +27,8 @@ from cebra import CEBRA
 names = [
     # "achilles",
     "buddy",
-    "cicero",
-    "gatsby",
+    # "cicero",
+    # "gatsby",
 ]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,7 +39,7 @@ MAX_ITER = 2500
 ATTR_BATCH_SIZE = 128
 RANDOM_SEED = 42
 
-SMOOTH_SIGMA_GRID_MS = [75.0]#, 50.0, 75.0 , 100.0]
+SMOOTH_SIGMA_GRID_MS = [25.0, 50.0, 75.0 , 100.0]
 BIN_WIDTH_MS = 25.0
 SQUARE_ROOT_PRE_SMOOTH = False
 
