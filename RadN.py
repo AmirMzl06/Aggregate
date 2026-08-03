@@ -532,7 +532,7 @@ for name in names:
         )
         full_results[model_name] = res
 
-        rows.append({
+        all_rows.append({
             "dataset": name,
             "setting": "full",
             "source_model": model_name,
