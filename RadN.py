@@ -696,10 +696,10 @@ from cebra import CEBRA
 # Config
 # ============================================================
 names = [
-    # "achilles",
+    "achilles",
     # "buddy",
-    "cicero",
-    "gatsby",
+    # "cicero",
+    # "gatsby",
 ]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
