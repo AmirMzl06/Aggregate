@@ -23,7 +23,7 @@ from cebra import CEBRA
 # Config
 # ============================================================
 names = [
-    "achilles",
+    # "achilles",
     "buddy",
     "cicero",
     "gatsby",
@@ -109,20 +109,26 @@ def cleanup_cuda(*objs):
         torch.cuda.ipc_collect()
 
 
-def zscore_fit_transform(train_x, test_x, eps=1e-8):
+def zscore_fit_transform(train_x, test_x, eps=1e-5):
     """
-    Per-neuron z-score using train statistics only.
+    Per-neuron z-score using train statistics only, with clipping to prevent float16 overflow.
     """
     train_x = np.asarray(train_x, dtype=np.float32)
     test_x = np.asarray(test_x, dtype=np.float32)
 
     mu = train_x.mean(axis=0, keepdims=True)
     sigma = train_x.std(axis=0, keepdims=True)
+    
     sigma = np.maximum(sigma, eps)
 
     train_z = (train_x - mu) / sigma
     test_z = (test_x - mu) / sigma
+    
+    train_z = np.clip(train_z, -20.0, 20.0)
+    test_z = np.clip(test_z, -20.0, 20.0)
+
     return train_z.astype(np.float32), test_z.astype(np.float32), mu.astype(np.float32), sigma.astype(np.float32)
+
 
 
 def reduce_attr_to_matrix(attr_tensor, total_neurons):
