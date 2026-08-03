@@ -10,12 +10,9 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
-from scipy import stats
 
 from utils.min_distance import min_l2_distance
 from utils.constants import CEBRA_DIR, DATA_DIR
-
-# Put gaussian_smoothing.py next to this script
 
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
@@ -35,19 +32,14 @@ names = [
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 OUTPUT_DIM = 48
-BATCH_SIZE = 2048
+BATCH_SIZE = 1024
 MAX_ITER = 2500
 ATTR_BATCH_SIZE = 128
 RANDOM_SEED = 42
 
-# Smoothness grid (ms). 0.0 means raw / no smoothing.
-SMOOTH_SIGMAS_MS = [100.0]
-
-# The hippocampus dataset is binned in 25ms windows.
-BIN_WIDTH_MS = 25.0
-
-# Whether to apply sqrt before smoothing
-SQRT_BEFORE_SMOOTH = False
+NUM_FAKE_NEURONS = 0  # raw only
+Z_CLIP = 20.0
+Z_EPS = 1e-3
 
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -61,7 +53,7 @@ os.environ["CEBRA_DATADIR"] = os.path.abspath(DATA_DIR)
 
 
 # ============================================================
-# Decoder
+# Local decoder
 # ============================================================
 class TwoLayerMLP(nn.Module):
     def __init__(self, input_dim=32, hidden_dim=64, output_dim=2, dropout_rate=0.4):
@@ -120,79 +112,37 @@ def cleanup_cuda(*objs):
         torch.cuda.ipc_collect()
 
 
-# ============================================================
-# Exact smoothing function from your instructor
-# ============================================================
-def gaussian_smooth_spikes(spikes, bin_size, kernel_sd, sqrt=False):
+def zscore_fit_transform(train_x, test_x, eps=Z_EPS, clip_value=Z_CLIP):
     """
-    Gaussian smoothing of spike counts.
-
-    Args:
-        spikes: numpy array of shape (T, N)
-        bin_size: bin width (same unit as kernel_sd)
-        kernel_sd: standard deviation of Gaussian kernel
-        sqrt: whether to apply sqrt transform before smoothing
-
-    Returns:
-        Smoothed spikes of shape (T, N)
+    Per-neuron z-score using train statistics only, with clipping.
     """
-    return_tensor = False
-    if isinstance(spikes, torch.Tensor):
-        spikes = spikes.detach().cpu().numpy()
-        return_tensor = True
+    train_x = np.asarray(train_x, dtype=np.float32)
+    test_x = np.asarray(test_x, dtype=np.float32)
 
-    spikes = np.asarray(spikes, dtype=np.float32)
+    mu = train_x.mean(axis=0, keepdims=True)
+    sigma = train_x.std(axis=0, keepdims=True)
+    sigma = np.maximum(sigma, eps)
 
-    if sqrt:
-        spikes = np.sqrt(spikes)
+    train_z = (train_x - mu) / sigma
+    test_z = (test_x - mu) / sigma
 
-    kernel_hl = 3 * int(kernel_sd / bin_size)
+    train_z = np.nan_to_num(train_z, nan=0.0, posinf=clip_value, neginf=-clip_value)
+    test_z = np.nan_to_num(test_z, nan=0.0, posinf=clip_value, neginf=-clip_value)
 
-    normal = stats.norm(0, kernel_sd)
-    x = np.arange(-kernel_hl * bin_size,
-                  (kernel_hl + 1) * bin_size,
-                  bin_size)
-    kernel = normal.pdf(x)
+    train_z = np.clip(train_z, -clip_value, clip_value)
+    test_z = np.clip(test_z, -clip_value, clip_value)
 
-    T = spikes.shape[0]
-
-    # Edge normalization (same as original code)
-    nm = np.convolve(kernel, np.ones(T))[kernel_hl:T + kernel_hl]
-
-    smoothed = np.empty_like(spikes, dtype=np.float32)
-
-    for n in range(spikes.shape[1]):
-        conv = np.convolve(kernel, spikes[:, n])
-        smoothed[:, n] = conv[kernel_hl:T + kernel_hl] / nm
-
-    if return_tensor:
-        smoothed = torch.from_numpy(smoothed)
-
-    return smoothed
-
-
-def smooth_with_grid(spikes_np, sigma_ms, bin_width_ms=25.0, sqrt=False):
-    """
-    sigma_ms <= 0 -> return raw spikes.
-    """
-    spikes_np = np.asarray(spikes_np, dtype=np.float32)
-
-    if sigma_ms <= 0:
-        if sqrt:
-            return np.sqrt(spikes_np).astype(np.float32)
-        return spikes_np.copy()
-
-    return gaussian_smooth_spikes(
-        spikes_np,
-        bin_size=bin_width_ms,
-        kernel_sd=sigma_ms,
-        sqrt=sqrt,
-    ).astype(np.float32)
+    return (
+        train_z.astype(np.float32),
+        test_z.astype(np.float32),
+        mu.astype(np.float32),
+        sigma.astype(np.float32),
+    )
 
 
 def reduce_attr_to_matrix(attr_tensor, total_neurons):
     """
-    Convert attribution tensor to a 2D matrix [latent_dim, neurons] whenever possible.
+    Convert attribution tensor to 2D matrix [latent_dim, neurons] whenever possible.
     """
     attr = torch.abs(attr_tensor)
 
@@ -216,11 +166,6 @@ def reduce_attr_to_matrix(attr_tensor, total_neurons):
     return mat.detach().cpu().numpy().astype(np.float32)
 
 
-def get_per_neuron_score(attr_tensor, total_neurons):
-    mat = reduce_attr_to_matrix(attr_tensor, total_neurons)
-    return mat.mean(axis=0)
-
-
 def normalize_map_for_plot(mat):
     mat = np.asarray(mat, dtype=np.float32)
     s = float(mat.sum())
@@ -232,7 +177,6 @@ def normalize_map_for_plot(mat):
 def save_four_panel_figure(
     save_path,
     dataset_name,
-    sigma_ms,
     clean_jf_map,
     acorn_jf_map,
     clean_jfinv_map,
@@ -265,7 +209,7 @@ def save_four_panel_figure(
         ax.set_xlabel("Neuron")
         ax.set_ylabel("Latent dim")
 
-    fig.suptitle(f"{dataset_name} | Gaussian smoothing sigma = {sigma_ms:g} ms", fontsize=16)
+    fig.suptitle(f"{dataset_name} | raw + z-score", fontsize=16)
     fig.colorbar(last_im, ax=axes.ravel().tolist(), shrink=0.9, label="Normalized |attribution|")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -471,6 +415,10 @@ def train_full_model_and_get_attr(
         decoder_iters=10000,
     )
 
+    decoder_save_path = os.path.join(out_dir, f"decoder_{save_name}.pth")
+    torch.save(decoder.state_dict(), decoder_save_path)
+    print("Saved decoder to:", decoder_save_path)
+
     cleanup_cuda(model, trained_model, input_tensor, method, result, jf_tensor, jfinv_tensor, decoder)
 
     return {
@@ -542,200 +490,922 @@ for name in names:
         else torch.tensor(dataset.continuous_index)
     ).float()
 
-    # position + direction
     y_np = continuous_index[:, :2].numpy().astype(np.float32)
 
     print(f"Raw neural shape: {neural_data.shape} | Labels shape: {y_np.shape}")
 
     neural_np = neural_data.detach().cpu().numpy().astype(np.float32)
 
-    for smooth_sigma_ms in SMOOTH_SIGMAS_MS:
-        sigma_tag = "raw" if smooth_sigma_ms <= 0 else f"{smooth_sigma_ms:g}".replace(".", "p")
-        sigma_dir = os.path.join(img_dir, name, f"sigma_{sigma_tag}")
-        os.makedirs(sigma_dir, exist_ok=True)
+    split_idx = int(0.8 * len(neural_np))
+    train_raw = neural_np[:split_idx]
+    test_raw = neural_np[split_idx:]
+    train_y = y_np[:split_idx]
+    test_y = y_np[split_idx:]
 
-        print(f"\n--- Smoothing sigma = {smooth_sigma_ms:g} ms ---")
+    train_data_np, valid_data_np, mu, sigma = zscore_fit_transform(train_raw, test_raw)
+    print("Z-scored neural shape:", train_data_np.shape, valid_data_np.shape)
+    print("Any NaN in train?", np.isnan(train_data_np).any(), "Any inf?", np.isinf(train_data_np).any())
+    print("Any NaN in test?", np.isnan(valid_data_np).any(), "Any inf?", np.isinf(valid_data_np).any())
 
-        smoothed_neural_np = smooth_with_grid(
-            neural_np,
-            sigma_ms=smooth_sigma_ms,
-            bin_width_ms=BIN_WIDTH_MS,
-            sqrt=SQRT_BEFORE_SMOOTH,
-        ).astype(np.float32)
+    save_dir = os.path.join(img_dir, name)
+    os.makedirs(save_dir, exist_ok=True)
 
-        print("Smoothed neural shape:", smoothed_neural_np.shape)
+    full_results = {}
 
-        split_idx = int(0.8 * len(smoothed_neural_np))
-        train_data_np = smoothed_neural_np[:split_idx].astype(np.float32)
-        valid_data_np = smoothed_neural_np[split_idx:].astype(np.float32)
+    # --------------------------------------------------------
+    # 1) Train full models and extract top-k
+    # --------------------------------------------------------
+    for adv in [False, True]:
+        cleanup_cuda()
 
-        train_continuous_label = y_np[:split_idx]
-        valid_continuous_label = y_np[split_idx:]
+        model_name = "ACORN" if adv else "CEBRA"
+        print(f"\n==================== Training FULL {model_name} ====================")
 
-        full_results = {}
-
-        # ----------------------------------------------------
-        # Full models: CEBRA and ACORN
-        # ----------------------------------------------------
-        for adv in [False, True]:
-            cleanup_cuda()
-
-            model_name = "ACORN" if adv else "CEBRA"
-            print(f"\n==================== Training FULL {model_name} ====================")
-
-            res = train_full_model_and_get_attr(
-                train_x_np=train_data_np,
-                train_y_np=train_continuous_label,
-                test_x_np=valid_data_np,
-                test_y_np=valid_continuous_label,
-                adv=adv,
-                total_neurons=train_data_np.shape[1],
-                output_dim=OUTPUT_DIM,
-            )
-            full_results[model_name] = res
-
-            # Save compact attribution outputs
-            npz_path = os.path.join(out_dir, f"{name}_sigma{sigma_tag}_{model_name}_attrs.npz")
-            np.savez_compressed(
-                npz_path,
-                jf_map=res["jf_map"].astype(np.float32),
-                jfinv_map=res["jfinv_map"].astype(np.float32),
-                jf_scores=res["jf_scores"].astype(np.float32),
-                jfinv_scores=res["jfinv_scores"].astype(np.float32),
-                topk_jf=res["topk_jf"].astype(np.int32),
-                topk_jfinv=res["topk_jfinv"].astype(np.int32),
-                base_r2=np.array([res["base_r2"]], dtype=np.float32),
-                adv_epsilon=np.array([res["adv_epsilon"]], dtype=np.float32),
-            )
-            print(f"Saved attribution npz to: {npz_path}")
-
-            all_rows.append({
-                "dataset": name,
-                "sigma_ms": smooth_sigma_ms,
-                "setting": "full",
-                "source_model": model_name,
-                "retrained_model": model_name,
-                "neurons": train_data_np.shape[1],
-                "base_r2": res["base_r2"],
-                "adv_epsilon": res["adv_epsilon"],
-                "artifact": npz_path,
-            })
-
-        # ----------------------------------------------------
-        # One 2x2 figure per setup:
-        # top row = Jf, bottom row = Jf-inv
-        # left = CEBRA, right = ACORN
-        # ----------------------------------------------------
-        panel_path = os.path.join(sigma_dir, f"{name}_sigma{sigma_tag}_4panel.png")
-        save_four_panel_figure(
-            save_path=panel_path,
-            dataset_name=name,
-            sigma_ms=smooth_sigma_ms,
-            clean_jf_map=full_results["CEBRA"]["jf_map"],
-            acorn_jf_map=full_results["ACORN"]["jf_map"],
-            clean_jfinv_map=full_results["CEBRA"]["jfinv_map"],
-            acorn_jfinv_map=full_results["ACORN"]["jfinv_map"],
-            clean_r2=full_results["CEBRA"]["base_r2"],
-            acorn_r2=full_results["ACORN"]["base_r2"],
+        res = train_full_model_and_get_attr(
+            train_x_np=train_data_np,
+            train_y_np=train_y,
+            test_x_np=valid_data_np,
+            test_y_np=test_y,
+            adv=adv,
+            total_neurons=train_data_np.shape[1],
+            output_dim=OUTPUT_DIM,
         )
-        print(f"Saved 4-panel figure to: {panel_path}")
+        full_results[model_name] = res
 
-        # ----------------------------------------------------
-        # Reduced retraining: 8 states
-        # 4 reduced datasets (CEBRA/ACORN × Jf/Jf-inv)
-        # × 2 retrained models (CEBRA/ACORN)
-        # ----------------------------------------------------
-        reduced_results = []
+        rows.append({
+            "dataset": name,
+            "setting": "full",
+            "source_model": model_name,
+            "retrained_model": model_name,
+            "neurons": train_data_np.shape[1],
+            "base_r2": res["base_r2"],
+            "adv_epsilon": res["adv_epsilon"],
+            "topk_metric": "jf/jfinv",
+        })
 
-        for source_model_name in ["CEBRA", "ACORN"]:
-            for metric_key in ["jf", "jfinv"]:
-                metric_label = "Jf" if metric_key == "jf" else "Jf-inv"
-                idxs = full_results[source_model_name][f"topk_{metric_key}"]
+        npz_path = os.path.join(out_dir, f"{name}_{model_name}_raw_zscore_attrs.npz")
+        np.savez_compressed(
+            npz_path,
+            jf_map=res["jf_map"].astype(np.float32),
+            jfinv_map=res["jfinv_map"].astype(np.float32),
+            jf_scores=res["jf_scores"].astype(np.float32),
+            jfinv_scores=res["jfinv_scores"].astype(np.float32),
+            topk_jf=res["topk_jf"].astype(np.int32),
+            topk_jfinv=res["topk_jfinv"].astype(np.int32),
+            base_r2=np.array([res["base_r2"]], dtype=np.float32),
+            adv_epsilon=np.array([res["adv_epsilon"]], dtype=np.float32),
+            zscore_mu=mu,
+            zscore_sigma=sigma,
+        )
+        print(f"Saved attribution npz to: {npz_path}")
+
+    # --------------------------------------------------------
+    # 2) Save one 2x2 figure per rat:
+    #    top row = Jf, bottom row = Jf-inv
+    #    left = CEBRA, right = ACORN
+    # --------------------------------------------------------
+    panel_path = os.path.join(save_dir, f"{name}_raw_zscore_4panel.png")
+    save_four_panel_figure(
+        save_path=panel_path,
+        dataset_name=name,
+        clean_jf_map=full_results["CEBRA"]["jf_map"],
+        acorn_jf_map=full_results["ACORN"]["jf_map"],
+        clean_jfinv_map=full_results["CEBRA"]["jfinv_map"],
+        acorn_jfinv_map=full_results["ACORN"]["jfinv_map"],
+        clean_r2=full_results["CEBRA"]["base_r2"],
+        acorn_r2=full_results["ACORN"]["base_r2"],
+    )
+    print(f"Saved 4-panel figure to: {panel_path}")
+
+    # --------------------------------------------------------
+    # 3) Reduced retraining: 8 states
+    #    4 reduced datasets (CEBRA/ACORN × Jf/Jf-inv)
+    #    × 2 retrained models (CEBRA/ACORN)
+    # --------------------------------------------------------
+    reduced_results = []
+
+    for source_model_name in ["CEBRA", "ACORN"]:
+        for metric_key in ["jf", "jfinv"]:
+            metric_label = "Jf" if metric_key == "jf" else "Jf-inv"
+            idxs = full_results[source_model_name][f"topk_{metric_key}"]
+
+            print(
+                f"\n==================== Reduced dataset: "
+                f"{source_model_name}_TopK_{metric_label} ===================="
+            )
+            print(f"Keeping {len(idxs)} neurons out of {train_data_np.shape[1]}")
+
+            reduced_train = train_data_np[:, idxs].astype(np.float32)
+            reduced_valid = valid_data_np[:, idxs].astype(np.float32)
+
+            for retrained_name, adv in [("CEBRA", False), ("ACORN", True)]:
+                print(
+                    f"\n--- Retraining {retrained_name} on "
+                    f"{source_model_name} Top-K ({metric_label}) ---"
+                )
+
+                base_r2, per_dim_r2 = train_reduced_model_from_scratch(
+                    reduced_train_x_np=reduced_train,
+                    reduced_train_y_np=train_y,
+                    reduced_test_x_np=reduced_valid,
+                    reduced_test_y_np=test_y,
+                    adv=adv,
+                    output_dim=OUTPUT_DIM,
+                )
+
+                reduced_results.append(
+                    (
+                        f"{source_model_name}_TopK_{metric_label}",
+                        retrained_name,
+                        len(idxs),
+                        base_r2,
+                    )
+                )
+
+                all_rows.append({
+                    "dataset": name,
+                    "setting": f"{source_model_name}_TopK_{metric_label}",
+                    "source_model": source_model_name,
+                    "retrained_model": retrained_name,
+                    "neurons": len(idxs),
+                    "base_r2": base_r2,
+                    "adv_epsilon": np.nan,
+                    "topk_metric": metric_label,
+                })
 
                 print(
-                    f"\n==================== Reduced dataset: "
-                    f"{source_model_name}_TopK_{metric_label} ===================="
+                    f"** {source_model_name} Top-K ({metric_label}) -> "
+                    f"{retrained_name} base R2: {base_r2:.4f} **"
                 )
-                print(f"Keeping {len(idxs)} neurons out of {train_data_np.shape[1]}")
 
-                reduced_train = train_data_np[:, idxs].astype(np.float32)
-                reduced_valid = valid_data_np[:, idxs].astype(np.float32)
+    # --------------------------------------------------------
+    # 4) Summary
+    # --------------------------------------------------------
+    print("\n" + "#" * 80)
+    print(f" SUMMARY FOR {name} (RAW + Z-SCORE) ".center(80, "#"))
+    print("#" * 80)
 
-                for retrained_name, adv in [("CEBRA", False), ("ACORN", True)]:
-                    print(
-                        f"\n--- Retraining {retrained_name} on "
-                        f"{source_model_name} Top-K ({metric_label}) ---"
-                    )
-
-                    base_r2, per_dim_r2 = train_reduced_model_from_scratch(
-                        reduced_train_x_np=reduced_train,
-                        reduced_train_y_np=train_continuous_label,
-                        reduced_test_x_np=reduced_valid,
-                        reduced_test_y_np=valid_continuous_label,
-                        adv=adv,
-                        output_dim=OUTPUT_DIM,
-                    )
-
-                    reduced_results.append(
-                        (
-                            f"{source_model_name}_TopK_{metric_label}",
-                            retrained_name,
-                            len(idxs),
-                            base_r2,
-                        )
-                    )
-
-                    all_rows.append({
-                        "dataset": name,
-                        "sigma_ms": smooth_sigma_ms,
-                        "setting": f"{source_model_name}_TopK_{metric_label}",
-                        "source_model": source_model_name,
-                        "retrained_model": retrained_name,
-                        "neurons": len(idxs),
-                        "base_r2": base_r2,
-                        "adv_epsilon": np.nan,
-                        "artifact": "",
-                    })
-
-                    print(
-                        f"** {source_model_name} Top-K ({metric_label}) -> "
-                        f"{retrained_name} base R2: {base_r2:.4f} **"
-                    )
-
-        # ----------------------------------------------------
-        # Summary for this sigma
-        # ----------------------------------------------------
-        print("\n" + "#" * 80)
-        print(f" SUMMARY FOR {name} | sigma={smooth_sigma_ms:g} ms ".center(80, "#"))
-        print("#" * 80)
-
-        for model_name in ["CEBRA", "ACORN"]:
-            print(
-                f"{model_name:>6} | full base R2 = {full_results[model_name]['base_r2']:.4f} | "
-                f"topJf K = {len(full_results[model_name]['topk_jf'])} | "
-                f"topJfinv K = {len(full_results[model_name]['topk_jfinv'])}"
-            )
-
-        print("\nReduced dataset results:")
-        for source_name, retrained_name, n_neurons, base_r2 in reduced_results:
-            print(
-                f"{source_name}__{retrained_name:<7} | "
-                f"neurons={n_neurons:<3d} | base R2={base_r2:.4f}"
-            )
-
-        sigma_csv = os.path.join(out_dir, f"{name}_sigma{sigma_tag}_full_and_reduced_results.csv")
-        pd.DataFrame([r for r in all_rows if r["dataset"] == name and r["sigma_ms"] == smooth_sigma_ms]).to_csv(
-            sigma_csv,
-            index=False,
+    for model_name in ["CEBRA", "ACORN"]:
+        print(
+            f"{model_name:>6} | full base R2 = {full_results[model_name]['base_r2']:.4f} | "
+            f"topJf K = {len(full_results[model_name]['topk_jf'])} | "
+            f"topJfinv K = {len(full_results[model_name]['topk_jfinv'])}"
         )
-        print(f"Saved CSV to: {sigma_csv}")
 
-    print(f"\nFinished dataset: {name}")
+    print("\nReduced dataset results:")
+    for source_name, retrained_name, n_neurons, base_r2 in reduced_results:
+        print(
+            f"{source_name}__{retrained_name:<7} | "
+            f"neurons={n_neurons:<3d} | base R2={base_r2:.4f}"
+        )
 
-summary_csv = os.path.join(out_dir, "rat_smoothed_grid_full_and_reduced_summary.csv")
+    csv_path = os.path.join(out_dir, f"{name}_raw_zscore_full_and_reduced_results.csv")
+    pd.DataFrame([r for r in all_rows if r["dataset"] == name]).to_csv(csv_path, index=False)
+    print(f"Saved CSV to: {csv_path}")
+
+summary_csv = os.path.join(out_dir, "rat_raw_zscore_full_and_reduced_summary.csv")
 pd.DataFrame(all_rows).to_csv(summary_csv, index=False)
 print(f"\nSaved global CSV summary to: {summary_csv}")
 print("\nPipeline Execution Completed for All Rat Datasets.")
+
+# import os
+# import sys
+# import gc
+# import copy
+# import numpy as np
+# import pandas as pd
+# import torch
+# import torch.nn as nn
+# import matplotlib.pyplot as plt
+
+# from sklearn.metrics import r2_score
+# from sklearn.model_selection import train_test_split
+# from scipy import stats
+
+# from utils.min_distance import min_l2_distance
+# from utils.constants import CEBRA_DIR, DATA_DIR
+
+# # Put gaussian_smoothing.py next to this script
+
+# sys.path.insert(0, str(CEBRA_DIR))
+# import cebra
+# from cebra import CEBRA
+
+
+# # ============================================================
+# # Config
+# # ============================================================
+# names = [
+#     # "achilles",
+#     "buddy",
+#     # "cicero",
+#     # "gatsby",
+# ]
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# OUTPUT_DIM = 48
+# BATCH_SIZE = 2048
+# MAX_ITER = 2500
+# ATTR_BATCH_SIZE = 128
+# RANDOM_SEED = 42
+
+# # Smoothness grid (ms). 0.0 means raw / no smoothing.
+# SMOOTH_SIGMAS_MS = [100.0]
+
+# # The hippocampus dataset is binned in 25ms windows.
+# BIN_WIDTH_MS = 25.0
+
+# # Whether to apply sqrt before smoothing
+# SQRT_BEFORE_SMOOTH = False
+
+# np.random.seed(RANDOM_SEED)
+# torch.manual_seed(RANDOM_SEED)
+
+# out_dir = "outputs"
+# img_dir = "images"
+# os.makedirs(out_dir, exist_ok=True)
+# os.makedirs(img_dir, exist_ok=True)
+
+# os.environ["CEBRA_DATADIR"] = os.path.abspath(DATA_DIR)
+
+
+# # ============================================================
+# # Decoder
+# # ============================================================
+# class TwoLayerMLP(nn.Module):
+#     def __init__(self, input_dim=32, hidden_dim=64, output_dim=2, dropout_rate=0.4):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim),
+#             nn.LayerNorm(hidden_dim),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(hidden_dim, output_dim),
+#         )
+#         self._initialize_weights()
+
+#     def _initialize_weights(self):
+#         for layer in self.net:
+#             if isinstance(layer, nn.Linear):
+#                 nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+#                 if layer.bias is not None:
+#                     nn.init.constant_(layer.bias, 0)
+
+#     def forward(self, x):
+#         return self.net(x)
+
+
+# # ============================================================
+# # Helpers
+# # ============================================================
+# def to_numpy(x):
+#     if isinstance(x, torch.Tensor):
+#         return x.detach().cpu().numpy()
+#     return np.asarray(x)
+
+
+# def mean_r2_score(y_true, y_pred):
+#     scores = []
+#     for i in range(y_true.shape[1]):
+#         scores.append(r2_score(y_true[:, i], y_pred[:, i]))
+#     return float(np.mean(scores)), scores
+
+
+# def get_embeddings(cebra_model, x_np):
+#     x_t = torch.from_numpy(x_np).float()
+#     emb = cebra_model.transform(x_t)
+#     return to_numpy(emb)
+
+
+# def cleanup_cuda(*objs):
+#     for obj in objs:
+#         try:
+#             del obj
+#         except Exception:
+#             pass
+#     gc.collect()
+#     if torch.cuda.is_available():
+#         torch.cuda.empty_cache()
+#         torch.cuda.ipc_collect()
+
+
+# # ============================================================
+# # Exact smoothing function from your instructor
+# # ============================================================
+# def gaussian_smooth_spikes(spikes, bin_size, kernel_sd, sqrt=False):
+#     """
+#     Gaussian smoothing of spike counts.
+
+#     Args:
+#         spikes: numpy array of shape (T, N)
+#         bin_size: bin width (same unit as kernel_sd)
+#         kernel_sd: standard deviation of Gaussian kernel
+#         sqrt: whether to apply sqrt transform before smoothing
+
+#     Returns:
+#         Smoothed spikes of shape (T, N)
+#     """
+#     return_tensor = False
+#     if isinstance(spikes, torch.Tensor):
+#         spikes = spikes.detach().cpu().numpy()
+#         return_tensor = True
+
+#     spikes = np.asarray(spikes, dtype=np.float32)
+
+#     if sqrt:
+#         spikes = np.sqrt(spikes)
+
+#     kernel_hl = 3 * int(kernel_sd / bin_size)
+
+#     normal = stats.norm(0, kernel_sd)
+#     x = np.arange(-kernel_hl * bin_size,
+#                   (kernel_hl + 1) * bin_size,
+#                   bin_size)
+#     kernel = normal.pdf(x)
+
+#     T = spikes.shape[0]
+
+#     # Edge normalization (same as original code)
+#     nm = np.convolve(kernel, np.ones(T))[kernel_hl:T + kernel_hl]
+
+#     smoothed = np.empty_like(spikes, dtype=np.float32)
+
+#     for n in range(spikes.shape[1]):
+#         conv = np.convolve(kernel, spikes[:, n])
+#         smoothed[:, n] = conv[kernel_hl:T + kernel_hl] / nm
+
+#     if return_tensor:
+#         smoothed = torch.from_numpy(smoothed)
+
+#     return smoothed
+
+
+# def smooth_with_grid(spikes_np, sigma_ms, bin_width_ms=25.0, sqrt=False):
+#     """
+#     sigma_ms <= 0 -> return raw spikes.
+#     """
+#     spikes_np = np.asarray(spikes_np, dtype=np.float32)
+
+#     if sigma_ms <= 0:
+#         if sqrt:
+#             return np.sqrt(spikes_np).astype(np.float32)
+#         return spikes_np.copy()
+
+#     return gaussian_smooth_spikes(
+#         spikes_np,
+#         bin_size=bin_width_ms,
+#         kernel_sd=sigma_ms,
+#         sqrt=sqrt,
+#     ).astype(np.float32)
+
+
+# def reduce_attr_to_matrix(attr_tensor, total_neurons):
+#     """
+#     Convert attribution tensor to a 2D matrix [latent_dim, neurons] whenever possible.
+#     """
+#     attr = torch.abs(attr_tensor)
+
+#     if attr.ndim == 3:
+#         attr_2d = attr.mean(dim=0)
+#     elif attr.ndim == 2:
+#         attr_2d = attr
+#     else:
+#         raise ValueError(f"Unsupported attribution shape: {tuple(attr.shape)}")
+
+#     if attr_2d.shape[1] == total_neurons:
+#         mat = attr_2d
+#     elif attr_2d.shape[0] == total_neurons:
+#         mat = attr_2d.T
+#     else:
+#         raise ValueError(
+#             f"Cannot identify neuron axis. Reduced attribution shape={tuple(attr_2d.shape)}, "
+#             f"total_neurons={total_neurons}"
+#         )
+
+#     return mat.detach().cpu().numpy().astype(np.float32)
+
+
+# def get_per_neuron_score(attr_tensor, total_neurons):
+#     mat = reduce_attr_to_matrix(attr_tensor, total_neurons)
+#     return mat.mean(axis=0)
+
+
+# def normalize_map_for_plot(mat):
+#     mat = np.asarray(mat, dtype=np.float32)
+#     s = float(mat.sum())
+#     if s > 0:
+#         mat = mat / s
+#     return mat
+
+
+# def save_four_panel_figure(
+#     save_path,
+#     dataset_name,
+#     sigma_ms,
+#     clean_jf_map,
+#     acorn_jf_map,
+#     clean_jfinv_map,
+#     acorn_jfinv_map,
+#     clean_r2,
+#     acorn_r2,
+# ):
+#     mats = [
+#         normalize_map_for_plot(clean_jf_map),
+#         normalize_map_for_plot(acorn_jf_map),
+#         normalize_map_for_plot(clean_jfinv_map),
+#         normalize_map_for_plot(acorn_jfinv_map),
+#     ]
+
+#     vmax = max(float(m.max()) for m in mats)
+#     vmax = max(vmax, 1e-8)
+
+#     fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+#     titles = [
+#         f"CEBRA | Jf\nR2={clean_r2:.4f}",
+#         f"ACORN | Jf\nR2={acorn_r2:.4f}",
+#         f"CEBRA | Jf-inv\nR2={clean_r2:.4f}",
+#         f"ACORN | Jf-inv\nR2={acorn_r2:.4f}",
+#     ]
+
+#     last_im = None
+#     for ax, mat, title in zip(axes.flat, mats, titles):
+#         last_im = ax.imshow(mat, aspect="auto", vmin=0.0, vmax=vmax, cmap="cividis")
+#         ax.set_title(title)
+#         ax.set_xlabel("Neuron")
+#         ax.set_ylabel("Latent dim")
+
+#     fig.suptitle(f"{dataset_name} | Gaussian smoothing sigma = {sigma_ms:g} ms", fontsize=16)
+#     fig.colorbar(last_im, ax=axes.ravel().tolist(), shrink=0.9, label="Normalized |attribution|")
+#     fig.tight_layout(rect=[0, 0, 1, 0.95])
+#     fig.savefig(save_path, dpi=300, bbox_inches="tight")
+#     plt.close(fig)
+
+
+# def build_cebra_model(adv, adv_epsilon, output_dim=OUTPUT_DIM):
+#     return CEBRA(
+#         batch_size=BATCH_SIZE,
+#         temperature=0.4,
+#         model_architecture="offset36-model-more-dropout",
+#         time_offsets=4,
+#         max_iterations=MAX_ITER,
+#         output_dimension=output_dim,
+#         verbose=True,
+#         training_mode="adversarial" if adv else "clean",
+#         adv_alpha=adv_epsilon / 5 if adv else 0.0,
+#         adv_epsilon=adv_epsilon if adv else 0.0,
+#         adv_steps=10 if adv else 0,
+#         attack_norm="linf",
+#         num_hidden_units=32,
+#     )
+
+
+# def train_decoder_with_same_arch(
+#     cebra_model,
+#     train_x_np,
+#     train_y_np,
+#     test_x_np,
+#     test_y_np,
+#     input_dim,
+#     hidden_dim=64,
+#     dropout_rate=0.4,
+#     decoder_iters=10000,
+# ):
+#     neural_train, neural_val, label_train, label_val = train_test_split(
+#         train_x_np,
+#         train_y_np,
+#         test_size=0.125,
+#         random_state=42,
+#         shuffle=False,
+#     )
+
+#     z_train = torch.from_numpy(get_embeddings(cebra_model, neural_train)).float().to(device)
+#     z_val = torch.from_numpy(get_embeddings(cebra_model, neural_val)).float().to(device)
+#     z_test = torch.from_numpy(get_embeddings(cebra_model, test_x_np)).float().to(device)
+
+#     y_train = torch.from_numpy(label_train).float().to(device)
+#     y_val = torch.from_numpy(label_val).float().to(device)
+#     y_test = torch.from_numpy(test_y_np).float().to(device)
+
+#     decoder = TwoLayerMLP(
+#         input_dim=input_dim,
+#         hidden_dim=hidden_dim,
+#         output_dim=y_train.shape[1],
+#         dropout_rate=dropout_rate,
+#     ).to(device)
+
+#     criterion = nn.MSELoss()
+#     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
+
+#     initial_state = copy.deepcopy(decoder.state_dict())
+#     best_r2 = -1e18
+#     best_epoch = 1
+#     best_decoder_state = copy.deepcopy(decoder.state_dict())
+
+#     patience = 1000
+#     bad_epochs = 0
+#     min_epochs = 4000
+
+#     for epoch in range(decoder_iters):
+#         decoder.train()
+#         optimizer.zero_grad()
+#         outputs = decoder(z_train)
+#         loss = criterion(outputs, y_train)
+#         loss.backward()
+#         optimizer.step()
+
+#         decoder.eval()
+#         with torch.no_grad():
+#             val_preds = decoder(z_val).cpu().numpy()
+#             val_true = y_val.cpu().numpy()
+
+#         current_r2, _ = mean_r2_score(val_true, val_preds)
+
+#         if current_r2 > best_r2:
+#             best_r2 = current_r2
+#             best_epoch = epoch + 1
+#             bad_epochs = 0
+#             best_decoder_state = copy.deepcopy(decoder.state_dict())
+#         else:
+#             if epoch > min_epochs - patience:
+#                 bad_epochs += 1
+
+#         if bad_epochs >= patience:
+#             print(f"Early stopping decoder at epoch {epoch + 1}")
+#             break
+
+#         if (epoch + 1) % 2000 == 0:
+#             print(
+#                 f"Decoder Epoch [{epoch + 1}/{decoder_iters}] | "
+#                 f"Loss: {loss.item():.4f} | Val R2: {current_r2:.4f}"
+#             )
+
+#     decoder.load_state_dict(best_decoder_state)
+
+#     z_full = torch.cat([z_train, z_val], dim=0)
+#     y_full = torch.cat([y_train, y_val], dim=0)
+
+#     decoder.load_state_dict(initial_state)
+#     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=2e-4)
+
+#     for _ in range(best_epoch):
+#         decoder.train()
+#         optimizer.zero_grad()
+#         outputs = decoder(z_full)
+#         loss = criterion(outputs, y_full)
+#         loss.backward()
+#         optimizer.step()
+
+#     decoder.eval()
+#     with torch.no_grad():
+#         test_preds = decoder(z_test).cpu().numpy()
+#         test_true = y_test.cpu().numpy()
+
+#     mean_test_r2, per_dim_r2 = mean_r2_score(test_true, test_preds)
+
+#     cleanup_cuda(
+#         z_train, z_val, z_test,
+#         y_train, y_val, y_test,
+#         decoder, optimizer,
+#         z_full, y_full,
+#         neural_train, neural_val, label_train, label_val
+#     )
+
+#     return decoder, mean_test_r2, per_dim_r2
+
+
+# def train_full_model_and_get_attr(
+#     train_x_np,
+#     train_y_np,
+#     test_x_np,
+#     test_y_np,
+#     adv,
+#     total_neurons,
+#     output_dim=OUTPUT_DIM,
+# ):
+#     train_tensor = torch.from_numpy(train_x_np).float()
+#     adv_epsilon = float(min_l2_distance(train_tensor)) / 2.0
+#     adv_epsilon = max(adv_epsilon, 1e-6)
+
+#     model = build_cebra_model(adv=adv, adv_epsilon=adv_epsilon, output_dim=output_dim)
+#     model.fit(train_x_np, train_y_np)
+
+#     save_name = "ACORN" if adv else "CEBRA"
+#     save_path = os.path.join(out_dir, f"{save_name}.pth")
+#     model.save(save_path)
+#     print("Saved model to:", save_path)
+
+#     trained_model = model.solver_.model.to(device)
+#     if hasattr(trained_model, "split_outputs"):
+#         trained_model.split_outputs = False
+#     trained_model.eval()
+
+#     input_tensor = torch.from_numpy(train_x_np).float().to(device).requires_grad_(True)
+
+#     method = cebra.attribution.init(
+#         name="jacobian-based-batched",
+#         model=trained_model,
+#         input_data=input_tensor,
+#         output_dimension=int(getattr(trained_model, "num_output", output_dim)),
+#     )
+
+#     result = method.compute_attribution_map(batch_size=min(ATTR_BATCH_SIZE, len(train_x_np)))
+#     print("Attribution keys:", list(result.keys()))
+
+#     jf_tensor = torch.as_tensor(result["jf"]).detach().cpu()
+#     jfinv_tensor = torch.as_tensor(result["jf-inv-svd"]).detach().cpu()
+
+#     jf_map = reduce_attr_to_matrix(jf_tensor, total_neurons)
+#     jfinv_map = reduce_attr_to_matrix(jfinv_tensor, total_neurons)
+
+#     jf_scores = jf_map.mean(axis=0)
+#     jfinv_scores = jfinv_map.mean(axis=0)
+
+#     k_neurons = int(np.sqrt(total_neurons))
+#     topk_jf_indices = np.argsort(jf_scores)[::-1][:k_neurons]
+#     topk_jfinv_indices = np.argsort(jfinv_scores)[::-1][:k_neurons]
+
+#     print(f"[{save_name}] Top K = {k_neurons} out of {total_neurons}")
+#     print(f"[{save_name}] Top K (Jf):    {topk_jf_indices.tolist()}")
+#     print(f"[{save_name}] Top K (Jf-inv): {topk_jfinv_indices.tolist()}")
+
+#     decoder, base_r2, per_dim_r2 = train_decoder_with_same_arch(
+#         cebra_model=model,
+#         train_x_np=train_x_np,
+#         train_y_np=train_y_np,
+#         test_x_np=test_x_np,
+#         test_y_np=test_y_np,
+#         input_dim=output_dim,
+#         hidden_dim=64,
+#         dropout_rate=0.4,
+#         decoder_iters=10000,
+#     )
+
+#     cleanup_cuda(model, trained_model, input_tensor, method, result, jf_tensor, jfinv_tensor, decoder)
+
+#     return {
+#         "base_r2": base_r2,
+#         "per_dim_r2": per_dim_r2,
+#         "jf_tensor": jf_tensor,
+#         "jfinv_tensor": jfinv_tensor,
+#         "jf_map": jf_map,
+#         "jfinv_map": jfinv_map,
+#         "jf_scores": jf_scores,
+#         "jfinv_scores": jfinv_scores,
+#         "topk_jf": topk_jf_indices,
+#         "topk_jfinv": topk_jfinv_indices,
+#         "adv_epsilon": adv_epsilon,
+#         "save_name": save_name,
+#     }
+
+
+# def train_reduced_model_from_scratch(
+#     reduced_train_x_np,
+#     reduced_train_y_np,
+#     reduced_test_x_np,
+#     reduced_test_y_np,
+#     adv,
+#     output_dim=OUTPUT_DIM,
+# ):
+#     train_tensor = torch.from_numpy(reduced_train_x_np).float()
+#     adv_epsilon = float(min_l2_distance(train_tensor)) / 2.0
+#     adv_epsilon = max(adv_epsilon, 1e-6)
+
+#     model = build_cebra_model(adv=adv, adv_epsilon=adv_epsilon, output_dim=output_dim)
+#     model.fit(reduced_train_x_np, reduced_train_y_np)
+
+#     decoder, base_r2, per_dim_r2 = train_decoder_with_same_arch(
+#         cebra_model=model,
+#         train_x_np=reduced_train_x_np,
+#         train_y_np=reduced_train_y_np,
+#         test_x_np=reduced_test_x_np,
+#         test_y_np=reduced_test_y_np,
+#         input_dim=output_dim,
+#         hidden_dim=64,
+#         dropout_rate=0.4,
+#         decoder_iters=10000,
+#     )
+
+#     cleanup_cuda(model, decoder)
+#     return base_r2, per_dim_r2
+
+
+# # ============================================================
+# # Main
+# # ============================================================
+# all_rows = []
+
+# for name in names:
+#     print(f"\n{'='*70}")
+#     print(f" Processing Dataset (Rat): {name} ".center(70, "="))
+#     print(f"{'='*70}")
+
+#     dataset = cebra.datasets.init(f"rat-hippocampus-single-{name}")
+
+#     neural_data = (
+#         dataset.neural.clone() if torch.is_tensor(dataset.neural) else torch.tensor(dataset.neural)
+#     ).float()
+
+#     continuous_index = (
+#         dataset.continuous_index.clone()
+#         if torch.is_tensor(dataset.continuous_index)
+#         else torch.tensor(dataset.continuous_index)
+#     ).float()
+
+#     # position + direction
+#     y_np = continuous_index[:, :2].numpy().astype(np.float32)
+
+#     print(f"Raw neural shape: {neural_data.shape} | Labels shape: {y_np.shape}")
+
+#     neural_np = neural_data.detach().cpu().numpy().astype(np.float32)
+
+#     for smooth_sigma_ms in SMOOTH_SIGMAS_MS:
+#         sigma_tag = "raw" if smooth_sigma_ms <= 0 else f"{smooth_sigma_ms:g}".replace(".", "p")
+#         sigma_dir = os.path.join(img_dir, name, f"sigma_{sigma_tag}")
+#         os.makedirs(sigma_dir, exist_ok=True)
+
+#         print(f"\n--- Smoothing sigma = {smooth_sigma_ms:g} ms ---")
+
+#         smoothed_neural_np = smooth_with_grid(
+#             neural_np,
+#             sigma_ms=smooth_sigma_ms,
+#             bin_width_ms=BIN_WIDTH_MS,
+#             sqrt=SQRT_BEFORE_SMOOTH,
+#         ).astype(np.float32)
+
+#         print("Smoothed neural shape:", smoothed_neural_np.shape)
+
+#         split_idx = int(0.8 * len(smoothed_neural_np))
+#         train_data_np = smoothed_neural_np[:split_idx].astype(np.float32)
+#         valid_data_np = smoothed_neural_np[split_idx:].astype(np.float32)
+
+#         train_continuous_label = y_np[:split_idx]
+#         valid_continuous_label = y_np[split_idx:]
+
+#         full_results = {}
+
+#         # ----------------------------------------------------
+#         # Full models: CEBRA and ACORN
+#         # ----------------------------------------------------
+#         for adv in [False, True]:
+#             cleanup_cuda()
+
+#             model_name = "ACORN" if adv else "CEBRA"
+#             print(f"\n==================== Training FULL {model_name} ====================")
+
+#             res = train_full_model_and_get_attr(
+#                 train_x_np=train_data_np,
+#                 train_y_np=train_continuous_label,
+#                 test_x_np=valid_data_np,
+#                 test_y_np=valid_continuous_label,
+#                 adv=adv,
+#                 total_neurons=train_data_np.shape[1],
+#                 output_dim=OUTPUT_DIM,
+#             )
+#             full_results[model_name] = res
+
+#             # Save compact attribution outputs
+#             npz_path = os.path.join(out_dir, f"{name}_sigma{sigma_tag}_{model_name}_attrs.npz")
+#             np.savez_compressed(
+#                 npz_path,
+#                 jf_map=res["jf_map"].astype(np.float32),
+#                 jfinv_map=res["jfinv_map"].astype(np.float32),
+#                 jf_scores=res["jf_scores"].astype(np.float32),
+#                 jfinv_scores=res["jfinv_scores"].astype(np.float32),
+#                 topk_jf=res["topk_jf"].astype(np.int32),
+#                 topk_jfinv=res["topk_jfinv"].astype(np.int32),
+#                 base_r2=np.array([res["base_r2"]], dtype=np.float32),
+#                 adv_epsilon=np.array([res["adv_epsilon"]], dtype=np.float32),
+#             )
+#             print(f"Saved attribution npz to: {npz_path}")
+
+#             all_rows.append({
+#                 "dataset": name,
+#                 "sigma_ms": smooth_sigma_ms,
+#                 "setting": "full",
+#                 "source_model": model_name,
+#                 "retrained_model": model_name,
+#                 "neurons": train_data_np.shape[1],
+#                 "base_r2": res["base_r2"],
+#                 "adv_epsilon": res["adv_epsilon"],
+#                 "artifact": npz_path,
+#             })
+
+#         # ----------------------------------------------------
+#         # One 2x2 figure per setup:
+#         # top row = Jf, bottom row = Jf-inv
+#         # left = CEBRA, right = ACORN
+#         # ----------------------------------------------------
+#         panel_path = os.path.join(sigma_dir, f"{name}_sigma{sigma_tag}_4panel.png")
+#         save_four_panel_figure(
+#             save_path=panel_path,
+#             dataset_name=name,
+#             sigma_ms=smooth_sigma_ms,
+#             clean_jf_map=full_results["CEBRA"]["jf_map"],
+#             acorn_jf_map=full_results["ACORN"]["jf_map"],
+#             clean_jfinv_map=full_results["CEBRA"]["jfinv_map"],
+#             acorn_jfinv_map=full_results["ACORN"]["jfinv_map"],
+#             clean_r2=full_results["CEBRA"]["base_r2"],
+#             acorn_r2=full_results["ACORN"]["base_r2"],
+#         )
+#         print(f"Saved 4-panel figure to: {panel_path}")
+
+#         # ----------------------------------------------------
+#         # Reduced retraining: 8 states
+#         # 4 reduced datasets (CEBRA/ACORN × Jf/Jf-inv)
+#         # × 2 retrained models (CEBRA/ACORN)
+#         # ----------------------------------------------------
+#         reduced_results = []
+
+#         for source_model_name in ["CEBRA", "ACORN"]:
+#             for metric_key in ["jf", "jfinv"]:
+#                 metric_label = "Jf" if metric_key == "jf" else "Jf-inv"
+#                 idxs = full_results[source_model_name][f"topk_{metric_key}"]
+
+#                 print(
+#                     f"\n==================== Reduced dataset: "
+#                     f"{source_model_name}_TopK_{metric_label} ===================="
+#                 )
+#                 print(f"Keeping {len(idxs)} neurons out of {train_data_np.shape[1]}")
+
+#                 reduced_train = train_data_np[:, idxs].astype(np.float32)
+#                 reduced_valid = valid_data_np[:, idxs].astype(np.float32)
+
+#                 for retrained_name, adv in [("CEBRA", False), ("ACORN", True)]:
+#                     print(
+#                         f"\n--- Retraining {retrained_name} on "
+#                         f"{source_model_name} Top-K ({metric_label}) ---"
+#                     )
+
+#                     base_r2, per_dim_r2 = train_reduced_model_from_scratch(
+#                         reduced_train_x_np=reduced_train,
+#                         reduced_train_y_np=train_continuous_label,
+#                         reduced_test_x_np=reduced_valid,
+#                         reduced_test_y_np=valid_continuous_label,
+#                         adv=adv,
+#                         output_dim=OUTPUT_DIM,
+#                     )
+
+#                     reduced_results.append(
+#                         (
+#                             f"{source_model_name}_TopK_{metric_label}",
+#                             retrained_name,
+#                             len(idxs),
+#                             base_r2,
+#                         )
+#                     )
+
+#                     all_rows.append({
+#                         "dataset": name,
+#                         "sigma_ms": smooth_sigma_ms,
+#                         "setting": f"{source_model_name}_TopK_{metric_label}",
+#                         "source_model": source_model_name,
+#                         "retrained_model": retrained_name,
+#                         "neurons": len(idxs),
+#                         "base_r2": base_r2,
+#                         "adv_epsilon": np.nan,
+#                         "artifact": "",
+#                     })
+
+#                     print(
+#                         f"** {source_model_name} Top-K ({metric_label}) -> "
+#                         f"{retrained_name} base R2: {base_r2:.4f} **"
+#                     )
+
+#         # ----------------------------------------------------
+#         # Summary for this sigma
+#         # ----------------------------------------------------
+#         print("\n" + "#" * 80)
+#         print(f" SUMMARY FOR {name} | sigma={smooth_sigma_ms:g} ms ".center(80, "#"))
+#         print("#" * 80)
+
+#         for model_name in ["CEBRA", "ACORN"]:
+#             print(
+#                 f"{model_name:>6} | full base R2 = {full_results[model_name]['base_r2']:.4f} | "
+#                 f"topJf K = {len(full_results[model_name]['topk_jf'])} | "
+#                 f"topJfinv K = {len(full_results[model_name]['topk_jfinv'])}"
+#             )
+
+#         print("\nReduced dataset results:")
+#         for source_name, retrained_name, n_neurons, base_r2 in reduced_results:
+#             print(
+#                 f"{source_name}__{retrained_name:<7} | "
+#                 f"neurons={n_neurons:<3d} | base R2={base_r2:.4f}"
+#             )
+
+#         sigma_csv = os.path.join(out_dir, f"{name}_sigma{sigma_tag}_full_and_reduced_results.csv")
+#         pd.DataFrame([r for r in all_rows if r["dataset"] == name and r["sigma_ms"] == smooth_sigma_ms]).to_csv(
+#             sigma_csv,
+#             index=False,
+#         )
+#         print(f"Saved CSV to: {sigma_csv}")
+
+#     print(f"\nFinished dataset: {name}")
+
+# summary_csv = os.path.join(out_dir, "rat_smoothed_grid_full_and_reduced_summary.csv")
+# pd.DataFrame(all_rows).to_csv(summary_csv, index=False)
+# print(f"\nSaved global CSV summary to: {summary_csv}")
+# print("\nPipeline Execution Completed for All Rat Datasets.")
 
 
 
