@@ -366,7 +366,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SEEDS = [121]
+SEEDS = [38]
 
 # One dataset only
 DATASET_CFG = {
