@@ -409,29 +409,32 @@ class ScaledTanh(nn.Module):
 
 
 def make_mlp(in_dim, out_dim, n_layers=4, seed=0):
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        layers = []
-        d_in = in_dim
-        hidden = max(64, 8 * max(in_dim, out_dim))
+    """
+    3 hidden layers with GELU, then one output layer + scaled tanh.
+    IMPORTANT: move the model to the same device as the inputs.
+    """
+    torch.manual_seed(seed)
 
-        for i in range(n_layers - 1):
-            d_h = hidden
-            lin = nn.Linear(d_in, d_h)
-            nn.init.orthogonal_(lin.weight)
-            nn.init.zeros_(lin.bias)
-            layers += [lin, nn.GELU()]
-            d_in = d_h
+    layers = []
+    d_in = in_dim
+    hidden = max(64, 8 * max(in_dim, out_dim))
 
-        lin = nn.Linear(d_in, out_dim)
+    for _ in range(n_layers - 1):
+        lin = nn.Linear(d_in, hidden)
         nn.init.orthogonal_(lin.weight)
         nn.init.zeros_(lin.bias)
-        layers += [lin, ScaledTanh(scale=1.0)]
+        layers += [lin, nn.GELU()]
+        d_in = hidden
 
-        mlp = nn.Sequential(*layers).eval()
-        for p in mlp.parameters():
-            p.requires_grad_(False)
-        return mlp
+    lin = nn.Linear(d_in, out_dim)
+    nn.init.orthogonal_(lin.weight)
+    nn.init.zeros_(lin.bias)
+    layers += [lin, ScaledTanh(scale=1.0)]
+
+    mlp = nn.Sequential(*layers).to(device).eval()
+    for p in mlp.parameters():
+        p.requires_grad_(False)
+    return mlp
 
 
 def brownian_motion_box(T, d, sigma=0.03, seed=0):
@@ -598,7 +601,7 @@ def run_one_model(
         adv_alpha=adv_epsilon / 5,
         adv_epsilon=adv_epsilon,
         adv_steps=10,
-        attack_norm="linf",   # consistent with min_l2_distance
+        attack_norm="linf",   # keep your own setting
         num_hidden_units=32,
     )
 
