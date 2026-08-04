@@ -358,7 +358,7 @@ N_MLP_LAYERS = 4
 SIGMA_EPS_DEFAULT = 0.03
 
 BATCH_SIZE = 2048
-MAX_ITER = 2500
+MAX_ITER = 15000
 ATTR_BATCH_SIZE = 128
 
 OUT_DIR = "outputs"
@@ -366,19 +366,17 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SEEDS = [42, 123]
+SEEDS = [121]
 
-# Default experiment grid:
-# - latent sweep
-# - neuron sweep
-EXPERIMENTS = [
-    {"name": "L2N2", "D1": 2, "D2": 2, "N1": 2, "N2": 2, "sigma_eps": SIGMA_EPS_DEFAULT},
-    {"name": "L2N3", "D1": 2, "D2": 2, "N1": 3, "N2": 3, "sigma_eps": SIGMA_EPS_DEFAULT},
-    {"name": "L3N2", "D1": 3, "D2": 3, "N1": 2, "N2": 2, "sigma_eps": SIGMA_EPS_DEFAULT},
-    {"name": "L3N3", "D1": 3, "D2": 3, "N1": 3, "N2": 3, "sigma_eps": SIGMA_EPS_DEFAULT},
-    {"name": "L5N2", "D1": 5, "D2": 5, "N1": 2, "N2": 2, "sigma_eps": SIGMA_EPS_DEFAULT},
-    {"name": "L5N5", "D1": 5, "D2": 5, "N1": 5, "N2": 5, "sigma_eps": SIGMA_EPS_DEFAULT},
-]
+# One dataset only
+DATASET_CFG = {
+    "name": "FIG5_SINGLE",
+    "D1": 3,
+    "D2": 3,
+    "N1": 25,
+    "N2": 25,
+    "sigma_eps": SIGMA_EPS_DEFAULT,
+}
 
 
 # ============================================================
@@ -401,47 +399,72 @@ def set_all_seeds(seed: int) -> None:
 # ============================================================
 # 3) Synthetic Data Generation
 # ============================================================
-def make_mlp(in_dim, out_dim, n_layers=4, seed=0):
-    torch.manual_seed(seed)
-    layers = []
-    d_in = in_dim
-    hidden = in_dim * 10
+class ScaledTanh(nn.Module):
+    def __init__(self, scale=1.0):
+        super().__init__()
+        self.scale = float(scale)
 
-    for i in range(n_layers - 1):
-        d_h = in_dim * 30 if i < n_layers - 2 else hidden
-        lin = nn.Linear(d_in, d_h)
+    def forward(self, x):
+        return self.scale * torch.tanh(x)
+
+
+def make_mlp(in_dim, out_dim, n_layers=4, seed=0):
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        layers = []
+        d_in = in_dim
+        hidden = max(64, 8 * max(in_dim, out_dim))
+
+        for i in range(n_layers - 1):
+            d_h = hidden
+            lin = nn.Linear(d_in, d_h)
+            nn.init.orthogonal_(lin.weight)
+            nn.init.zeros_(lin.bias)
+            layers += [lin, nn.GELU()]
+            d_in = d_h
+
+        lin = nn.Linear(d_in, out_dim)
         nn.init.orthogonal_(lin.weight)
         nn.init.zeros_(lin.bias)
-        layers += [lin, nn.GELU()]
-        d_in = d_h
+        layers += [lin, ScaledTanh(scale=1.0)]
 
-    lin = nn.Linear(d_in, out_dim)
-    nn.init.orthogonal_(lin.weight)
-    nn.init.zeros_(lin.bias)
-    layers.append(lin)
-
-    mlp = nn.Sequential(*layers)
-    for p in mlp.parameters():
-        p.requires_grad_(False)
-    return mlp.eval()
+        mlp = nn.Sequential(*layers).eval()
+        for p in mlp.parameters():
+            p.requires_grad_(False)
+        return mlp
 
 
 def brownian_motion_box(T, d, sigma=0.03, seed=0):
+    """
+    Brownian motion in [-1, 1]^d.
+    Uses rejection sampling so the latent always stays in the box.
+    """
     rng = np.random.default_rng(seed)
-    x = np.zeros((T, d), dtype=np.float32)
-    x[0] = rng.uniform(-1.0, 1.0, size=d).astype(np.float32)
+    z = np.empty((T, d), dtype=np.float32)
+    z[0] = rng.uniform(-1.0, 1.0, size=d).astype(np.float32)
 
-    for t in range(T - 1):
-        step = rng.normal(loc=0.0, scale=sigma, size=d).astype(np.float32)
-        x[t + 1] = np.clip(x[t] + step, -1.0, 1.0)
-    return x
+    for t in range(1, T):
+        prev = z[t - 1].copy()
+        nxt = prev + rng.normal(0.0, sigma, size=d).astype(np.float32)
+
+        mask = (nxt < -1.0) | (nxt > 1.0)
+        while np.any(mask):
+            nxt[mask] = prev[mask] + rng.normal(0.0, sigma, size=mask.sum()).astype(np.float32)
+            mask = (nxt < -1.0) | (nxt > 1.0)
+
+        z[t] = nxt
+
+    return z
 
 
 def make_binary_ground_truth(D1, D2, N1, N2):
     """
-    Ground truth shape = [D_LATENT, D_OBS]
-    - first D1 latents connect to all neurons
-    - last D2 latents connect only to x2 block (last N2 neurons)
+    Ground truth map:
+      rows = latent variables [z1, z2]
+      cols = observed neurons [x1, x2]
+
+    z1 -> x1 and x2
+    z2 -> x2 only
     """
     gt = np.zeros((D1 + D2, N1 + N2), dtype=bool)
     gt[:D1, :] = True
@@ -459,11 +482,12 @@ def generate_synthetic_data(cfg, seed=42):
     z1 = brownian_motion_box(T, D1, sigma=sigma_eps, seed=seed)
     z2 = brownian_motion_box(T, D2, sigma=sigma_eps, seed=seed + 1)
 
+    # mixing functions (new random mixing per seed)
     g1 = make_mlp(D1, N1, n_layers=N_MLP_LAYERS, seed=seed + 10)
     g2 = make_mlp(D1 + D2, N2, n_layers=N_MLP_LAYERS, seed=seed + 20)
 
-    z1_t = torch.tensor(z1, dtype=torch.float32)
-    z2_t = torch.tensor(z2, dtype=torch.float32)
+    z1_t = torch.tensor(z1, dtype=torch.float32, device=device)
+    z2_t = torch.tensor(z2, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         x1 = g1(z1_t).cpu().numpy()
@@ -513,9 +537,6 @@ def reduce_attr_map(arr):
 
 
 def align_attr_to_gt(attr_map_2d, gt_bool):
-    """
-    Make attribution map orientation match ground truth.
-    """
     if attr_map_2d.shape == gt_bool.shape:
         return attr_map_2d
     if attr_map_2d.T.shape == gt_bool.shape:
@@ -543,6 +564,9 @@ def compute_auroc(attr_map_2d, gt_bool):
     return float(roc_auc_score(y_true, y_score))
 
 
+# ============================================================
+# 5) Training + Attribution
+# ============================================================
 def run_one_model(
     cfg,
     seed,
@@ -552,9 +576,6 @@ def run_one_model(
     training_mode,
     adv_epsilon,
 ):
-    """
-    Train one model (clean or adversarial), compute attribution, and return metrics.
-    """
     D1 = int(cfg["D1"])
     D2 = int(cfg["D2"])
     N1 = int(cfg["N1"])
@@ -577,18 +598,18 @@ def run_one_model(
         adv_alpha=adv_epsilon / 5,
         adv_epsilon=adv_epsilon,
         adv_steps=10,
-        attack_norm="linf",
+        attack_norm="linf",   # consistent with min_l2_distance
         num_hidden_units=32,
     )
 
     model.fit(train_data, train_continuous_label)
 
-    save_path = os.path.join(
-        OUT_DIR,
-        f"{cfg['name']}_seed{seed}_{model_name}.pth",
-    )
-    model.save(save_path)
-    print("Saved model to:", save_path)
+    save_path = os.path.join(OUT_DIR, f"{cfg['name']}_seed{seed}_{model_name}.pth")
+    try:
+        model.save(save_path)
+        print("Saved model to:", save_path)
+    except Exception as e:
+        print("Could not save model:", e)
 
     trained_model = model.solver_.model.to(device)
 
@@ -604,21 +625,17 @@ def run_one_model(
     result = method.compute_attribution_map(batch_size=min(ATTR_BATCH_SIZE, len(train_data)))
     print("Attribution keys:", list(result.keys()))
 
-    jc_map_raw = reduce_attr_map(result["jf"])
-    jc_inv_raw = reduce_attr_map(result["jf-inv-svd"])
-    jc_invconv_raw = reduce_attr_map(result["jf-convabs-inv-svd"])
+    jac_raw = reduce_attr_map(result["jf"])
+    jac_inv_raw = reduce_attr_map(result["jf-inv-svd"])
 
-    jc_map = align_attr_to_gt(jc_map_raw, gt_attr_bool)
-    jc_inv_map = align_attr_to_gt(jc_inv_raw, gt_attr_bool)
-    jc_invconv_map = align_attr_to_gt(jc_invconv_raw, gt_attr_bool)
+    jac_map = align_attr_to_gt(jac_raw, gt_attr_bool)
+    jac_inv_map = align_attr_to_gt(jac_inv_raw, gt_attr_bool)
 
-    auc_jc = compute_auroc(jc_map, gt_attr_bool)
-    auc_jc_inv = compute_auroc(jc_inv_map, gt_attr_bool)
-    auc_jc_invconv = compute_auroc(jc_invconv_map, gt_attr_bool)
+    auc_jac = compute_auroc(jac_map, gt_attr_bool)
+    auc_jac_inv = compute_auroc(jac_inv_map, gt_attr_bool)
 
-    print(f"** {cfg['name']} | seed={seed} | {model_name} jc AUROC:        {auc_jc:.4f} **")
-    print(f"** {cfg['name']} | seed={seed} | {model_name} jc_inv AUROC:    {auc_jc_inv:.4f} **")
-    print(f"** {cfg['name']} | seed={seed} | {model_name} jc_invconv AUROC:{auc_jc_invconv:.4f} **")
+    print(f"** {cfg['name']} | seed={seed} | {model_name} jac AUROC:     {auc_jac:.4f} **")
+    print(f"** {cfg['name']} | seed={seed} | {model_name} jac_inv AUROC: {auc_jac_inv:.4f} **")
 
     cleanup_cuda(method, trained_model, input_tensor, model)
 
@@ -633,63 +650,54 @@ def run_one_model(
         "D_OBS": N1 + N2,
         "model": model_name,
         "training_mode": training_mode,
-        "jc": auc_jc,
-        "jc_inv": auc_jc_inv,
-        "jc_invconv": auc_jc_invconv,
+        "jac_auc": auc_jac,
+        "jac_inv_auc": auc_jac_inv,
     }
 
 
 # ============================================================
-# 5) Main Experiment Loop
+# 6) Main
 # ============================================================
 all_rows = []
 
-for cfg in EXPERIMENTS:
-    print("\n" + "#" * 90)
-    print(
-        f"SETUP: {cfg['name']} | "
-        f"D1={cfg['D1']} D2={cfg['D2']} | "
-        f"N1={cfg['N1']} N2={cfg['N2']} | "
-        f"sigma={cfg.get('sigma_eps', SIGMA_EPS_DEFAULT)}"
-    )
-    print("#" * 90)
+print("\n" + "#" * 90)
+print(f"SETUP: {DATASET_CFG['name']} | D1={DATASET_CFG['D1']} D2={DATASET_CFG['D2']} | N1={DATASET_CFG['N1']} N2={DATASET_CFG['N2']} | sigma={DATASET_CFG['sigma_eps']}")
+print("#" * 90)
 
-    set_all_seeds(42)
-    x_np, y_np, gt_attr, gt_attr_bool = generate_synthetic_data(cfg, seed=42)
+set_all_seeds(42)
+x_np, y_np, gt_attr, gt_attr_bool = generate_synthetic_data(DATASET_CFG, seed=42)
 
-    print("x shape:", x_np.shape)
-    print("y shape:", y_np.shape)
-    print("gt_attr_bool shape:", gt_attr_bool.shape)
+print("x shape:", x_np.shape)
+print("y shape:", y_np.shape)
+print("gt_attr_bool shape:", gt_attr_bool.shape)
 
-    split_idx = int(0.8 * len(x_np))
-    train_data = x_np[:split_idx].astype(np.float32)
-    train_continuous_label = y_np[:split_idx].astype(np.float32)
+split_idx = int(0.8 * len(x_np))
+train_data = x_np[:split_idx].astype(np.float32)
+train_continuous_label = y_np[:split_idx].astype(np.float32)
 
-    adv_epsilon = float(min_l2_distance(train_data)) / 2.0
-    adv_epsilon = max(adv_epsilon, 1e-6)
+adv_epsilon = float(min_l2_distance(train_data)) / 2.0
+adv_epsilon = max(adv_epsilon, 1e-6)
+print("adv_epsilon:", adv_epsilon)
 
-    for seed in SEEDS:
-        for training_mode in ["clean", "adversarial"]:
-            cleanup_cuda()
+for seed in SEEDS:
+    for training_mode in ["clean", "adversarial"]:
+        cleanup_cuda()
 
-            print("\n" + "=" * 70)
-            print(f"Training {cfg['name']} | seed={seed} | mode={training_mode}")
-            print("=" * 70)
+        print("\n" + "=" * 70)
+        print(f"Training {DATASET_CFG['name']} | seed={seed} | mode={training_mode}")
+        print("=" * 70)
 
-            row = run_one_model(
-                cfg=cfg,
-                seed=seed,
-                train_data=train_data,
-                train_continuous_label=train_continuous_label,
-                gt_attr_bool=gt_attr_bool,
-                training_mode=training_mode,
-                adv_epsilon=adv_epsilon,
-            )
-            all_rows.append(row)
+        row = run_one_model(
+            cfg=DATASET_CFG,
+            seed=seed,
+            train_data=train_data,
+            train_continuous_label=train_continuous_label,
+            gt_attr_bool=gt_attr_bool,
+            training_mode=training_mode,
+            adv_epsilon=adv_epsilon,
+        )
+        all_rows.append(row)
 
-# ============================================================
-# 6) Summary Tables
-# ============================================================
 results_df = pd.DataFrame(all_rows)
 
 detailed_csv = os.path.join(OUT_DIR, "synthetic_auroc_detailed.csv")
@@ -700,12 +708,10 @@ summary_df = (
     results_df
     .groupby(["setup", "model", "training_mode", "D1", "D2", "N1", "N2", "D_LATENT", "D_OBS"], as_index=False)
     .agg(
-        jc_mean=("jc", "mean"),
-        jc_std=("jc", "std"),
-        jc_inv_mean=("jc_inv", "mean"),
-        jc_inv_std=("jc_inv", "std"),
-        jc_invconv_mean=("jc_invconv", "mean"),
-        jc_invconv_std=("jc_invconv", "std"),
+        jac_mean=("jac_auc", "mean"),
+        jac_std=("jac_auc", "std"),
+        jac_inv_mean=("jac_inv_auc", "mean"),
+        jac_inv_std=("jac_inv_auc", "std"),
         n_runs=("seed", "count"),
     )
 )
@@ -721,7 +727,6 @@ print(summary_df.to_string(index=False))
 print("=" * 120)
 
 print("Done.")
-
 
 # import os
 # import gc
