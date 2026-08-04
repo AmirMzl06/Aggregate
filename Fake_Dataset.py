@@ -598,8 +598,8 @@ def run_one_model(
         output_dimension=D_LATENT,
         verbose=True,
         training_mode=training_mode,
-        adv_alpha=5 / 5,
-        adv_epsilon=5,
+        adv_alpha=0.1 / 5,
+        adv_epsilon=0.1,
         adv_steps=10,
         attack_norm="linf",   # keep your own setting
         num_hidden_units=32,
