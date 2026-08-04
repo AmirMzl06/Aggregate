@@ -358,7 +358,7 @@ N_MLP_LAYERS = 4
 SIGMA_EPS_DEFAULT = 0.03
 
 BATCH_SIZE = 2048
-MAX_ITER = 15
+MAX_ITER = 15000
 ATTR_BATCH_SIZE = 128
 
 OUT_DIR = "outputs"
@@ -598,8 +598,8 @@ def run_one_model(
         output_dimension=D_LATENT,
         verbose=True,
         training_mode=training_mode,
-        adv_alpha=adv_epsilon / 5,
-        adv_epsilon=adv_epsilon,
+        adv_alpha=5 / 5,
+        adv_epsilon=5,
         adv_steps=10,
         attack_norm="linf",   # keep your own setting
         num_hidden_units=32,
