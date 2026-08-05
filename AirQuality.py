@@ -123,14 +123,28 @@ def build_model(adv, eps):
     )
 
 def reduce_attr(a):
+    """
+    Works for both torch.Tensor and numpy.ndarray
+    """
+
     if torch.is_tensor(a):
-        a = a.detach().cpu()
-    a = torch.abs(a)
+        a = a.detach().cpu().numpy()
+
+    else:
+        a = np.asarray(a)
+
+    a = np.abs(a)
     if a.ndim == 3:
-        a = a.mean(0)
+        a = a.mean(axis=0)
+    elif a.ndim == 2:
+        pass
     elif a.ndim == 1:
         a = a[None, :]
-    return a.numpy().astype(np.float32)
+    else:
+        raise ValueError(
+            f"Unsupported attribution shape: {a.shape}"
+        )
+    return a.astype(np.float32)
 
 def plot_attr(mat, path, title):
     plt.figure(figsize=(10, 5))
