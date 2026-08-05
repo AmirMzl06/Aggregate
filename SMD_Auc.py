@@ -59,6 +59,7 @@ os.makedirs(IMAGES_ROOT, exist_ok=True)
 # ============================================================
 # IO helpers
 # ============================================================
+
 def cleanup_cuda(*objs):
 
     for obj in objs:
@@ -347,13 +348,10 @@ def compute_attr_scores(cebra_model, x_np: np.ndarray, n_features: int, attr_bat
         input_data=x_t,
         output_dimension=output_dim,
     )
-    usable = max(2, len(x_seg) - 10)
-    batch_size = min(
-        ATTR_BATCH_SIZE,
-        usable
-    )
 
-    result = method.compute_attribution_map(batch_size = min(ATTR_BATCH_SIZE,usable)))
+    usable = max(2, len(x_seg) - 10)
+    
+    result = method.compute_attribution_map(batch_size=min(attr_batch_size, usable))
 
     out = {}
     if "jf" in result:
