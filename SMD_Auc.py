@@ -30,7 +30,7 @@ from utils.min_distance import min_l2_distance
 # ============================================================
 # Config
 # ============================================================
-DATA_ROOT = "/data/SMD"
+DATA_ROOT = "./data/SMD"
 OUTPUT_ROOT = "./outputs_smd_feature_eval"
 IMAGES_ROOT = "./images_smd_feature_eval"
 
