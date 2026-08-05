@@ -59,6 +59,21 @@ os.makedirs(IMAGES_ROOT, exist_ok=True)
 # ============================================================
 # IO helpers
 # ============================================================
+def cleanup_cuda(*objs):
+
+    for obj in objs:
+        try:
+            del obj
+        except:
+            pass
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
 def list_txt_files(folder: str) -> List[str]:
     if not os.path.isdir(folder):
         return []
@@ -332,8 +347,13 @@ def compute_attr_scores(cebra_model, x_np: np.ndarray, n_features: int, attr_bat
         input_data=x_t,
         output_dimension=output_dim,
     )
+    usable = max(2, len(x_seg) - 10)
+    batch_size = min(
+        ATTR_BATCH_SIZE,
+        usable
+    )
 
-    result = method.compute_attribution_map(batch_size=min(attr_batch_size, len(x_np)))
+    result = method.compute_attribution_map(batch_size = min(ATTR_BATCH_SIZE,usable)))
 
     out = {}
     if "jf" in result:
