@@ -1986,7 +1986,7 @@ ATTR_BATCH_SIZE = 128
 MAX_ITERATIONS = 2500
 OUTPUT_DIM = 48
 
-ATTR_SOURCE = "test"   # "train" or "test"
+ATTR_SOURCE = "train"   # "train" or "test"
 
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
