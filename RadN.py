@@ -2130,7 +2130,8 @@ def train_cebra_and_decoder(
         trained_model.split_outputs = False
     trained_model.eval()
 
-    input_tensor = torch.from_numpy(train_x_np).float().to(device).requires_grad_(True)
+    input_tensor = torch.from_numpy(test_x_np).float().to(device).requires_grad_(True)
+    
     method = cebra.attribution.init(
         name="jacobian-based-batched",
         model=trained_model,
@@ -2138,7 +2139,7 @@ def train_cebra_and_decoder(
         output_dimension=int(getattr(trained_model, "num_output", output_dim)),
     )
 
-    result = method.compute_attribution_map(batch_size=min(128, len(train_x_np)))
+    result = method.compute_attribution_map(batch_size=min(128, len(test_x_np)))
     jf_tensor = torch.as_tensor(result["jf"]).detach().cpu()
     jfinv_tensor = torch.as_tensor(result["jf-inv-svd"]).detach().cpu()
 
