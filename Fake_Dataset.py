@@ -388,7 +388,7 @@ os.makedirs(IMG_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Keep one seed by default; add more if you want averaging
-SEEDS = [38]
+SEEDS = [38,226]
 
 DATASET_CFG = {
     "name": "FIG5_SINGLE",
