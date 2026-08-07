@@ -375,7 +375,7 @@ SIGMA_EPS_DEFAULT = 0.03
 
 # Training
 BATCH_SIZE = 2048
-MAX_ITER = 25000
+MAX_ITER = 10000
 ATTR_BATCH_SIZE = 128
 
 # Model / run
@@ -626,12 +626,8 @@ def build_model(adv: bool, adv_epsilon: float):
     return CEBRA(
         batch_size=BATCH_SIZE,
         temperature=0.4,
-        learning_rate=1e-4,
-        model_architecture="offset1-model-mse",
-        distance="euclidean",
-        conditional="delta",
-        # time_offsets=4,
-        delta=0.1,
+        model_architecture="offset36-model-more-dropout",
+        time_offsets=4,
         max_iterations=MAX_ITER,
         output_dimension=OUTPUT_DIM,
         verbose=True,
