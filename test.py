@@ -94,12 +94,15 @@ def get_attribution(model, name):
     torch.cuda.empty_cache()
 
 def save_heatmap(tensor, name):
-    arr = tensor.detach().cpu().numpy()
+    if torch.is_tensor(tensor):
+        arr = tensor.detach().cpu().numpy()
+    else:
+        arr = np.asarray(tensor)
     if arr.ndim == 3:
         arr = np.abs(arr).mean(axis=0)
     else:
         arr = np.abs(arr)
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(10,6))
     plt.imshow(arr, aspect="auto")
     plt.colorbar(label="absolute attribution")
     plt.xlabel("Neuron")
