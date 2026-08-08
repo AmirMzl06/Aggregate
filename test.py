@@ -36,6 +36,7 @@ BIN_MS = 10
 
 EVENT_NAME = "stim_on"   # alignment event
 TRIAL_LIMIT = None       # e.g. 20 for debugging, None = all valid trials
+N_RANDOM_TRIALS = 20 
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -279,6 +280,18 @@ print("all_trials shape:", all_trials.shape)   # [n_trials, time_bins, neurons]
 
 
 # =====================================================
+# =====================================================
+total_trials = all_trials.shape[0]
+if total_trials > N_RANDOM_TRIALS:
+    random_indices = np.random.choice(total_trials, size=N_RANDOM_TRIALS, replace=False)
+    random_indices.sort() 
+else:
+    random_indices = np.arange(total_trials)
+
+print(f"\n--- Randomly selected {len(random_indices)} trials out of {total_trials} ---")
+
+
+# =====================================================
 # Loop over trials:
 # train separately on each trial -> compute JF/JF-inv -> average later
 # =====================================================
@@ -289,9 +302,9 @@ acorn_jfinv_sum = None
 
 n_trials_used = 0
 
-for trial_idx in range(all_trials.shape[0]):
+for step, trial_idx in enumerate(random_indices):
     print("\n" + "=" * 80)
-    print(f"Processing trial {trial_idx + 1}/{all_trials.shape[0]}")
+    print(f"Processing randomly selected trial {step + 1}/{len(random_indices)} (Original Trial ID: {trial_idx})")
     print("=" * 80)
 
     X_trial = all_trials[trial_idx]
@@ -363,10 +376,10 @@ np.save(os.path.join(OUT_DIR, "CEBRA_mean_jfinv.npy"), cebra_jfinv_mean)
 np.save(os.path.join(OUT_DIR, "ACORN_mean_jf.npy"), acorn_jf_mean)
 np.save(os.path.join(OUT_DIR, "ACORN_mean_jfinv.npy"), acorn_jfinv_mean)
 
-save_heatmap(cebra_jf_mean, os.path.join(IMG_DIR, "CEBRA_jf_mean.png"), "CEBRA | mean JF over trials")
-save_heatmap(cebra_jfinv_mean, os.path.join(IMG_DIR, "CEBRA_jfinv_mean.png"), "CEBRA | mean JF-INV over trials")
-save_heatmap(acorn_jf_mean, os.path.join(IMG_DIR, "ACORN_jf_mean.png"), "ACORN | mean JF over trials")
-save_heatmap(acorn_jfinv_mean, os.path.join(IMG_DIR, "ACORN_jfinv_mean.png"), "ACORN | mean JF-INV over trials")
+save_heatmap(cebra_jf_mean, os.path.join(IMG_DIR, "CEBRA_jf_mean.png"), "CEBRA | mean JF over 20 random trials")
+save_heatmap(cebra_jfinv_mean, os.path.join(IMG_DIR, "CEBRA_jfinv_mean.png"), "CEBRA | mean JF-INV over 20 random trials")
+save_heatmap(acorn_jf_mean, os.path.join(IMG_DIR, "ACORN_jf_mean.png"), "ACORN | mean JF over 20 random trials")
+save_heatmap(acorn_jfinv_mean, os.path.join(IMG_DIR, "ACORN_jfinv_mean.png"), "ACORN | mean JF-INV over 20 random trials")
 
 print("\nDONE")
 print("trials used:", n_trials_used)
