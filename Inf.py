@@ -7,8 +7,8 @@ data = sio.loadmat(
 
 unit = data["unit"]
 
-neurons = [0, 1, 3, 4, 5, 7, 9, 13, 14, 15, 26, 30, 40]
-
+neurons = [2,6,11,12,19,20,21,33,34,41,42]
+#[0, 1, 3, 4, 5, 7, 9, 13, 14, 15, 26, 30, 40]
 for i in neurons:
     print("\nNeuron", i)
     print("----------------")
