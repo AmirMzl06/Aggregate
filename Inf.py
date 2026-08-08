@@ -7,9 +7,9 @@ data = sio.loadmat(
 
 unit = data["unit"]
 
-print("Number of neurons:", len(unit))
+neurons = [0, 1, 3, 4, 5, 7, 9, 13, 14, 15, 26, 30, 40]
 
-for i in range(min(5, len(unit))):
+for i in neurons:
     print("\nNeuron", i)
     print("----------------")
     print("session:", unit[i]["session"])
