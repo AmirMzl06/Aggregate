@@ -405,13 +405,13 @@ for step, trial_idx in enumerate(selected_trial_ids, start=1):
         }
         selected_meta_rows.append(meta)
 
+    print(f"trial {trial_idx} top10 neurons:", top10.tolist())
     del acorn_model, X_trial, jf_map, jfinv_map, neuron_scores, top10
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print(f"trial {trial_idx} top10 neurons:", top10.tolist())
 
 
 # =====================================================
