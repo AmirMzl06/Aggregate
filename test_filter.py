@@ -33,7 +33,7 @@ os.makedirs(IMG_DIR, exist_ok=True)
 os.makedirs(PER_TRIAL_DIR, exist_ok=True)
 
 BATCH_SIZE = 256
-MAX_ITER = 2500
+MAX_ITER = 5000
 OUTPUT_DIM = 16
 
 PRE_MS = 500
