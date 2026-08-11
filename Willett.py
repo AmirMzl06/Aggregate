@@ -23,7 +23,7 @@ DATA_DIR = "./data/seed_model_training_data/mat"
 SESSION_FILE = "t5.2022.05.18.mat"
 MAT_PATH = os.path.join(DATA_DIR, SESSION_FILE)
 
-TRIAL_ID = 0
+TRIAL_ID = 35
 
 # Per the dataset README: only area 6v carries the recommended signal for this
 # style of analysis. In the 256-channel layout, area 6v = first 128 columns.
