@@ -17,8 +17,8 @@ import cebra
 import cebra.attribution
 from cebra import CEBRA
 
-DATA_PATH = "./data/spk/M021519_spk.mat"
-BHV_PATH = "./data/behav/M021519_trialtype.csv"
+DATA_PATH = "./data/spk/X021920_spk.mat"
+BHV_PATH = "./data/behav/X021920_trialtype.csv"
 OUT_DIR = "./outputs"
 IMG_DIR = "./image"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -159,8 +159,7 @@ def train_model(X, adv=False):
     sample_idx = rng.choice(len(X), size=sample_size, replace=False)
     eps = float(min_l2_distance(X[sample_idx])) / 2.0
     eps = max(eps, 1e-6)
-
-    eps = 5
+    # eps = 5
     print(f"training {name} | eps={eps:.5f}")
     model = CEBRA(
         batch_size=BATCH_SIZE,
