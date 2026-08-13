@@ -159,7 +159,7 @@ def train_model(X, adv=False):
     sample_idx = rng.choice(len(X), size=sample_size, replace=False)
     eps = float(min_l2_distance(X[sample_idx])) / 2.0
     eps = max(eps, 1e-6)
-    # eps = 5
+    eps = 5
     print(f"training {name} | eps={eps:.5f}")
     model = CEBRA(
         batch_size=BATCH_SIZE,
@@ -173,8 +173,8 @@ def train_model(X, adv=False):
         adv_alpha=eps / 5 if adv else 0,
         adv_epsilon=eps if adv else 0,
         adv_steps=10 if adv else 0,
-        attack_norm="linf",
-        num_hidden_units=32,
+        attack_norm="l2",
+        num_hidden_units=48, #32,
     )
     model.fit(X, time_labels, trial_labels)
     return model
