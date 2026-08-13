@@ -36,11 +36,11 @@ EPS_SAMPLE_SIZE = 2000
 RANDOM_SEED = 42
 SIDE_TO_LABEL = {"left": 0, "right": 1}
 LABEL_NAMES = ["left", "right"]
-DECODER_HIDDEN_DIM = 64
+DECODER_HIDDEN_DIM = 48
 DECODER_DROPOUT = 0.4
 DECODER_LR = 1e-3
 DECODER_WEIGHT_DECAY = 1e-4
-DECODER_EPOCHS = 50000
+DECODER_EPOCHS = 10000
 DECODER_BATCH_SIZE = 32
 
 torch.manual_seed(RANDOM_SEED)
@@ -159,6 +159,8 @@ def train_model(X, adv=False):
     sample_idx = rng.choice(len(X), size=sample_size, replace=False)
     eps = float(min_l2_distance(X[sample_idx])) / 2.0
     eps = max(eps, 1e-6)
+
+    eps = 5
     print(f"training {name} | eps={eps:.5f}")
     model = CEBRA(
         batch_size=BATCH_SIZE,
@@ -260,6 +262,7 @@ def train_decoder(X_train_feats, y_train, X_test_feats, y_test, tag):
     optimizer = torch.optim.Adam(decoder.parameters(), lr=DECODER_LR, weight_decay=DECODER_WEIGHT_DECAY)
     loss_fn = nn.CrossEntropyLoss()
     for epoch in range(DECODER_EPOCHS):
+        print(f"epoch = {epoch}")
         decoder.train()
         perm = torch.randperm(len(Xtr_t), device=device)
         for start in range(0, len(Xtr_t), DECODER_BATCH_SIZE):
