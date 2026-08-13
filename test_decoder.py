@@ -17,8 +17,8 @@ import cebra
 import cebra.attribution
 from cebra import CEBRA
 
-DATA_PATH = "./data/spk/X021920_spk.mat"
-BHV_PATH = "./data/behav/X021920_trialtype.csv"
+DATA_PATH = "./data/spk/M021519_spk.mat"
+BHV_PATH = "./data/behav/M021519_trialtype.csv"
 OUT_DIR = "./outputs"
 IMG_DIR = "./image"
 os.makedirs(OUT_DIR, exist_ok=True)
