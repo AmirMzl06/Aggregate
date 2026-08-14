@@ -128,7 +128,8 @@ mu_all = all_concat.mean(axis=0, keepdims=True)
 sigma_all = all_concat.std(axis=0, keepdims=True) + 1e-8
 
 def normalize_multi(X):
-    return ((X - mu_all) / sigma_all).astype(np.float32)
+    # return ((X - mu_all) / sigma_all).astype(np.float32)
+    return (X).astype(np.float32)
 
 # Prepare multi-trial CEBRA inputs
 X_multi_parts = []
