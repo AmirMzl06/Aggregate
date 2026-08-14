@@ -151,7 +151,8 @@ TRAIN_MU = train_raw_concat.mean(axis=0, keepdims=True).astype(np.float32)
 TRAIN_SIGMA = (train_raw_concat.std(axis=0, keepdims=True) + 1e-8).astype(np.float32)
 
 def normalize(X):
-    return ((X - TRAIN_MU) / TRAIN_SIGMA).astype(np.float32)
+    # return ((X - TRAIN_MU) / TRAIN_SIGMA).astype(np.float32)
+    return (X).astype(np.float32)
 
 X_parts = []
 time_parts = []
