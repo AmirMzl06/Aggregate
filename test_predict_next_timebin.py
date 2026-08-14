@@ -31,7 +31,7 @@ RANDOM_SEED = 42
 
 # Predictor
 HIDDEN_DIM = 64
-EPOCHS = 10000
+EPOCHS = 5000
 LR = 1e-3
 WD = 1e-5
 
