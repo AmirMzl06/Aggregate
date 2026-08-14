@@ -17,6 +17,7 @@ sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 import cebra.attribution
 from cebra import CEBRA
+from scipy.ndimage import gaussian_filter1d
 
 # =================== CONFIG ===================
 DATA_PATH = "./data/spk/X021920_spk.mat"
@@ -151,8 +152,27 @@ TRAIN_MU = train_raw_concat.mean(axis=0, keepdims=True).astype(np.float32)
 TRAIN_SIGMA = (train_raw_concat.std(axis=0, keepdims=True) + 1e-8).astype(np.float32)
 
 def normalize(X):
-    # return ((X - TRAIN_MU) / TRAIN_SIGMA).astype(np.float32)
-    return (X).astype(np.float32)
+    X = X.astype(np.float32)
+    
+    # ============================================================
+    # 1) GAUSSIAN SMOOTHING 
+    #    Ma: 50ms bin + Gaussian σ=100ms
+    #    : 10ms bin → σ = 100/10 = 10 bin
+    # ============================================================
+    sigma_bins = 100.0 / BIN_MS          # = 10.0
+    for n in range(X.shape[1]):
+        X[:, n] = gaussian_filter1d(X[:, n], sigma=sigma_bins, mode='reflect')
+    # ============================================================
+    
+    # ============================================================
+    # 2) Z-SCORE per neuron
+    # ============================================================
+    # mu = X.mean(axis=0, keepdims=True)
+    # sigma = X.std(axis=0, keepdims=True) + 1e-8
+    # X = (X - mu) / sigma
+    # ============================================================
+    
+    return X
 
 X_parts = []
 time_parts = []
