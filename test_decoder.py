@@ -194,6 +194,7 @@ def train_model(X, adv=False):
     sample_idx = rng.choice(len(X), size=sample_size, replace=False)
     eps = float(min_l2_distance(X[sample_idx])) / 2.0
     eps = max(eps, 1e-6)
+    eps = 6
     print(f"training {name} | eps={eps:.5f}")
     model = CEBRA(
         batch_size=BATCH_SIZE,
