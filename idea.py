@@ -13,6 +13,7 @@ sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 import cebra.attribution
 from cebra import CEBRA
+from scipy.ndimage import gaussian_filter1d
 
 # =================== CONFIG ===================
 DATA_PATH = "./data/spk/X021920_spk.mat"
