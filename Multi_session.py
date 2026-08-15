@@ -234,10 +234,18 @@ def train_multisession_model(sessions, model_name, adversarial=False):
     print("\n" + "=" * 90)
     print(f"TRAINING {model_name} | sessions={len(sessions)}")
     print("=" * 90)
-    model = Offset36Multi(num_units=HIDDEN_DIM, num_outputs=OUTPUT_DIM, normalize_output=True).to(DEVICE)
+    # model = Offset36Multi(num_units=HIDDEN_DIM, num_outputs=OUTPUT_DIM, normalize_output=True).to(DEVICE)
+    # for session in sessions:
+    #     model.add_session(session["name"], session["n_neurons"])
+    #     print(f"Registered {session['name']} | neurons={session['n_neurons']}")
+    model = Offset36Multi(num_units=HIDDEN_DIM,num_outputs=OUTPUT_DIM,normalize_output=True)
+    
     for session in sessions:
-        model.add_session(session["name"], session["n_neurons"])
+        model.add_session(session["name"],session["n_neurons"])
         print(f"Registered {session['name']} | neurons={session['n_neurons']}")
+        
+    # Move all shared + session-specific layers to GPU
+    model = model.to(DEVICE)
     loaders = []
     for session in sessions:
         dataset, loader = create_loader(session, model)
