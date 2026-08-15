@@ -28,7 +28,7 @@ os.makedirs(IMG_DIR, exist_ok=True)
 
 PREPROCESS_MODE = "smooth"
 SMOOTH_SIGMA_MS = 100.0
-MAX_SESSIONS = 3
+MAX_SESSIONS = None
 TASK_NAME = "2afc"
 REQUIRE_BRK_ZERO = True
 PRE_MS = 500
