@@ -128,7 +128,7 @@ all_concat = np.concatenate(all_trials_raw, axis=0)
 mu_all = all_concat.mean(axis=0, keepdims=True)
 sigma_all = all_concat.std(axis=0, keepdims=True) + 1e-8
 
-def normalize(X):
+def normalize_multi(X):
     X = X.astype(np.float32)
     
     # ============================================================
