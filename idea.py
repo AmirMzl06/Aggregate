@@ -19,7 +19,7 @@ DATA_PATH = "./data/spk/X021920_spk.mat"
 BHV_PATH = "./data/behav/X021920_trialtype.csv"
 SESSION_PREFIX = os.path.basename(DATA_PATH).replace("_spk.mat", "")
 OUT_DIR = "./outputs"
-IMG_DIR = "./image"
+IMG_DIR = "./image_smooth"
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(IMG_DIR, exist_ok=True)
 
@@ -127,9 +127,28 @@ all_concat = np.concatenate(all_trials_raw, axis=0)
 mu_all = all_concat.mean(axis=0, keepdims=True)
 sigma_all = all_concat.std(axis=0, keepdims=True) + 1e-8
 
-def normalize_multi(X):
-    # return ((X - mu_all) / sigma_all).astype(np.float32)
-    return (X).astype(np.float32)
+def normalize(X):
+    X = X.astype(np.float32)
+    
+    # ============================================================
+    # 1) GAUSSIAN SMOOTHING 
+    #    Ma: 50ms bin + Gaussian σ=100ms
+    #    : 10ms bin → σ = 100/10 = 10 bin
+    # ============================================================
+    sigma_bins = 100.0 / BIN_MS          # = 10.0
+    for n in range(X.shape[1]):
+        X[:, n] = gaussian_filter1d(X[:, n], sigma=sigma_bins, mode='reflect')
+    # ============================================================
+    
+    # ============================================================
+    # 2) Z-SCORE per neuron
+    # ============================================================
+    # mu = X.mean(axis=0, keepdims=True)
+    # sigma = X.std(axis=0, keepdims=True) + 1e-8
+    # X = (X - mu) / sigma
+    # ============================================================
+    
+    return X
 
 # Prepare multi-trial CEBRA inputs
 X_multi_parts = []
