@@ -388,7 +388,7 @@ os.makedirs(IMG_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Keep one seed by default; add more if you want averaging
-SEEDS = [38,226]
+SEEDS = [38,226,1,36,989,26,84,66,27,81,49]
 
 DATASET_CFG = {
     "name": "FIG5_SINGLE",
@@ -825,6 +825,63 @@ def main():
 
     summary_csv = os.path.join(OUT_DIR, "synthetic_auroc_summary.csv")
     summary_df.to_csv(summary_csv, index=False)
+        # ============================================================
+    # Save seed-wise + mean ± std results
+    # ============================================================
+
+    fake_result_dir = "Fake_dataset_result"
+    os.makedirs(fake_result_dir, exist_ok=True)
+
+    seed_rows = []
+
+    # individual seed results
+    for _, row in results_df.iterrows():
+        seed_rows.append({
+            "type": "seed",
+            "setup": row["setup"],
+            "model": row["model"],
+            "training_mode": row["training_mode"],
+            "seed": row["seed"],
+            "AUROC_JF": row["auroc_jf"],
+            "AUROC_JFINV": row["auroc_jfinv"],
+            "AUPRC_JF": row["auprc_jf"],
+            "AUPRC_JFINV": row["auprc_jfinv"],
+        })
+
+
+    # mean ± std (paper format)
+    for _, row in summary_df.iterrows():
+        seed_rows.append({
+            "type": "mean_std",
+            "setup": row["setup"],
+            "model": row["model"],
+            "training_mode": row["training_mode"],
+            "seed": "all",
+
+            "AUROC_JF":
+                f"{row['auroc_jf_mean']:.4f} ± {row['auroc_jf_std']:.4f}",
+
+            "AUROC_JFINV":
+                f"{row['auroc_jfinv_mean']:.4f} ± {row['auroc_jfinv_std']:.4f}",
+
+            "AUPRC_JF":
+                f"{row['auprc_jf_mean']:.4f} ± {row['auprc_jf_std']:.4f}",
+
+            "AUPRC_JFINV":
+                f"{row['auprc_jfinv_mean']:.4f} ± {row['auprc_jfinv_std']:.4f}",
+        })
+
+
+    seed_summary_df = pd.DataFrame(seed_rows)
+
+    seed_summary_csv = os.path.join(
+        fake_result_dir,
+        "Fake_dataset_all_seeds_results.csv"
+    )
+
+    seed_summary_df.to_csv(seed_summary_csv, index=False)
+
+    print(f"Saved seed results to: {seed_summary_csv}")
     print(f"Saved summary results to: {summary_csv}")
 
     print("\n" + "=" * 120)
