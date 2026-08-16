@@ -5,6 +5,14 @@ import glob
 import random
 import numpy as np
 import pandas as pd
+
+#####
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+os.environ["TRITON_DISABLE"] = "1"
+#####
+
+
 import torch
 import torch.nn as nn
 import scipy.io as sio
