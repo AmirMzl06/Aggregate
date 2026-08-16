@@ -308,14 +308,32 @@ def train_multisession_model(sessions, model_name, adversarial=False):
         progress.set_postfix(loss=f"{float(total_loss.detach().cpu()):.4f}")
     return model
 
+# class FixedSessionModel(nn.Module):
+#     def __init__(self, model, session_name):
+#         super().__init__()
+#         self.model = model
+#         self.session_name = session_name
+#         self.num_output = model.num_output
+#     def forward(self, x):
+#         return self.model(x, self.session_name)
+#     def get_offset(self):
+#         return self.model.get_offset()
 class FixedSessionModel(nn.Module):
     def __init__(self, model, session_name):
         super().__init__()
         self.model = model
         self.session_name = session_name
         self.num_output = model.num_output
+
     def forward(self, x):
-        return self.model(x, self.session_name)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)       
+        x = x.permute(0, 2, 1)
+        out = self.model(x, self.session_name)
+        if out.dim() == 3:
+            out = out.squeeze(0).permute(1, 0)   
+        return out
+
     def get_offset(self):
         return self.model.get_offset()
 
