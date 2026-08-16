@@ -375,7 +375,7 @@ SIGMA_EPS_DEFAULT = 0.03
 
 # Training
 BATCH_SIZE = 2048
-MAX_ITER = 25000
+MAX_ITER = 25#000
 ATTR_BATCH_SIZE = 128
 
 # Model / run
@@ -388,7 +388,7 @@ os.makedirs(IMG_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Keep one seed by default; add more if you want averaging
-SEEDS = [38,226,1,36,989,26,84,66,27,81,49]
+SEEDS = [38]#,226,1,36,989,26,84,66,27,81,49]
 
 DATASET_CFG = {
     "name": "FIG5_SINGLE",
