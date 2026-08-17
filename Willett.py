@@ -3,6 +3,11 @@ import gc
 import sys
 import numpy as np
 import scipy.io as sio
+
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+os.environ["TRITON_DISABLE"] = "1"
+
 import torch
 import matplotlib.pyplot as plt
 
@@ -19,8 +24,12 @@ from cebra import CEBRA
 # =====================================================
 # Config
 # =====================================================
-DATA_DIR = "./data/seed_model_training_data/mat"
-SESSION_FILE = "t5.2022.05.18.mat"
+# DATA_DIR = "./data/seed_model_training_data/mat"
+# SESSION_FILE = "t5.2022.05.18.mat"
+
+DATA_DIR = "./data/competitionData/competitionData/train"
+SESSION_FILE = "t12.2022.05.05.mat"
+
 MAT_PATH = os.path.join(DATA_DIR, SESSION_FILE)
 
 TRIAL_ID = 0
