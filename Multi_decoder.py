@@ -617,9 +617,9 @@ X_train_acorn = X_test_acorn = y_train_acorn = y_test_acorn = None
 
 if RUN_CEBRA:
     cebra_model = train_multisession_model(sessions, model_name="CEBRA", session_eps=session_eps, adversarial=False)
-    cebra_path = os.path.join(OUT_DIR, "CEBRA_multisession_shared.pt")
-    torch.save(cebra_model.state_dict(), cebra_path)
-    print("Saved CEBRA:", cebra_path)
+    # cebra_path = os.path.join(OUT_DIR, "CEBRA_multisession_shared.pt")
+    # torch.save(cebra_model.state_dict(), cebra_path)
+    # print("Saved CEBRA:", cebra_path)
     cebra_summary = compute_all_attributions(cebra_model, sessions, "CEBRA", attribution_trial_idx)
     cebra_summary.to_csv(os.path.join(OUT_DIR, "CEBRA_trial_jacobian_summary.csv"), index=False)
     X_train_cebra, y_train_cebra = build_pooled_split(cebra_model, sessions, "train")
@@ -629,9 +629,9 @@ if RUN_CEBRA:
 
 if RUN_ACORN:
     acorn_model = train_multisession_model(sessions, model_name="ACORN", session_eps=session_eps, adversarial=True)
-    acorn_path = os.path.join(OUT_DIR, "ACORN_multisession_shared.pt")
-    torch.save(acorn_model.state_dict(), acorn_path)
-    print("Saved ACORN:", acorn_path)
+    # acorn_path = os.path.join(OUT_DIR, "ACORN_multisession_shared.pt")
+    # torch.save(acorn_model.state_dict(), acorn_path)
+    # print("Saved ACORN:", acorn_path)
     acorn_summary = compute_all_attributions(acorn_model, sessions, "ACORN", attribution_trial_idx)
     acorn_summary.to_csv(os.path.join(OUT_DIR, "ACORN_trial_jacobian_summary.csv"), index=False)
     X_train_acorn, y_train_acorn = build_pooled_split(acorn_model, sessions, "train")
