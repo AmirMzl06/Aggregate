@@ -42,7 +42,7 @@ IMG_DIR = "./image"
 os.makedirs(IMG_DIR, exist_ok=True)
 
 BATCH_SIZE = 256
-MAX_ITER = 25000
+MAX_ITER = 2500
 OUTPUT_DIM = 16
 
 RANDOM_SEED = 42
