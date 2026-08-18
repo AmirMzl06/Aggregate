@@ -42,8 +42,8 @@ IMG_DIR = "./image"
 os.makedirs(IMG_DIR, exist_ok=True)
 
 BATCH_SIZE = 256
-MAX_ITER = 2500
-OUTPUT_DIM = 16
+MAX_ITER = 1000
+OUTPUT_DIM = 32
 
 RANDOM_SEED = 42
 
@@ -275,7 +275,7 @@ def train_acorn(X):
         batch_size=train_batch_size,
         temperature=0.4,
         model_architecture="offset10-model",
-        time_offsets=10,
+        time_offsets=36,#10,
         max_iterations=MAX_ITER,
         output_dimension=OUTPUT_DIM,
         verbose=True,
@@ -284,7 +284,7 @@ def train_acorn(X):
         adv_epsilon=eps,
         adv_steps=10,
         attack_norm="linf",
-        num_hidden_units=32,
+        num_hidden_units=128 ,#32,
         device="cuda_if_available",
     )
 
