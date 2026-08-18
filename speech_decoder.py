@@ -384,15 +384,25 @@ class Encoder_Decoder(nn.Module):
                  no_rnn=False, cebra_window_10=False, cebra_bn=False):
         super().__init__()
 
+        # def init_cebra(in_features):
+        #     if cebra_window_10:
+        #         self.left_of = 5
+        #         ceb_model = Offset10ModelBN if cebra_bn else Offset10Model
+        #     else:
+        #         self.left_of = 18
+        #         ceb_model = Offset36Dropoutv2
+        #     return ceb_model(in_features, 256, cebra_out_dim)
+         
         def init_cebra(in_features):
             if cebra_window_10:
                 self.left_of = 5
-                ceb_model = Offset10ModelBN if cebra_bn else Offset10Model
+                ceb_model = Offset10Model
             else:
                 self.left_of = 18
                 ceb_model = Offset36Dropoutv2
+      
             return ceb_model(in_features, 256, cebra_out_dim)
-
+           
         current_dim = neural_dim
         self.cebra_unfolder = cebra_unfolder
         self.smoother = GaussianSmoothing(neural_dim, 20, smooth_width, dim=1) if gauss_in else nn.Identity()
