@@ -48,9 +48,13 @@ from utils.constants import CEBRA_DIR
 from utils.load_model_states import save_checkpoint, load_checkpoint
 
 sys.path.insert(0, str(CEBRA_DIR))
+# from cebra.models import (
+#     Offset36Dropoutv2, Offset10Model, Offset36Dropoutv2BN,
+#     Offset10ModelBN, Offset36Dropoutv205,
+# )
 from cebra.models import (
-    Offset36Dropoutv2, Offset10Model, Offset36Dropoutv2BN,
-    Offset10ModelBN, Offset36Dropoutv205,
+    Offset36Dropoutv2,
+    Offset10Model,
 )
 
 
