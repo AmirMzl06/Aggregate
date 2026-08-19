@@ -45,7 +45,12 @@ DROPOUT = 0.1
 OFFSET_LEFT = 18
 OFFSET_RIGHT = 18
 BATCH_SIZE = 1024
-TOTAL_STEPS = 10000
+
+# TOTAL_STEPS = 50000 #iteration for cebra
+
+MULTI_TOTAL_STEPS = 60000
+SINGLE_TOTAL_STEPS = 10000
+
 NUM_SESSIONS_PER_ITER = 1
 TEMPERATURE = 0.4
 LEARNING_RATE = 1e-4
@@ -65,7 +70,9 @@ DECODER_NUM_LAYERS = 2
 DECODER_DROPOUT = 0.4
 DECODER_LR = 1e-3
 DECODER_WEIGHT_DECAY = 1e-4
-DECODER_EPOCHS = 5000
+
+DECODER_EPOCHS = 2100
+
 DECODER_BATCH_SIZE = 256
 PRINT_EVERY = 5
 RANDOM_SEED = 42
@@ -275,7 +282,7 @@ def project_l2_ball(x_adv, x_ref, epsilon):
     factor = torch.clamp(epsilon / norm, max=1.0)
     return x_ref + delta * factor
 
-def train_multisession_model(sessions, model_name, session_eps, adversarial=False):
+def train_multisession_model(sessions, model_name, session_eps, adversarial=False,total_steps=TOTAL_STEPS):
     print("\n" + "=" * 90)
     print(f"TRAINING {model_name} | sessions={len(sessions)}")
     print("=" * 90)
@@ -292,7 +299,7 @@ def train_multisession_model(sessions, model_name, session_eps, adversarial=Fals
         loaders.append(loader)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), eps=1e-8, weight_decay=WEIGHT_DECAY)
     criterion = cebra.models.FixedCosineInfoNCE(temperature=TEMPERATURE).to(DEVICE)
-    progress = tqdm(range(TOTAL_STEPS), desc=model_name)
+    progress = tqdm(range(total_steps), desc=model_name)
     for step in progress:
         selected = choose_sessions(step, len(sessions), NUM_SESSIONS_PER_ITER)
         model.train()
@@ -347,6 +354,79 @@ def train_multisession_model(sessions, model_name, session_eps, adversarial=Fals
             optimizer.step()
         progress.set_postfix(loss=f"{float(total_loss.detach().cpu()):.4f}")
     return model
+    
+# def train_multisession_model(sessions, model_name, session_eps, adversarial=False):
+#     print("\n" + "=" * 90)
+#     print(f"TRAINING {model_name} | sessions={len(sessions)}")
+#     print("=" * 90)
+#     model = Offset36Multi(num_units=HIDDEN_DIM, num_outputs=OUTPUT_DIM, normalize_output=True)
+#     for session in sessions:
+#         model.add_session(session["name"], session["n_neurons"])
+#         print(f"Registered {session['name']} | neurons={session['n_neurons']} | eps={session_eps[session['name']]:.5f}")
+#     model = model.to(DEVICE)
+#     loaders = []
+#     for session in sessions:
+#         dataset, loader = create_loader(session, model)
+#         session["dataset"] = dataset
+#         session["loader"] = loader
+#         loaders.append(loader)
+#     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), eps=1e-8, weight_decay=WEIGHT_DECAY)
+#     criterion = cebra.models.FixedCosineInfoNCE(temperature=TEMPERATURE).to(DEVICE)
+#     progress = tqdm(range(TOTAL_STEPS), desc=model_name)
+#     for step in progress:
+#         selected = choose_sessions(step, len(sessions), NUM_SESSIONS_PER_ITER)
+#         model.train()
+#         optimizer.zero_grad(set_to_none=True)
+#         batches = []
+#         session_names = []
+#         total_loss = torch.tensor(0.0, device=DEVICE)
+#         for idx in selected:
+#             session = sessions[idx]
+#             name = session["name"]
+#             batch = next(session["loader"])
+#             batch.to(DEVICE)
+#             reference = model(batch.reference, name)
+#             positive = model(batch.positive, name)
+#             negative = model(batch.negative, name)
+#             loss, _, _ = criterion(reference, positive, negative)
+#             total_loss = total_loss + loss / len(selected)
+#             batches.append(batch)
+#             session_names.append(name)
+#         total_loss.backward()
+#         optimizer.step()
+#         if adversarial:
+#             optimizer.zero_grad(set_to_none=True)
+#             adv_batches = []
+#             for batch, name in zip(batches, session_names):
+#                 eps = session_eps[name]
+#                 alpha = eps / 5.0
+#                 x_ref = batch.reference.detach()
+#                 noise = normalize_l2(torch.randn_like(x_ref))
+#                 radius = torch.rand((x_ref.shape[0], 1, 1), device=DEVICE) * eps
+#                 x_adv = (x_ref + noise * radius).detach()
+#                 x_adv.requires_grad_(True)
+#                 for _ in range(ADV_STEPS):
+#                     r_adv = model(x_adv, name)
+#                     p = model(batch.positive, name)
+#                     n = model(batch.negative, name)
+#                     adv_loss, _, _ = criterion(r_adv, p, n)
+#                     grad_x = torch.autograd.grad(adv_loss, x_adv, retain_graph=False, create_graph=False)[0]
+#                     with torch.no_grad():
+#                         x_adv = x_adv + alpha * normalize_l2(grad_x)
+#                         x_adv = project_l2_ball(x_adv, x_ref, eps)
+#                     x_adv.requires_grad_(True)
+#                 adv_batches.append((x_adv.detach(), batch, name))
+#             total_adv_loss = torch.tensor(0.0, device=DEVICE)
+#             for x_adv, batch, name in adv_batches:
+#                 r_adv = model(x_adv, name)
+#                 p = model(batch.positive, name)
+#                 n = model(batch.negative, name)
+#                 adv_loss, _, _ = criterion(r_adv, p, n)
+#                 total_adv_loss = total_adv_loss + adv_loss / len(adv_batches)
+#             total_adv_loss.backward()
+#             optimizer.step()
+#         progress.set_postfix(loss=f"{float(total_loss.detach().cpu()):.4f}")
+#     return model
 
 def transform_batch(model, session_name, X_batch_np):
     x = torch.tensor(X_batch_np, dtype=torch.float32, device=DEVICE)
@@ -548,7 +628,7 @@ X_test_acorn = y_test_acorn = acorn_test_slices = None
 cebra_pooled_acc = acorn_pooled_acc = None
 
 if RUN_CEBRA:
-    cebra_model = train_multisession_model(sessions, model_name="CEBRA", session_eps=session_eps, adversarial=False)
+    cebra_model = train_multisession_model(sessions, model_name="CEBRA", session_eps=session_eps, adversarial=False,total_steps=MULTI_TOTAL_STEPS)
     X_train_cebra, y_train_cebra, _ = build_pooled_split(cebra_model, sessions, "train")
     X_test_cebra, y_test_cebra, cebra_test_slices = build_pooled_split(cebra_model, sessions, "test")
     print(f"CEBRA embeddings | train={X_train_cebra.shape} | test={X_test_cebra.shape}")
@@ -559,7 +639,7 @@ if RUN_CEBRA:
     cleanup(X_train_cebra, y_train_cebra)
 
 if RUN_ACORN:
-    acorn_model = train_multisession_model(sessions, model_name="ACORN", session_eps=session_eps, adversarial=True)
+    acorn_model = train_multisession_model(sessions, model_name="ACORN", session_eps=session_eps, adversarial=True,total_steps=MULTI_TOTAL_STEPS)
     X_train_acorn, y_train_acorn, _ = build_pooled_split(acorn_model, sessions, "train")
     X_test_acorn, y_test_acorn, acorn_test_slices = build_pooled_split(acorn_model, sessions, "test")
     print(f"ACORN embeddings | train={X_train_acorn.shape} | test={X_test_acorn.shape}")
@@ -611,7 +691,7 @@ for name in compare_session_names:
     print(f"\n--- session {name} ---")
 
     if RUN_CEBRA:
-        model_s = train_multisession_model([session], model_name=f"CEBRA[{name}]", session_eps=session_eps, adversarial=False)
+        model_s = train_multisession_model([session], model_name=f"CEBRA[{name}]", session_eps=session_eps, adversarial=False,total_steps=SINGLE_TOTAL_STEPS)
         X_tr = extract_session_embeddings(model_s, session, session["train_trials"])
         X_te = extract_session_embeddings(model_s, session, session["test_trials"])
         cleanup(model_s)
@@ -621,7 +701,7 @@ for name in compare_session_names:
         cleanup(dec_s, X_tr, X_te)
 
     if RUN_ACORN:
-        model_s = train_multisession_model([session], model_name=f"ACORN[{name}]", session_eps=session_eps, adversarial=True)
+        model_s = train_multisession_model([session], model_name=f"ACORN[{name}]", session_eps=session_eps, adversarial=True,total_steps=SINGLE_TOTAL_STEPS)
         X_tr = extract_session_embeddings(model_s, session, session["train_trials"])
         X_te = extract_session_embeddings(model_s, session, session["test_trials"])
         cleanup(model_s)
