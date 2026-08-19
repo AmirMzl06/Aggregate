@@ -286,7 +286,7 @@ def get_dataset_loaders(datasetPath, batch_size, area_6v_channels, max_files, te
         test_ds, batch_size=batch_size, shuffle=False,
         num_workers=0, pin_memory=True, collate_fn=ctc_collate,
     )
-    return train_loader, test_loader, test_samples
+    return train_loader, test_loader, test_samples, , files
 
 # =====================================================================
 # Model pieces -- copied from your professor's code (GaussianSmoothing,
@@ -625,7 +625,11 @@ def train_model(args: dict):
     with open(os.path.join(args["out_dir"], "args"), "wb") as f:
         pickle.dump(args, f)
 
-    train_loader, test_loader, test_samples = get_dataset_loaders(
+    # train_loader, test_loader, test_samples = get_dataset_loaders(
+    #     args["datasetPath"], args["batchSize"], args["area_6v_channels"],
+    #     args["max_files"], args["test_size"], args["seed"],
+    # )
+    train_loader, test_loader, test_samples, files = get_dataset_loaders(
         args["datasetPath"], args["batchSize"], args["area_6v_channels"],
         args["max_files"], args["test_size"], args["seed"],
     )
@@ -785,10 +789,29 @@ def train_model(args: dict):
             with open(os.path.join(args["out_dir"], "trainingStats"), "wb") as f:
                 pickle.dump({"testLoss": np.array(testLoss), "testCER": np.array(testCER)}, f)
 
+    # print("DONE")
+    # raw_X, _, _ = test_samples[0]
+    # run_attribution(model, raw_X, args["area_6v_channels"], args["ceb_out"],
+    #                  args["out_dir"], device, tag="CEBRA_trial0")
+    # return model
     print("DONE")
-    raw_X, _, _ = test_samples[0]
-    run_attribution(model, raw_X, args["area_6v_channels"], args["ceb_out"],
-                     args["out_dir"], device, tag="CEBRA_trial0")
+
+    day_to_trial = {}
+    for X, text, day_idx in test_samples:
+        if day_idx not in day_to_trial:
+            day_to_trial[day_idx] = X
+
+    print(f"\nrunning attribution for {len(day_to_trial)} day(s) present in the test split "
+          f"(out of {len(files)} total day files)")
+
+    for day_idx in sorted(day_to_trial.keys()):
+        day_name = os.path.splitext(files[day_idx])[0]
+        tag = f"CEBRA_day{day_idx}_{day_name}"
+        run_attribution(
+            model, day_to_trial[day_idx], args["area_6v_channels"], args["ceb_out"],
+            args["out_dir"], device, tag=tag,
+        )
+
     return model
 
 
