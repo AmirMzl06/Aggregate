@@ -603,30 +603,56 @@ cleanup(cebra_decoder, acorn_decoder, X_test_cebra, y_test_cebra, X_test_acorn, 
 
 print("\n" + "=" * 90)
 print("PART B: fresh SINGLE-session CEBRA/ACORN + decoder, same train/test split per session")
+print("\n" + "=" * 90)
+print("PART B: fresh SINGLE-session Offset36Multi (same architecture) + decoder, same train/test split per session")
 print("=" * 90)
 for name in compare_session_names:
     session = session_lookup[name]
     print(f"\n--- session {name} ---")
 
     if RUN_CEBRA:
-        model_s, eps_s = train_cebra_single_session(session, adv=False)
-        X_tr = build_single_session_embeddings(model_s, session["train_trials"])
-        X_te = build_single_session_embeddings(model_s, session["test_trials"])
+        model_s = train_multisession_model([session], model_name=f"CEBRA[{name}]", session_eps=session_eps, adversarial=False)
+        X_tr = extract_session_embeddings(model_s, session, session["train_trials"])
+        X_te = extract_session_embeddings(model_s, session, session["test_trials"])
         cleanup(model_s)
         acc, dec_s, mu_s, sigma_s = train_decoder(X_tr, session["y_train"], X_te, session["y_test"], f"CEBRA[{name}]")
-        print(f"  [single][CEBRA] {name}: acc={acc:.4f} | eps={eps_s:.5f}")
+        print(f"  [single][CEBRA] {name}: acc={acc:.4f}")
         rows.append({"session": name, "model": "CEBRA", "pipeline": "single", "accuracy": acc})
         cleanup(dec_s, X_tr, X_te)
 
     if RUN_ACORN:
-        model_s, eps_s = train_cebra_single_session(session, adv=True)
-        X_tr = build_single_session_embeddings(model_s, session["train_trials"])
-        X_te = build_single_session_embeddings(model_s, session["test_trials"])
+        model_s = train_multisession_model([session], model_name=f"ACORN[{name}]", session_eps=session_eps, adversarial=True)
+        X_tr = extract_session_embeddings(model_s, session, session["train_trials"])
+        X_te = extract_session_embeddings(model_s, session, session["test_trials"])
         cleanup(model_s)
         acc, dec_s, mu_s, sigma_s = train_decoder(X_tr, session["y_train"], X_te, session["y_test"], f"ACORN[{name}]")
-        print(f"  [single][ACORN] {name}: acc={acc:.4f} | eps={eps_s:.5f}")
+        print(f"  [single][ACORN] {name}: acc={acc:.4f}")
         rows.append({"session": name, "model": "ACORN", "pipeline": "single", "accuracy": acc})
         cleanup(dec_s, X_tr, X_te)
+# print("=" * 90)
+# for name in compare_session_names:
+#     session = session_lookup[name]
+#     print(f"\n--- session {name} ---")
+
+#     if RUN_CEBRA:
+#         model_s, eps_s = train_cebra_single_session(session, adv=False)
+#         X_tr = build_single_session_embeddings(model_s, session["train_trials"])
+#         X_te = build_single_session_embeddings(model_s, session["test_trials"])
+#         cleanup(model_s)
+#         acc, dec_s, mu_s, sigma_s = train_decoder(X_tr, session["y_train"], X_te, session["y_test"], f"CEBRA[{name}]")
+#         print(f"  [single][CEBRA] {name}: acc={acc:.4f} | eps={eps_s:.5f}")
+#         rows.append({"session": name, "model": "CEBRA", "pipeline": "single", "accuracy": acc})
+#         cleanup(dec_s, X_tr, X_te)
+
+#     if RUN_ACORN:
+#         model_s, eps_s = train_cebra_single_session(session, adv=True)
+#         X_tr = build_single_session_embeddings(model_s, session["train_trials"])
+#         X_te = build_single_session_embeddings(model_s, session["test_trials"])
+#         cleanup(model_s)
+#         acc, dec_s, mu_s, sigma_s = train_decoder(X_tr, session["y_train"], X_te, session["y_test"], f"ACORN[{name}]")
+#         print(f"  [single][ACORN] {name}: acc={acc:.4f} | eps={eps_s:.5f}")
+#         rows.append({"session": name, "model": "ACORN", "pipeline": "single", "accuracy": acc})
+#         cleanup(dec_s, X_tr, X_te)
 
 compare_df = pd.DataFrame(rows)
 compare_path = os.path.join(OUT_DIR, "session_comparison_multi_vs_single.csv")
