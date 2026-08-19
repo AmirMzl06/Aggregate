@@ -480,9 +480,9 @@ def run_attribution(model, raw_X, area_6v_channels, ceb_out_dim, out_dir, device
         input_data=x_tensor,
         output_dimension=ceb_out_dim,
     )
-    # batch_size = کل طول trial، تا هیچ‌وقت یه تکه‌ی کوچیک‌تر از receptive field نساخته بشه
-    result = method.compute_attribution_map(batch_size=raw_X.shape[0])
-
+    
+    result = method.compute_attribution_map(batch_size=x_tensor.shape[0])
+    
     jf = result["jf"]
     jf_inv = result.get("jf-inv-svd", result.get("jf-inv-lsq", result.get("jf-inv")))
 
