@@ -131,7 +131,7 @@ DEFAULT_ARGS = dict(
     lambda_contrastive=1.0,   # weight on the CEBRA contrastive term, professor's code uses 1.0
 
     # adversarial training (optional, matches professor's PGD-on-input scheme)
-    adv=True,
+    adv=False,
     adv_eps=5,
     adv_norm="linf",
     adv_steps=10,
