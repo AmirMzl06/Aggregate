@@ -1,3 +1,4 @@
+#only CER
 import os
 import sys
 import math
@@ -103,7 +104,7 @@ DEFAULT_ARGS = dict(
     batchSize=16,
     lrStart=3e-4,
     lrEnd=3e-5,
-    nBatch=50000,#epoch
+    nBatch=5,#epoch
     l2_decay=1e-5,
     temperature=0.1,
     whiteNoiseSD=0.0,
