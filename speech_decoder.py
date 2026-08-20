@@ -637,21 +637,15 @@ def evaluate_metrics(model, loader, ctc_criterion, device, compute_per=False):
                 # decoded_ids = torch.argmax(pred_v[i, :lengths_v[i], :], dim=-1)
                 # decoded_ids = torch.unique_consecutive(decoded_ids)
                 # decoded_ids = [c for c in decoded_ids.cpu().numpy().tolist() if c != 0]
-                decoded_ids = torch.argmax(
-                    pred_v[i, :lengths_v[i], :], dim=-1
-                ).cpu().numpy().tolist()
-                # Remove CTC blanks first
-                decoded_ids = [c for c in decoded_ids if c != 0]                
-                # Then collapse consecutive repeated symbols
+                raw_ids = torch.argmax(pred_v[i, :lengths_v[i], :], dim=-1).cpu().numpy().tolist()
                 collapsed = []
-                for c in decoded_ids:
+                for c in raw_ids:
                     if not collapsed or c != collapsed[-1]:
                         collapsed.append(c)
                 
-                decoded_ids = collapsed
-                
+                decoded_ids = [c for c in collapsed if c != 0]
                 true_ids = yv[i][:yv_len[i]].cpu().numpy().tolist()
-
+        
                 matcher = SequenceMatcher(a=true_ids, b=decoded_ids)
                 total_char_edit += matcher.distance()
                 total_char_len += len(true_ids)
