@@ -816,8 +816,10 @@ def train_model(args: dict):
         if day_idx not in day_to_trial:
             day_to_trial[day_idx] = X
 
-    print(f"\nrunning attribution for {len(day_to_trial)} day(s) present in the test split "
-          f"(out of {len(filter)} total day files)")
+    print(
+        f"\nrunning attribution for {len(day_to_trial)} day(s) present in the test split "
+        f"(out of {len(test_files)} total day files)"
+    )
     
     
     final_loss, final_cer = evaluate_cer(model, test_loader, ctc_criterion, device)
