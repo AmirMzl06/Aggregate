@@ -817,7 +817,7 @@ def train_model(args: dict):
             day_to_trial[day_idx] = X
 
     print(f"\nrunning attribution for {len(day_to_trial)} day(s) present in the test split "
-          f"(out of {len(files)} total day files)")
+          f"(out of {len(filter)} total day files)")
     
     
     final_loss, final_cer = evaluate_cer(model, test_loader, ctc_criterion, device)
