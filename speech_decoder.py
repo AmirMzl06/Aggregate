@@ -947,7 +947,7 @@ def train_model(args: dict):
             
 
             testLoss.append(avgLoss)
-            testCER.append(cer)
+            testCER.append(per)
             with open(os.path.join(args["out_dir"], "trainingStats"), "wb") as f:
                 pickle.dump({"testLoss": np.array(testLoss), "testCER": np.array(testCER)}, f)
 
