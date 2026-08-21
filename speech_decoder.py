@@ -214,7 +214,7 @@ DEFAULT_ARGS = dict(
     batchSize=16,
     lrStart=3e-4,
     lrEnd=3e-5,
-    nBatch=35,
+    nBatch=45000,
     l2_decay=1e-5,
     temperature=0.1,
 
