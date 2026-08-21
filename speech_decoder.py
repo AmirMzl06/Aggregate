@@ -64,17 +64,28 @@ class Charset:
 
 _g2p = G2p()
 
+ARPABET_PHONES = [
+    "AA", "AE", "AH", "AO", "AW", "AY", "B", "CH", "D", "DH",
+    "EH", "ER", "EY", "F", "G", "HH", "IH", "IY", "JH", "K",
+    "L", "M", "N", "NG", "OW", "OY", "P", "R", "S", "SH",
+    "T", "TH", "UH", "UW", "V", "W", "Y", "Z", "ZH", "SIL",
+]
+
 def text_to_phonemes(text: str) -> List[str]:
     text = text.replace(">", " ")
     cleaned = "".join(ch for ch in text if ch.isalpha() or ch in " '")
-    cleaned = " ".join(cleaned.split())
-    if not cleaned:
+    words = cleaned.split()
+    if not words:
         return []
-    phones = _g2p(cleaned)
-    phones = [p for p in phones if p.strip() != ""]
-    # strip stress digits so AH0/AH1/AH2 collapse to AH (matches ~41-class vocab)
-    phones = [p[:-1] if p[-1:].isdigit() else p for p in phones]
+    phones = ["SIL"]
+    for word in words:
+        word_phones = _g2p(word)
+        word_phones = [p for p in word_phones if p.strip() != ""]
+        word_phones = [p[:-1] if p[-1:].isdigit() else p for p in word_phones]
+        phones.extend(word_phones)
+        phones.append("SIL")
     return phones
+
 
 charset = Charset(CHARS)
 
@@ -173,7 +184,7 @@ DEFAULT_ARGS = dict(
     # ============================================================
     datasetPath="./data/competitionData/competitionData/train",
     testDatasetPath="./data/competitionData/competitionData/competitionHoldOut",
-    out_dir="./outputs/ctc_char_run",
+    out_dir="./outputs/ctc_phoneme_run",
     seed=0,
 
     area_6v_channels=128,
@@ -415,8 +426,8 @@ def get_dataset_loaders(datasetPath, testDatasetPath, batch_size, area_6v_channe
         )
 
     phoneme_vocab = build_phoneme_vocab(train_samples)
-    phon_charset = PhonemeCharset(phoneme_vocab)
-    print(f"phoneme vocab size: {phon_charset.num_classes} (incl. blank)")
+    phon_charset = PhonemeCharset(ARPABET_PHONES)
+    print(f"phoneme vocab size: {phon_charset.num_classes} (incl. blank, fixed ARPABET set)")
     print("example:", train_samples[0][1], "->", text_to_phonemes(train_samples[0][1]))
 
     train_ds = BrainToTextPhonemeDataset(train_samples, phon_charset)
@@ -935,7 +946,8 @@ def train_model(args: dict):
             with torch.no_grad():
                 allLoss, total_edit_distance, total_seq_length = [], 0, 0
                 avgLoss, per = evaluate_metrics(model, test_loader, ctc_criterion, device)
-                print(f"batch {batch} | val ctc loss: {avgLoss:.4f} | PER: {per:.4f} | ...")
+                print(f"batch {batch} | val ctc loss: {avgLoss:.4f} | PER: {per:.4f} "
+                      f"| train ctc: {ctc_loss.item():.4f} | train cont: {loss_contrastive.item():.4f}")
                 # avgLoss = float(np.sum(allLoss) / max(len(test_loader), 1))
                 # cer = total_edit_distance / max(total_seq_length, 1)
                 # print(f"batch {batch} | val ctc loss: {avgLoss:.4f} | CER: {cer:.4f} "
@@ -967,6 +979,14 @@ def train_model(args: dict):
         f"\nrunning attribution for {len(day_to_trial)} day(s) present in the test split "
         f"(out of {len(test_files)} total day files)"
     )
+    
+    
+    final_loss, final_per = evaluate_metrics(model, test_loader, ctc_criterion, device)
+    print("\n" + "=" * 60)
+    print(f"FINAL TEST RESULTS ({args['testDatasetPath']})")
+    print(f"  CTC loss: {final_loss:.4f}")
+    print(f"  PER (phoneme error rate, native): {final_per:.4f}")
+    print("=" * 60)
 
     for day_idx in sorted(day_to_trial.keys()):
         day_name = os.path.splitext(test_files[day_idx])[0]
