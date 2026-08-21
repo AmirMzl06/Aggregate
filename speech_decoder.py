@@ -961,15 +961,6 @@ def train_model(args: dict):
         f"\nrunning attribution for {len(day_to_trial)} day(s) present in the test split "
         f"(out of {len(test_files)} total day files)"
     )
-    
-    
-    final_loss, final_cer, final_per = evaluate_metrics(model, test_loader, ctc_criterion, device, compute_per=True)
-    print("\n" + "=" * 60)
-    print(f"FINAL TEST RESULTS ({args['testDatasetPath']})")
-    print(f"  CTC loss: {final_loss:.4f}")
-    print(f"  CER (character error rate): {final_cer:.4f}")
-    print(f"  PER (phoneme error rate, via g2p_en): {final_per:.4f}" if final_per is not None else "  PER: N/A (no valid phoneme sequences)")
-    print("=" * 60)
 
     for day_idx in sorted(day_to_trial.keys()):
         day_name = os.path.splitext(test_files[day_idx])[0]
