@@ -783,7 +783,6 @@ def train_model(args: dict):
 
     neural_dim = 2 * args["area_6v_channels"]
     # num_classes = phon_charset.num_classes
-    print(f"neural_dim={neural_dim} | num_classes={num_classes} (charset, incl. blank)")
 
     model = Encoder_Decoder(
         neural_dim, args["ceb_out"], args["kernel"], args["stride"], num_classes,
@@ -804,6 +803,7 @@ def train_model(args: dict):
         args["area_6v_channels"], args["max_files"], args["seed"],
     )
     num_classes = phon_charset.num_classes
+    print(f"neural_dim={neural_dim} | num_classes={num_classes} (charset, incl. blank)")
     criterion = InfoNCE(args["temperature"])
     ctc_criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args["lrStart"],
