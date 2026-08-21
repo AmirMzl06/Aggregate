@@ -86,22 +86,80 @@ def text_to_char_ids(text: str) -> List[int]:
 # =====================================================================
 # Config
 # =====================================================================
+# DEFAULT_ARGS = dict(
+#     datasetPath="./data/competitionData/competitionData/train",
+#     testDatasetPath="./data/competitionData/competitionData/competitionHoldOut",
+#     out_dir="./outputs/ctc_char_run",
+#     seed=42,
+
+#     area_6v_channels=128,   # neural_dim = 2 * this (spikePow_6v + tx1_6v)
+#     max_files=None,         # cap number of session-day .mat files, for a quick test run
+#     # test_size=0.15,
+
+#     # Encoder_Decoder / CEBRA
+#     ceb_out=32,
+#     kernel=8,
+#     stride=4,
+#     hidden=256,
+#     layers=2,
+#     dropout=0.4,
+#     bidir=True,
+#     cebra_unfolder=False,
+#     gru=True,
+#     gauss_in=True,
+#     no_rnn=False,
+#     ceb_bn=False,
+#     cebra_window_10=True,   # True -> Offset10Model (window 10); False -> Offset36Dropoutv2
+
+#     # optimization
+#     batchSize=16,
+#     lrStart=3e-4,
+#     lrEnd=3e-5,
+#     nBatch=50000,#epoch
+#     l2_decay=1e-5,
+#     temperature=0.1,
+#     whiteNoiseSD=0.0,
+#     constantOffsetSD=0.0,
+
+#     # InfoNCE positive/negative sampling (see get_batch)
+#     cont_batch=512,
+#     offset=4,
+#     sample_single=False,
+#     random_dir=False,
+#     random_offset=False,
+#     all_ref=False,
+#     lambda_contrastive=1.0,   # weight on the CEBRA contrastive term, professor's code uses 1.0
+
+#     # adversarial training (optional, matches professor's PGD-on-input scheme)
+#     adv=False,
+#     adv_eps=5,
+#     adv_norm="linf",
+#     adv_steps=10,
+
+#     eval_every=150,
+# )
+
 DEFAULT_ARGS = dict(
+    # ============================================================
+    # DATA
+    # ============================================================
     datasetPath="./data/competitionData/competitionData/train",
     testDatasetPath="./data/competitionData/competitionData/competitionHoldOut",
     out_dir="./outputs/ctc_char_run",
-    seed=42,
+    seed=0,
 
-    area_6v_channels=128,   # neural_dim = 2 * this (spikePow_6v + tx1_6v)
-    max_files=None,         # cap number of session-day .mat files, for a quick test run
-    # test_size=0.15,
+    area_6v_channels=128,
+    max_files=None,
 
-    # Encoder_Decoder / CEBRA
+    # ============================================================
+    # ENCODER / DECODER
+    # matching professor setup
+    # ============================================================
     ceb_out=32,
-    kernel=8,
+    kernel=32,
     stride=4,
-    hidden=256,
-    layers=2,
+    hidden=1024,
+    layers=5,
     dropout=0.4,
     bidir=True,
     cebra_unfolder=False,
@@ -109,35 +167,49 @@ DEFAULT_ARGS = dict(
     gauss_in=True,
     no_rnn=False,
     ceb_bn=False,
-    cebra_window_10=True,   # True -> Offset10Model (window 10); False -> Offset36Dropoutv2
+    cebra_window_10=True,
 
-    # optimization
+    # ============================================================
+    # OPTIMIZATION
+    # ============================================================
     batchSize=16,
     lrStart=3e-4,
     lrEnd=3e-5,
-    nBatch=50000,#epoch
+    nBatch=2000,
     l2_decay=1e-5,
     temperature=0.1,
-    whiteNoiseSD=0.0,
-    constantOffsetSD=0.0,
 
-    # InfoNCE positive/negative sampling (see get_batch)
+    # ============================================================
+    # INPUT AUGMENTATION
+    # ============================================================
+    whiteNoiseSD=0.8,
+    constantOffsetSD=0.2,
+
+    # ============================================================
+    # INFONCE / CEBRA SAMPLING
+    # ============================================================
     cont_batch=512,
-    offset=10,
+    offset=4,
     sample_single=False,
     random_dir=False,
-    random_offset=False,
+    random_offset=True,
     all_ref=False,
-    lambda_contrastive=1.0,   # weight on the CEBRA contrastive term, professor's code uses 1.0
+    lambda_contrastive=1.0,
 
-    # adversarial training (optional, matches professor's PGD-on-input scheme)
-    adv=False,
-    adv_eps=5,
-    adv_norm="linf",
+    # ============================================================
+    # ADVERSARIAL TRAINING
+    # ============================================================
+    adv=True,
+    adv_eps=0.8,
+    adv_norm="l2",
     adv_steps=10,
 
+    # ============================================================
+    # EVALUATION
+    # ============================================================
     eval_every=150,
 )
+
 
 
 def cleanup(*objs):
