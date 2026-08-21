@@ -782,7 +782,7 @@ def train_model(args: dict):
     checkpoint_address = os.path.join(args["out_dir"], "checkpoint.pt")
 
     neural_dim = 2 * args["area_6v_channels"]
-    num_classes = phon_charset.num_classes
+    # num_classes = phon_charset.num_classes
     print(f"neural_dim={neural_dim} | num_classes={num_classes} (charset, incl. blank)")
 
     model = Encoder_Decoder(
@@ -803,7 +803,7 @@ def train_model(args: dict):
         args["datasetPath"], args["testDatasetPath"], args["batchSize"],
         args["area_6v_channels"], args["max_files"], args["seed"],
     )
-    
+    num_classes = phon_charset.num_classes
     criterion = InfoNCE(args["temperature"])
     ctc_criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args["lrStart"],
