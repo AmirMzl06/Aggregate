@@ -214,7 +214,7 @@ DEFAULT_ARGS = dict(
     batchSize=16,
     lrStart=3e-4,
     lrEnd=3e-5,
-    nBatch=45000,
+    nBatch=20000,
     l2_decay=1e-5,
     temperature=0.1,
 
@@ -238,7 +238,7 @@ DEFAULT_ARGS = dict(
     # ============================================================
     # ADVERSARIAL TRAINING
     # ============================================================
-    adv=True,
+    adv=False,
     adv_eps=0.8,
     adv_norm="l2",
     adv_steps=10,
