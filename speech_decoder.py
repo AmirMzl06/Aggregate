@@ -22,10 +22,7 @@ from utils.constants import CEBRA_DIR
 from utils.load_model_states import save_checkpoint, load_checkpoint
 
 sys.path.insert(0, str(CEBRA_DIR))
-# from cebra.models import (
-#     Offset36Dropoutv2, Offset10Model, Offset36Dropoutv2BN,
-#     Offset10ModelBN, Offset36Dropoutv205,
-# )
+
 from cebra.models import (
     Offset36Dropoutv2,
     Offset10Model,
@@ -122,71 +119,17 @@ def text_to_char_ids(text: str) -> List[int]:
     return charset.text_to_int(text)
 
 
-# =====================================================================
-# Config
-# =====================================================================
-# DEFAULT_ARGS = dict(
-#     datasetPath="./data/competitionData/competitionData/train",
-#     testDatasetPath="./data/competitionData/competitionData/competitionHoldOut",
-#     out_dir="./outputs/ctc_char_run",
-#     seed=42,
-
-#     area_6v_channels=128,   # neural_dim = 2 * this (spikePow_6v + tx1_6v)
-#     max_files=None,         # cap number of session-day .mat files, for a quick test run
-#     # test_size=0.15,
-
-#     # Encoder_Decoder / CEBRA
-#     ceb_out=32,
-#     kernel=8,
-#     stride=4,
-#     hidden=256,
-#     layers=2,
-#     dropout=0.4,
-#     bidir=True,
-#     cebra_unfolder=False,
-#     gru=True,
-#     gauss_in=True,
-#     no_rnn=False,
-#     ceb_bn=False,
-#     cebra_window_10=True,   # True -> Offset10Model (window 10); False -> Offset36Dropoutv2
-
-#     # optimization
-#     batchSize=16,
-#     lrStart=3e-4,
-#     lrEnd=3e-5,
-#     nBatch=50000,#epoch
-#     l2_decay=1e-5,
-#     temperature=0.1,
-#     whiteNoiseSD=0.0,
-#     constantOffsetSD=0.0,
-
-#     # InfoNCE positive/negative sampling (see get_batch)
-#     cont_batch=512,
-#     offset=4,
-#     sample_single=False,
-#     random_dir=False,
-#     random_offset=False,
-#     all_ref=False,
-#     lambda_contrastive=1.0,   # weight on the CEBRA contrastive term, professor's code uses 1.0
-
-#     # adversarial training (optional, matches professor's PGD-on-input scheme)
-#     adv=False,
-#     adv_eps=5,
-#     adv_norm="linf",
-#     adv_steps=10,
-
-#     eval_every=150,
-# )
-
 DEFAULT_ARGS = dict(
     # ============================================================
     # DATA
     # ============================================================
     datasetPath="./data/competitionData/competitionData/train",
-    testDatasetPath="./data/competitionData/competitionData/competitionHoldOut",
     out_dir="./outputs/ctc_phoneme_run",
     seed=0,
-
+    
+    seen_test_size=0.2,
+    unseen_day_fraction=0.5,
+    
     area_6v_channels=128,
     max_files=None,
 
@@ -414,34 +357,55 @@ def ctc_collate(batch):
     return x_pad, targets_padded, input_lengths, target_lengths, sessions_t
 
 
-def get_dataset_loaders(datasetPath, testDatasetPath, batch_size, area_6v_channels, max_files, seed):
-    train_samples, train_files = load_all_sessions(datasetPath, area_6v_channels, max_files)
-    test_samples, test_files = load_all_sessions(testDatasetPath, area_6v_channels, max_files)
+def split_days_and_trials(samples, files, seen_test_size=0.2, unseen_day_fraction=0.5, seed=0):
+    rng = np.random.default_rng(seed)
+    n_days = len(files)
+    day_order = np.arange(n_days)
+    rng.shuffle(day_order)
 
-    if len(test_samples) == 0:
-        raise RuntimeError(
-            f"No usable trials in {testDatasetPath} after charset filtering. "
-            f"competitionHoldOut sentence labels may be withheld for the competition -- "
-            f"open one .mat file and check data['sentenceText'] directly before trusting this path."
-        )
+    n_train_days = int(round(n_days * (1 - unseen_day_fraction)))
+    train_day_ids = set(day_order[:n_train_days].tolist())
+    unseen_day_ids = set(day_order[n_train_days:].tolist())
 
-    phoneme_vocab = build_phoneme_vocab(train_samples)
+    train_day_samples = [s for s in samples if s[2] in train_day_ids]
+    unseen_samples = [s for s in samples if s[2] in unseen_day_ids]
+
+    train_samples, seen_samples = train_test_split(
+        train_day_samples, test_size=seen_test_size, random_state=seed, shuffle=True
+    )
+
+    print(f"days: {n_days} total | {len(train_day_ids)} train-days | {len(unseen_day_ids)} unseen-days")
+    print(f"trials -> train: {len(train_samples)} | seen-eval: {len(seen_samples)} | unseen-eval: {len(unseen_samples)}")
+    return train_samples, seen_samples, unseen_samples
+
+
+def get_dataset_loaders(datasetPath, batch_size, area_6v_channels, max_files, seed,
+                         seen_test_size=0.2, unseen_day_fraction=0.5):
+    samples, files = load_all_sessions(datasetPath, area_6v_channels, max_files)
+
+    train_samples, seen_samples, unseen_samples = split_days_and_trials(
+        samples, files, seen_test_size=seen_test_size,
+        unseen_day_fraction=unseen_day_fraction, seed=seed,
+    )
+    if len(seen_samples) == 0 or len(unseen_samples) == 0:
+        raise RuntimeError("Empty seen/unseen split -- check day count and split fractions.")
+
     phon_charset = PhonemeCharset(ARPABET_PHONES)
     print(f"phoneme vocab size: {phon_charset.num_classes} (incl. blank, fixed ARPABET set)")
-    print("example:", train_samples[0][1], "->", text_to_phonemes(train_samples[0][1]))
 
     train_ds = BrainToTextPhonemeDataset(train_samples, phon_charset)
-    test_ds = BrainToTextPhonemeDataset(test_samples, phon_charset)
-    print(f"train trials: {len(train_ds)} (from {datasetPath})")
-    print(f"test trials: {len(test_ds)} (from {testDatasetPath})")
+    seen_ds = BrainToTextPhonemeDataset(seen_samples, phon_charset)
+    unseen_ds = BrainToTextPhonemeDataset(unseen_samples, phon_charset)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                num_workers=4, pin_memory=True, collate_fn=ctc_collate,
                                persistent_workers=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+    seen_loader = DataLoader(seen_ds, batch_size=batch_size, shuffle=False,
                               num_workers=0, pin_memory=True, collate_fn=ctc_collate)
-    return train_loader, test_loader, test_samples, test_files, phon_charset
+    unseen_loader = DataLoader(unseen_ds, batch_size=batch_size, shuffle=False,
+                                num_workers=0, pin_memory=True, collate_fn=ctc_collate)
 
+    return train_loader, seen_loader, unseen_loader, unseen_samples, files, phon_charset
 
 # =====================================================================
 # Model pieces -- copied from your professor's code (GaussianSmoothing,
@@ -794,9 +758,9 @@ def train_model(args: dict):
 
     neural_dim = 2 * args["area_6v_channels"]
     # num_classes = phon_charset.num_classes
-    train_loader, test_loader, test_samples, test_files, phon_charset = get_dataset_loaders(
-        args["datasetPath"], args["testDatasetPath"], args["batchSize"],
-        args["area_6v_channels"], args["max_files"], args["seed"],
+    train_loader, seen_loader, unseen_loader, unseen_samples, files, phon_charset = get_dataset_loaders(
+        args["datasetPath"], args["batchSize"], args["area_6v_channels"], args["max_files"], args["seed"],
+        seen_test_size=args["seen_test_size"], unseen_day_fraction=args["unseen_day_fraction"],
     )
     num_classes = phon_charset.num_classes
     print(f"neural_dim={neural_dim} | num_classes={num_classes} (charset, incl. blank)")
@@ -835,6 +799,7 @@ def train_model(args: dict):
 
     inf_losses = 0
     testLoss, testCER = [], []
+    testLoss_unseen, testCER_unseen = [], []
     train_iter = iter(train_loader)
 
     for batch in trange(args["nBatch"]):
@@ -942,32 +907,26 @@ def train_model(args: dict):
 
         # ---------------- periodic validation (CER) ----------------
         if batch % args["eval_every"] == 0:
-            model.eval()
-            with torch.no_grad():
-                allLoss, total_edit_distance, total_seq_length = [], 0, 0
-                avgLoss, per = evaluate_metrics(model, test_loader, ctc_criterion, device)
-                print(f"batch {batch} | val ctc loss: {avgLoss:.4f} | PER: {per:.4f} "
-                      f"| train ctc: {ctc_loss.item():.4f} | train cont: {loss_contrastive.item():.4f}")
-                # avgLoss = float(np.sum(allLoss) / max(len(test_loader), 1))
-                # cer = total_edit_distance / max(total_seq_length, 1)
-                # print(f"batch {batch} | val ctc loss: {avgLoss:.4f} | CER: {cer:.4f} "
-                #       f"| train ctc: {ctc_loss.item():.4f} | train cont: {loss_contrastive.item():.4f}")
+            loss_seen, per_seen = evaluate_metrics(model, seen_loader, ctc_criterion, device)
+            loss_unseen, per_unseen = evaluate_metrics(model, unseen_loader, ctc_criterion, device)
+            print(f"batch {batch} | seen: loss={loss_seen:.4f} PER={per_seen:.4f} "
+                  f"| unseen: loss={loss_unseen:.4f} PER={per_unseen:.4f} "
+                  f"| train ctc: {ctc_loss.item():.4f} | train cont: {loss_contrastive.item():.4f}")
 
             state_dict = (model.module if isinstance(model, torch.nn.DataParallel) else model).state_dict()
             torch.save(state_dict, os.path.join(args["out_dir"], "modelWeights"))
             save_checkpoint(checkpoint_address, model, optimizer, scheduler, batch)
-            
 
-            testLoss.append(avgLoss)
-            testCER.append(per)
+            testLoss.append(loss_seen)
+            testCER.append(per_seen)
+            testLoss_unseen.append(loss_unseen)
+            testCER_unseen.append(per_unseen)
             with open(os.path.join(args["out_dir"], "trainingStats"), "wb") as f:
-                pickle.dump({"testLoss": np.array(testLoss), "testCER": np.array(testCER)}, f)
+                pickle.dump({
+                    "testLoss_seen": np.array(testLoss), "testPER_seen": np.array(testCER),
+                    "testLoss_unseen": np.array(testLoss_unseen), "testPER_unseen": np.array(testCER_unseen),
+                }, f)
 
-    # print("DONE")
-    # raw_X, _, _ = test_samples[0]
-    # run_attribution(model, raw_X, args["area_6v_channels"], args["ceb_out"],
-    #                  args["out_dir"], device, tag="CEBRA_trial0")
-    # return model
     print("DONE")
 
     day_to_trial = {}
@@ -981,21 +940,25 @@ def train_model(args: dict):
     )
     
     
-    final_loss, final_per = evaluate_metrics(model, test_loader, ctc_criterion, device)
+    print("DONE")
+    final_loss_seen, final_per_seen = evaluate_metrics(model, seen_loader, ctc_criterion, device)
+    final_loss_unseen, final_per_unseen = evaluate_metrics(model, unseen_loader, ctc_criterion, device)
     print("\n" + "=" * 60)
-    print(f"FINAL TEST RESULTS ({args['testDatasetPath']})")
-    print(f"  CTC loss: {final_loss:.4f}")
-    print(f"  PER (phoneme error rate, native): {final_per:.4f}")
+    print("FINAL RESULTS")
+    print(f"  SEEN days   | CTC loss: {final_loss_seen:.4f} | PER: {final_per_seen:.4f}")
+    print(f"  UNSEEN days | CTC loss: {final_loss_unseen:.4f} | PER: {final_per_unseen:.4f}")
     print("=" * 60)
 
+    day_to_trial = {}
+    for X, text, day_idx in unseen_samples:
+        if day_idx not in day_to_trial:
+            day_to_trial[day_idx] = X
+    print(f"\nrunning attribution for {len(day_to_trial)} unseen day(s)")
     for day_idx in sorted(day_to_trial.keys()):
-        day_name = os.path.splitext(test_files[day_idx])[0]
-        tag = f"CEBRA_day{day_idx}_{day_name}"
-        run_attribution(
-            model, day_to_trial[day_idx], args["area_6v_channels"], args["ceb_out"],
-            args["out_dir"], device, tag=tag,
-        )
-
+        day_name = os.path.splitext(files[day_idx])[0]
+        tag = f"CEBRA_unseen_day{day_idx}_{day_name}"
+        run_attribution(model, day_to_trial[day_idx], args["area_6v_channels"], args["ceb_out"],
+                         args["out_dir"], device, tag=tag)
     return model
 
 
