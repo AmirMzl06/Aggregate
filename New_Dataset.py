@@ -83,3 +83,25 @@ for i, t in enumerate(trials[:5]):
         print(k, v)
 print("\nFirst events:")
 print(dataset.events[:10])
+
+
+import numpy as np
+
+def extract_trial_spikes(neurons, trials):
+    trial_spikes = []
+    for t_idx, trial in enumerate(trials):
+        stim_on = trial["stim_on"]
+        response = trial["response"]
+        one_trial = {}
+        for neuron_name, spikes in neurons.items():
+            mask = (spikes >= stim_on) & (spikes <= response)
+            selected = spikes[mask]
+            relative_time = (selected - stim_on) / 1e6
+            one_trial[neuron_name] = relative_time
+        trial_spikes.append(one_trial)
+    return trial_spikes
+
+trial_spikes = extract_trial_spikes(dataset.neurons, trials)
+print("\nExample Trial 0")
+for neuron, spikes in trial_spikes[0].items():
+    print(neuron, "n_spikes:", len(spikes), spikes[:10])
