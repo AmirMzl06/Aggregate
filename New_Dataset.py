@@ -98,7 +98,7 @@ def build_model(adv):
         model_architecture="offset36-model-more-dropout",
         time_offsets=4,
         max_iterations=MAX_ITER,
-        output_dimension=6,
+        output_dimension=64,
         training_mode="adversarial" if adv else "single_session",
         adv_alpha=1/5 if adv else 0,
         adv_epsilon=0.05 if adv else 0,
