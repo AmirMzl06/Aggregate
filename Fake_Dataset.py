@@ -18,15 +18,15 @@ from sklearn.linear_model import LinearRegression
 from utils.constants import CEBRA_DIR
 
 
-# ============================================================
-# 0) Import ONLY the custom CEBRA fork
-# ============================================================
-for name in list(sys.modules):
-    if name == "cebra" or name.startswith("cebra."):
-        del sys.modules[name]
+# # ============================================================
+# # 0) Import ONLY the custom CEBRA fork
+# # ============================================================
+# for name in list(sys.modules):
+#     if name == "cebra" or name.startswith("cebra."):
+#         del sys.modules[name]
 
 sys.path.insert(0, str(CEBRA_DIR))
-importlib.invalidate_caches()
+# importlib.invalidate_caches()
 
 import cebra
 from cebra import CEBRA
