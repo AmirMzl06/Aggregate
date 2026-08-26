@@ -201,7 +201,7 @@ def get_train_attribution(model, train_trials, n_neurons):
     net.eval()
     jf_maps = []
     jfinv_maps = []
-    print("\nComputing attribution on ALL TRAIN trials:", len(train_trials))
+    print("\nComputing Jacobian on ALL TRAIN trials:", len(train_trials))
     for i, trial in enumerate(train_trials):
         inp = torch.tensor(trial, dtype=torch.float32, device=next(net.parameters()).device)
         inp.requires_grad_(True)
@@ -218,22 +218,121 @@ def get_train_attribution(model, train_trials, n_neurons):
         elif "jf-inv" in result:
             jfinv_raw = result["jf-inv"]
         else:
-            raise RuntimeError("No inverse Jacobian found. Keys=" + str(list(result.keys())))
+            raise RuntimeError(f"No inverse Jacobian. Keys={list(result.keys())}")
+        jf_raw = to_numpy(jf_raw)
+        jfinv_raw = to_numpy(jfinv_raw)
         if i == 0:
-            print("Raw JF shape:", to_numpy(jf_raw).shape)
-            print("Raw JFINV shape:", to_numpy(jfinv_raw).shape)
-        jf_map = aggregate_attr_array(jf_raw, n_neurons, LATENT_DIM, "JF")
-        jfinv_map = aggregate_attr_array(jfinv_raw, n_neurons, LATENT_DIM, "JFINV")
+            print("RAW JF shape:", jf_raw.shape)
+            print("RAW JFINV shape:", jfinv_raw.shape)
+        # FORWARD JACOBIAN: J_f = dz / dx, expected [samples, latent, neuron], average over samples -> [latent, neuron]
+        jf_map = np.mean(np.abs(jf_raw), axis=0)
+        jf_map = np.squeeze(jf_map)
+        if jf_map.shape == (n_neurons, LATENT_DIM):
+            jf_map = jf_map.T
+        if jf_map.shape != (LATENT_DIM, n_neurons):
+            raise RuntimeError(
+                f"Unexpected JF shape after averaging: {jf_map.shape}; expected ({LATENT_DIM}, {n_neurons})"
+            )
+        # INVERSE JACOBIAN: J_f^-1 ≈ dx / dz, expected [samples, neuron, latent], average over samples -> [neuron, latent]
+        jfinv_map = np.mean(np.abs(jfinv_raw), axis=0)
+        jfinv_map = np.squeeze(jfinv_map)
+        if jfinv_map.shape == (LATENT_DIM, n_neurons):
+            jfinv_map = jfinv_map.T
+        if jfinv_map.shape != (n_neurons, LATENT_DIM):
+            raise RuntimeError(
+                f"Unexpected JFINV shape after averaging: {jfinv_map.shape}; expected ({n_neurons}, {LATENT_DIM})"
+            )
         jf_maps.append(jf_map)
         jfinv_maps.append(jfinv_map)
         del method, result, inp, jf_raw, jfinv_raw
-        if torch.cuda.is_available() and (i + 1) % 10 == 0:
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if (i + 1) % 10 == 0:
+            print(f"Attribution: {i+1}/{len(train_trials)} trials")
     jf = np.mean(np.stack(jf_maps), axis=0)
     jfinv = np.mean(np.stack(jfinv_maps), axis=0)
-    print("Final JF shape:", jf.shape)
-    print("Final JFINV shape:", jfinv.shape)
+    print("\nFINAL:")
+    print("JF     dz/dx shape:", jf.shape, " = Latent x Neuron")
+    print("JFINV  dx/dz shape:", jfinv.shape, " = Neuron x Latent")
     return jf, jfinv
+
+# def get_train_attribution(model, train_trials, n_neurons):
+#     net = model.solver_.model.to("cuda" if torch.cuda.is_available() else "cpu")
+#     net.eval()
+#     jf_maps = []
+#     jfinv_maps = []
+#     print("\nComputing attribution on ALL TRAIN trials:", len(train_trials))
+#     for i, trial in enumerate(train_trials):
+#         inp = torch.tensor(trial, dtype=torch.float32, device=next(net.parameters()).device)
+#         inp.requires_grad_(True)
+#         method = cebra.attribution.init(
+#             name="jacobian-based-batched",
+#             model=net,
+#             input_data=inp,
+#             output_dimension=LATENT_DIM
+#         )
+#         result = method.compute_attribution_map(batch_size=16)
+#         jf_raw = result["jf"]
+#         if "jf-inv-svd" in result:
+#             jfinv_raw = result["jf-inv-svd"]
+#         elif "jf-inv" in result:
+#             jfinv_raw = result["jf-inv"]
+#         else:
+#             raise RuntimeError("No inverse Jacobian found. Keys=" + str(list(result.keys())))
+#         if i == 0:
+#             print("Raw JF shape:", to_numpy(jf_raw).shape)
+#             print("Raw JFINV shape:", to_numpy(jfinv_raw).shape)
+#         jf_map = aggregate_attr_array(jf_raw, n_neurons, LATENT_DIM, "JF")
+#         jfinv_map = aggregate_attr_array(jfinv_raw, n_neurons, LATENT_DIM, "JFINV")
+#         jf_maps.append(jf_map)
+#         jfinv_maps.append(jfinv_map)
+#         del method, result, inp, jf_raw, jfinv_raw
+#         if torch.cuda.is_available() and (i + 1) % 10 == 0:
+#             torch.cuda.empty_cache()
+#     jf = np.mean(np.stack(jf_maps), axis=0)
+#     jfinv = np.mean(np.stack(jfinv_maps), axis=0)
+#     print("Final JF shape:", jf.shape)
+#     print("Final JFINV shape:", jfinv.shape)
+#     return jf, jfinv
+
+
+def plot_jf(clean, adv, neuron_names):
+    vmax = max(np.max(clean), np.max(adv))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
+    for ax, mat, name in zip(axes, [clean, adv], ["CLEAN", "ADV"]):
+        im = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=0, vmax=vmax)
+        ax.set_title(f"{name} — Jacobian $|dz/dx|$")
+        ax.set_xlabel("Neuron")
+        ax.set_ylabel("Latent Dimension")
+        ax.set_xticks(np.arange(len(neuron_names)))
+        ax.set_xticklabels(neuron_names, rotation=90, fontsize=6)
+        ax.set_yticks(np.arange(LATENT_DIM))
+        ax.set_yticklabels([f"z{i}" for i in range(LATENT_DIM)])
+    fig.colorbar(im, ax=axes, label="Mean |dz / dx|")
+    path = os.path.join(OUT, "CLEAN_vs_ADV_JF.png")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved:", path)
+
+def plot_jfinv(clean, adv, neuron_names):
+    vmax = max(np.max(clean), np.max(adv))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 12), constrained_layout=True)
+    for ax, mat, name in zip(axes, [clean, adv], ["CLEAN", "ADV"]):
+        im = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=0, vmax=vmax)
+        ax.set_title(f"{name} — Inverse Jacobian $|dx/dz|$")
+        ax.set_xlabel("Latent Dimension")
+        ax.set_ylabel("Neuron")
+        ax.set_xticks(np.arange(LATENT_DIM))
+        ax.set_xticklabels([f"z{i}" for i in range(LATENT_DIM)])
+        ax.set_yticks(np.arange(len(neuron_names)))
+        ax.set_yticklabels(neuron_names, fontsize=7)
+    fig.colorbar(im, ax=axes, label="Mean |dx / dz|")
+    path = os.path.join(OUT, "CLEAN_vs_ADV_JFINV.png")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved:", path)
+
+
 
 def plot_comparison(clean_map, adv_map, title, filename, neuron_names):
     vmax = max(float(np.nanmax(clean_map)), float(np.nanmax(adv_map)))
@@ -328,14 +427,25 @@ def main():
     print("\nSaved:", result_path)
     print("\nRESULTS:")
     print(result_df.to_string(index=False))
-    plot_comparison(attrs["CLEAN"]["jf"], attrs["ADV"]["jf"],
-                    title="Forward Jacobian (JF)",
-                    filename="CLEAN_vs_ADV_JF.png",
-                    neuron_names=neuron_names)
-    plot_comparison(attrs["CLEAN"]["jfinv"], attrs["ADV"]["jfinv"],
-                    title="Inverse Jacobian (JFINV)",
-                    filename="CLEAN_vs_ADV_JFINV.png",
-                    neuron_names=neuron_names)
+    # plot_comparison(attrs["CLEAN"]["jf"], attrs["ADV"]["jf"],
+    #                 title="Forward Jacobian (JF)",
+    #                 filename="CLEAN_vs_ADV_JF.png",
+    #                 neuron_names=neuron_names)
+    # plot_comparison(attrs["CLEAN"]["jfinv"], attrs["ADV"]["jfinv"],
+    #                 title="Inverse Jacobian (JFINV)",
+    #                 filename="CLEAN_vs_ADV_JFINV.png",
+    #                 neuron_names=neuron_names)
+    plot_jf(
+        attrs["CLEAN"]["jf"],
+        attrs["ADV"]["jf"],
+        neuron_names
+    )
+    
+    plot_jfinv(
+        attrs["CLEAN"]["jfinv"],
+        attrs["ADV"]["jfinv"],
+        neuron_names
+    )
     print("\nDONE.")
     print("\nOnly these files were created:")
     print(os.path.join(OUT, "results.csv"))
