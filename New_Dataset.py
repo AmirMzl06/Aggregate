@@ -211,7 +211,7 @@ def get_train_attribution(model, train_trials, n_neurons):
             input_data=inp,
             output_dimension=LATENT_DIM
         )
-        result = method.compute_attribution_map(batch_size=ATTR_BATCH_SIZE)
+        result = method.compute_attribution_map(batch_size=16)
         jf_raw = result["jf"]
         if "jf-inv-svd" in result:
             jfinv_raw = result["jf-inv-svd"]
