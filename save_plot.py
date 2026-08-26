@@ -2,7 +2,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-RESULT_DIR = "RecogMemory_results"
+RESULT_DIR = "RRESULT"
 IMG_DIR = os.path.join(RESULT_DIR, "images")
 os.makedirs(IMG_DIR, exist_ok=True)
 MODELS = ["CLEAN", "ADV"]
