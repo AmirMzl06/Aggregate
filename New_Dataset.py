@@ -31,8 +31,8 @@ BLOCK = "NO"
 RECOG_EXPERIMENT_ID = 81
 EVENT_DIR = os.path.join(ROOT, "Data/events", SESSION, BLOCK)
 SPIKE_DIR = os.path.join(ROOT, "Data/sorted", SESSION, BLOCK)
-STIM_ORDER_FILE = os.path.join(ROOT, "Code/dataRelease/stimFiles/NewOldDelay_v3.mat")
-OUT = "RecogMemory_topk_results"
+RESPONSE_FILE = os.path.join(EVENT_DIR, "newold81.txt")
+OUT = "RecogMemory_topk_6class_results"
 os.makedirs(OUT, exist_ok=True)
 
 SEED = 42
@@ -42,12 +42,29 @@ BIN_MS = 50
 TEST_SIZE = 0.20
 BATCH_SIZE = 1024
 MAX_ITER = 4000
-LATENT_DIM = 8
+LATENT_DIM = 64
 DEVICE = "cuda_if_available"
 ADV_EPSILON = 0.05
 ADV_ALPHA = 0.01
 ADV_STEPS = 10
 ATTR_BATCH_SIZE = 16
+
+RESPONSE_TO_CLASS = {
+    31: 0,
+    32: 1,
+    33: 2,
+    34: 3,
+    35: 4,
+    36: 5,
+}
+CLASS_NAMES = {
+    0: "response_31",
+    1: "response_32",
+    2: "response_33",
+    3: "response_34",
+    4: "response_35",
+    5: "response_36",
+}
 
 def seed_all(seed):
     random.seed(seed)
@@ -79,6 +96,8 @@ def load_neurons():
     neuron_names = []
     for channel, cluster_id in units:
         spike_file = os.path.join(SPIKE_DIR, f"A{channel}_cells.mat")
+        if not os.path.exists(spike_file):
+            raise FileNotFoundError(spike_file)
         mat = loadmat(spike_file, squeeze_me=True)
         spikes = np.asarray(mat["spikes"])
         if spikes.ndim == 1:
@@ -86,7 +105,7 @@ def load_neurons():
         mask = np.isclose(spikes[:, 0], cluster_id)
         ts = spikes[mask, 2].astype(np.float64)
         if len(ts) == 0:
-            raise RuntimeError(f"No spikes for A{channel}, cluster {cluster_id}")
+            raise RuntimeError(f"No spikes for A{channel} cluster {cluster_id}")
         neurons.append(ts)
         neuron_names.append(f"A{channel}_C{cluster_id:g}")
     print("\n================ DATA ================")
@@ -95,23 +114,39 @@ def load_neurons():
     return neurons, neuron_names
 
 def load_recognition_onsets():
-    path = os.path.join(EVENT_DIR, "eventsRaw.mat")
-    mat = loadmat(path, squeeze_me=True)
+    mat = loadmat(os.path.join(EVENT_DIR, "eventsRaw.mat"), squeeze_me=True)
     events = np.asarray(mat["events"])
     mask = (events[:, 2] == RECOG_EXPERIMENT_ID) & (events[:, 1] == 1)
     stim = events[mask, 0].astype(np.float64)
     print("Recognition stimuli:", len(stim))
     return stim
 
-def load_ground_truth_labels():
-    mat = loadmat(STIM_ORDER_FILE, squeeze_me=True, struct_as_record=False)
-    exp = np.asarray(mat["experimentStimuli"], dtype=object).reshape(-1)
-    recognition = exp[1]
-    labels = np.asarray(recognition.newOldRecog).astype(int).reshape(-1)
-    if not np.all(np.isin(labels, [0, 1])):
-        raise RuntimeError(f"Unexpected labels: {np.unique(labels)}")
-    print("Ground truth:", np.unique(labels, return_counts=True))
-    return labels
+def load_six_class_labels():
+    labels = []
+    raw_codes = []
+    with open(RESPONSE_FILE, "r") as f:
+        for line in f:
+            parts = line.strip().split(";")
+            if len(parts) < 2:
+                continue
+            try:
+                code = int(parts[1])
+            except ValueError:
+                continue
+            if code in RESPONSE_TO_CLASS:
+                raw_codes.append(code)
+                labels.append(RESPONSE_TO_CLASS[code])
+    labels = np.asarray(labels, dtype=np.int64)
+    raw_codes = np.asarray(raw_codes, dtype=np.int64)
+    values, counts = np.unique(labels, return_counts=True)
+    print("\n6-class confidence labels:")
+    for value, count in zip(values, counts):
+        print(f"  class {value} (event {value + 31}) : {count}")
+    if len(values) != 6:
+        raise RuntimeError(f"Expected all 6 response classes, found {values.tolist()}")
+    if np.min(counts) < 2:
+        raise RuntimeError("At least one confidence class has fewer than 2 trials. Cannot perform a reliable stratified split.")
+    return labels, raw_codes
 
 def make_trial_tensor(neurons, stimulus_times):
     edges_ms = np.arange(WINDOW_START_MS, WINDOW_END_MS + BIN_MS, BIN_MS, dtype=np.float64)
@@ -134,7 +169,7 @@ def normalize_using_train(X, idx_train):
     X_norm = (X - mu.reshape(1, 1, -1)) / sd.reshape(1, 1, -1)
     return X_norm.astype(np.float32)
 
-def build_model(adv, n_neurons):
+def build_model(adv):
     return CEBRA(
         batch_size=BATCH_SIZE,
         temperature=0.4,
@@ -159,16 +194,18 @@ def get_trial_embeddings(model, trials):
         z = np.asarray(z)
         if z.ndim != 2:
             z = z.reshape(z.shape[0], -1)
-        trial_embedding = z.mean(axis=0)
-        embeddings.append(trial_embedding)
+        z_trial = z.mean(axis=0)
+        embeddings.append(z_trial)
     return np.stack(embeddings, axis=0)
 
 def evaluate_decoder(model, train_trials, test_trials, train_y, test_y):
     z_train = get_trial_embeddings(model, train_trials)
     z_test = get_trial_embeddings(model, test_trials)
+    print("Decoder train embedding:", z_train.shape)
+    print("Decoder test embedding:", z_test.shape)
     decoder = Pipeline([
         ("scaler", StandardScaler()),
-        ("logreg", LogisticRegression(max_iter=2000, solver="liblinear", random_state=SEED))
+        ("logreg", LogisticRegression(max_iter=5000, solver="lbfgs", random_state=SEED))
     ])
     decoder.fit(z_train, train_y)
     prediction = decoder.predict(z_test)
@@ -185,7 +222,7 @@ def get_train_attribution(model, train_trials, n_neurons):
     net.eval()
     jf_maps = []
     jfinv_maps = []
-    print("\nAttribution on ALL TRAIN trials:", len(train_trials))
+    print("\nComputing attribution on ALL TRAIN trials:", len(train_trials))
     for i, trial in enumerate(train_trials):
         inp = torch.tensor(trial, dtype=torch.float32, device=next(net.parameters()).device)
         inp.requires_grad_(True)
@@ -202,7 +239,7 @@ def get_train_attribution(model, train_trials, n_neurons):
         elif "jf-inv" in result:
             jfinv_raw = to_numpy(result["jf-inv"])
         else:
-            raise RuntimeError("Inverse Jacobian missing. Keys=" + str(list(result.keys())))
+            raise RuntimeError("No inverse Jacobian. Keys=" + str(list(result.keys())))
         if i == 0:
             print("RAW JF:", jf_raw.shape)
             print("RAW JFINV:", jfinv_raw.shape)
@@ -211,13 +248,13 @@ def get_train_attribution(model, train_trials, n_neurons):
         if jf_map.shape == (n_neurons, LATENT_DIM):
             jf_map = jf_map.T
         if jf_map.shape != (LATENT_DIM, n_neurons):
-            raise RuntimeError(f"JF shape {jf_map.shape}, expected ({LATENT_DIM},{n_neurons})")
+            raise RuntimeError(f"JF shape = {jf_map.shape}; expected ({LATENT_DIM},{n_neurons})")
         jfinv_map = np.mean(np.abs(jfinv_raw), axis=0)
         jfinv_map = np.squeeze(jfinv_map)
         if jfinv_map.shape == (LATENT_DIM, n_neurons):
             jfinv_map = jfinv_map.T
         if jfinv_map.shape != (n_neurons, LATENT_DIM):
-            raise RuntimeError(f"JFINV shape {jfinv_map.shape}, expected ({n_neurons},{LATENT_DIM})")
+            raise RuntimeError(f"JFINV shape = {jfinv_map.shape}; expected ({n_neurons},{LATENT_DIM})")
         jf_maps.append(jf_map)
         jfinv_maps.append(jfinv_map)
         del method, result, inp, jf_raw, jfinv_raw
@@ -241,7 +278,7 @@ def select_topk(scores, k):
     return np.argsort(scores)[::-1][:k]
 
 def plot_jf(clean, adv, neuron_names):
-    vmax = max(np.max(clean), np.max(adv))
+    vmax = max(float(np.max(clean)), float(np.max(adv)))
     fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
     for ax, mat, name in zip(axes, [clean, adv], ["CLEAN", "ADV"]):
         im = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=0, vmax=vmax)
@@ -257,7 +294,7 @@ def plot_jf(clean, adv, neuron_names):
     plt.close(fig)
 
 def plot_jfinv(clean, adv, neuron_names):
-    vmax = max(np.max(clean), np.max(adv))
+    vmax = max(float(np.max(clean)), float(np.max(adv)))
     fig, axes = plt.subplots(1, 2, figsize=(10, 12), constrained_layout=True)
     for ax, mat, name in zip(axes, [clean, adv], ["CLEAN", "ADV"]):
         im = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=0, vmax=vmax)
@@ -275,7 +312,7 @@ def plot_jfinv(clean, adv, neuron_names):
 def train_and_evaluate(train_trials, test_trials, train_y, test_y, adv):
     n_neurons = train_trials.shape[-1]
     train_flat = train_trials.reshape(-1, n_neurons)
-    model = build_model(adv=adv, n_neurons=n_neurons)
+    model = build_model(adv)
     model.fit(train_flat.astype(np.float32))
     accuracy = evaluate_decoder(model, train_trials, test_trials, train_y, test_y)
     return model, accuracy
@@ -284,23 +321,29 @@ def main():
     seed_all(SEED)
     neurons, neuron_names = load_neurons()
     stim = load_recognition_onsets()
-    labels = load_ground_truth_labels()
+    labels, raw_codes = load_six_class_labels()
     if len(stim) != len(labels):
-        raise RuntimeError(f"{len(stim)} stimuli vs {len(labels)} labels")
+        raise RuntimeError(f"Stimulus/response mismatch: {len(stim)} stimuli vs {len(labels)} responses")
     X = make_trial_tensor(neurons, stim)
     n_trials, time_bins, n_neurons = X.shape
     print("\nTrial tensor:", X.shape)
     indices = np.arange(n_trials)
     idx_train, idx_test = train_test_split(indices, test_size=TEST_SIZE, random_state=SEED, stratify=labels)
-    print("Train:", len(idx_train))
-    print("Test:", len(idx_test))
-    print("Train labels:", np.unique(labels[idx_train], return_counts=True))
-    print("Test labels:", np.unique(labels[idx_test], return_counts=True))
+    train_y = labels[idx_train]
+    test_y = labels[idx_test]
+    print("\nTrain trials:", len(idx_train))
+    print("Test trials:", len(idx_test))
+    print("Train classes:", np.unique(train_y, return_counts=True))
+    print("Test classes:", np.unique(test_y, return_counts=True))
+    n_classes = 6
+    uniform_chance = 1.0 / n_classes
+    test_counts = np.bincount(test_y, minlength=n_classes)
+    majority_baseline = test_counts.max() / len(test_y)
+    print("\nUniform 6-class chance:", f"{uniform_chance:.4f}")
+    print("Test majority baseline:", f"{majority_baseline:.4f}")
     X = normalize_using_train(X, idx_train)
     train_trials = X[idx_train]
     test_trials = X[idx_test]
-    train_y = labels[idx_train]
-    test_y = labels[idx_test]
 
     results = []
     full_attrs = {}
@@ -311,7 +354,7 @@ def main():
         print(f"FULL MODEL: {model_name}")
         print("=" * 70)
         model, accuracy = train_and_evaluate(train_trials, test_trials, train_y, test_y, adv)
-        print(f"\nFULL {model_name} ACCURACY = {accuracy:.4f}")
+        print(f"\nFULL {model_name} 6-CLASS ACCURACY = {accuracy:.4f}")
         jf, jfinv = get_train_attribution(model, train_trials, n_neurons)
         full_attrs[model_name] = {"jf": jf, "jfinv": jfinv}
         results.append({
@@ -320,6 +363,9 @@ def main():
             "selector_attribution": "NONE",
             "trained_model": model_name,
             "accuracy": accuracy,
+            "uniform_chance": uniform_chance,
+            "majority_baseline": majority_baseline,
+            "n_classes": n_classes,
             "n_neurons": n_neurons,
             "selected_indices": "ALL",
             "selected_neurons": "ALL"
@@ -331,9 +377,9 @@ def main():
     plot_jfinv(full_attrs["CLEAN"]["jfinv"], full_attrs["ADV"]["jfinv"], neuron_names)
 
     K = int(np.sqrt(n_neurons))
-    K = max(1, K)
+    K = max(K, 1)
     print("\n" + "=" * 70)
-    print(f"TOP-K SELECTION: N={n_neurons}, K={K}")
+    print(f"TOP-K: N={n_neurons}, K={K}")
     print("=" * 70)
 
     clean_jf_scores = get_jf_scores(full_attrs["CLEAN"]["jf"])
@@ -362,12 +408,12 @@ def main():
     for selector_name, info in selectors.items():
         selected_indices = info["indices"]
         selected_names = [neuron_names[i] for i in selected_indices]
-        reduced_train_trials = train_trials[:, :, selected_indices]
-        reduced_test_trials = test_trials[:, :, selected_indices]
+        reduced_train = train_trials[:, :, selected_indices]
+        reduced_test = test_trials[:, :, selected_indices]
         print("\n" + "#" * 70)
         print(f"REDUCED DATASET: {selector_name}")
-        print(f"Selected {len(selected_indices)} of {n_neurons} neurons")
-        print("Selected neurons:", selected_names)
+        print(f"{len(selected_indices)} of {n_neurons} neurons")
+        print(selected_names)
         print("#" * 70)
         for adv in [False, True]:
             seed_all(SEED)
@@ -375,20 +421,17 @@ def main():
             print("\n" + "-" * 60)
             print(f"{selector_name} --> {trained_model_name}")
             print("-" * 60)
-            model, accuracy = train_and_evaluate(
-                reduced_train_trials,
-                reduced_test_trials,
-                train_y,
-                test_y,
-                adv
-            )
-            print(f"\n{selector_name} --> {trained_model_name} ACCURACY = {accuracy:.4f}")
+            model, accuracy = train_and_evaluate(reduced_train, reduced_test, train_y, test_y, adv)
+            print(f"\n{selector_name} --> {trained_model_name} 6-CLASS ACCURACY = {accuracy:.4f}")
             results.append({
                 "setting": "TOPK",
                 "selector_model": info["model"],
                 "selector_attribution": info["attr"],
                 "trained_model": trained_model_name,
                 "accuracy": accuracy,
+                "uniform_chance": uniform_chance,
+                "majority_baseline": majority_baseline,
+                "n_classes": n_classes,
                 "n_neurons": len(selected_indices),
                 "selected_indices": ",".join(map(str, selected_indices.tolist())),
                 "selected_neurons": ",".join(selected_names)
@@ -397,14 +440,16 @@ def main():
             cleanup()
 
     result_df = pd.DataFrame(results)
-    result_df = result_df[["setting", "selector_model", "selector_attribution", "trained_model", "accuracy", "n_neurons", "selected_indices", "selected_neurons"]]
+    result_df = result_df[["setting", "selector_model", "selector_attribution", "trained_model", "accuracy", "uniform_chance", "majority_baseline", "n_classes", "n_neurons", "selected_indices", "selected_neurons"]]
     result_path = os.path.join(OUT, "results.csv")
     result_df.to_csv(result_path, index=False)
 
-    print("\n" + "=" * 90)
-    print("FINAL RESULTS")
-    print("=" * 90)
+    print("\n" + "=" * 100)
+    print("FINAL 6-CLASS TOP-K RESULTS")
+    print("=" * 100)
     print(result_df[["setting", "selector_model", "selector_attribution", "trained_model", "accuracy", "n_neurons"]].to_string(index=False))
+    print("\nUniform chance:", f"{uniform_chance:.4f}")
+    print("Majority baseline:", f"{majority_baseline:.4f}")
     print("\nSaved:", result_path)
     print("Saved:", os.path.join(OUT, "CLEAN_vs_ADV_JF.png"))
     print("Saved:", os.path.join(OUT, "CLEAN_vs_ADV_JFINV.png"))
@@ -412,6 +457,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 ### Normal Decoder
 # import os
 # import sys
