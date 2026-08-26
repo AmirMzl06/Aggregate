@@ -1,1137 +1,1136 @@
-import os
-import gc
-import sys
-import json
-import random
-import importlib
-from pathlib import Path
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# ==============================================================================
+#  Fig-5-style synthetic attribution benchmark
+#
+#  Reproduces the data-generating process of
+#    Schneider, Gonzalez Laiz, Filippova, Frey, Mathis,
+#    "Time-series attribution maps with regularized contrastive learning",
+#    AISTATS 2025, arXiv:2502.12977 -- Figure 5 / Appendix B.1
+#  and asks whether PGD adversarial training acts as an IMPLICIT substitute
+#  for the paper's explicit Jacobian-Frobenius regularizer.
+#
+#  ARMS (6):
+#    cebra       1 clean update / iter                    lambda = 0
+#    cebra_2x    2 clean updates / iter (SAME batch)      lambda = 0   <- control
+#    xcebra      1 clean update / iter                    lambda = 0.1
+#    xcebra_2x   2 clean updates / iter (SAME batch)      lambda = 0.1 <- control
+#    acorn       clean update THEN adversarial update     lambda = 0
+#    acorn_xreg  clean update THEN adversarial update     lambda = 0.1
+#
+#  WHY THE *_2x CONTROLS EXIST.
+#    cebra/solver/base.py::Solver.step runs `self.optimizer.step()`
+#    unconditionally, and the adversarial branch then runs a SECOND
+#    `self.optimizer.step()` on the same batch.  That is the algorithm as
+#    written -- not a bug to be silently removed -- but it means the
+#    adversarial arm receives 2x the parameter updates.  Removing the double
+#    update would no longer measure the method; keeping it silently would
+#    confound "adversarial" with "twice the optimisation".  So the double
+#    update is kept EXACTLY as in the fork, and a clean arm with the same
+#    doubled update count is added.  The pre-registered primary comparison is
+#    acorn vs cebra_2x (compute matched); acorn vs cebra is reported as the
+#    "as-published" secondary.
+#
+#  WHAT IS TAKEN FROM THE FORK (unmodified):
+#    cebra.models.init(...)      -- the encoder architectures
+#    cebra.models.criterions.*   -- InfoNCE with learnable temperature
+#    cebra.attribution.init(...) -- the "neuron gradient" Jacobian J_f
+#
+#  WHAT IS IMPLEMENTED HERE:
+#    * lambda * ||J_f(x)||_F^2   -- paper Eq. 10/15, Hoffman et al. (2019)
+#                                   random-projection estimator (+ exact mode
+#                                   + an unbiasedness self-test)
+#    * lambda schedule           -- 0 for 2500 steps, linear ramp over the next
+#                                   2500, constant to 20000
+#    * PGD-linf and PGD-l2       -- LITERAL transcription of Solver.step,
+#                                   including _l2_normalize / _rand_radius_like
+#                                   / _proj_l2_ball, the uniform eps-cube init,
+#                                   the per-inner-step re-encoding of
+#                                   positive/negative, the raw (non-Madry)
+#                                   alpha, and the ABSENCE of any clamp to the
+#                                   valid data range
+#    * the alignment metric + its proof-carrying validation test
+#
+#  METRIC (and why it is the only one with a valid ground truth):
+#    `gt` is the support of the GENERATOR Jacobian dx/dz, which is unique.
+#    dz/dx is NOT unique for an over-determined system (50 neurons, d
+#    latents): the encoder may legitimately use x1 to cancel z1's contribution
+#    to x2, so a nonzero dz2/dx1 is compatible with a perfect encoder.
+#    Forward-direction scores therefore have no well-defined target.
+#
+#    Let  Q = pinv(J_f) in R^{CxO}  (the paper's "inverted neuron gradient")
+#    and  A in R^{OxD}  the linear map f ~ A z fitted on a held-out segment.
+#    Score  R = Q A in R^{CxD}  estimates dx_i/dz_d, and is EXACTLY invariant
+#    to the linear indeterminacy of contrastive learning: if f' = M f then
+#    Q' = Q M^{-1} and A' = M A, so R' = Q M^{-1} M A = R.
+#    validate_alignment_metric() checks this end-to-end on a known-perfect
+#    analytic encoder and aborts the run if auROC < SURROGATE_AUROC_MIN.
+# ==============================================================================
+
+from __future__ import annotations
+
+import math
+import time
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import pandas as pd
+
+# ------------------------------------------------------------------------------
+# 1. CONFIG
+# ------------------------------------------------------------------------------
+
+DRY_RUN = True                # <<< set False for the real run
+EXPERIMENT_SCALE = "pilot"    # "dry" | "pilot" | "paper_final" | "paper_table1"
+
+# --- architecture -------------------------------------------------------------
+# "euclidean_linear": offset1-model-mse (normalize=False) + Euclidean InfoNCE.
+#     Theory-matched: Brownian positives are conditionally Gaussian, so the
+#     Euclidean similarity is the identifiable choice (Zimmermann et al. 2021),
+#     and the paper's encoder likewise ends in a linear / scaled-tanh head, not
+#     an L2 normalisation.  J_f is full rank -> no pinv rank truncation.
+# "cosine_sphere":    offset1-model (normalize=True) + cosine InfoNCE.
+#     Reproduces the production ACORN setting.  J_f = (1/|u|)(I - f f^T) A has
+#     rank <= OUTPUT_DIM - 1, so OUTPUT_DIM must exceed d and one singular
+#     value must be truncated.  Report as an ablation.
+ARCH_VARIANT = "euclidean_linear"
+
+_ARCH = {
+    "euclidean_linear": dict(model="offset1-model-mse", normalize=False,
+                             criterion="euclidean", out_extra=0, pinv_drop=0),
+    "cosine_sphere":    dict(model="offset1-model",     normalize=True,
+                             criterion="cosine",        out_extra=1, pinv_drop=1),
+}[ARCH_VARIANT]
+
+MODEL_NAME = _ARCH["model"]
+CRITERION  = _ARCH["criterion"]
+OUT_EXTRA  = _ARCH["out_extra"]     # OUTPUT_DIM = d + OUT_EXTRA
+PINV_DROP  = _ARCH["pinv_drop"]     # singular values discarded in the pinv
+NUM_UNITS  = 128
+
+# --- data generating process (Figure 5 / Appendix B.1) ------------------------
+# "We sample 10 different datasets with 100,000 samples, each with a different
+#  mixing function g.  All latents [...] lie within the box [-1,1]^D.  We
+#  sample z1 from a uniform distribution over [-1,1]^D.  The following time
+#  steps are generated by Brownian motion, z_t = N_[-1,1](z_{t-1}, sigma^2 I)
+#  where N_[-1,1] is a truncated normal distribution clipped to the bounds."
+D_LATENT_LIST   = [6]        # Table 1 averages over d = 4..9
+N1, N2          = 25, 25     # "g1 [...] outputs 25 neurons [...] g2 [...] 25"
+D_OBS           = N1 + N2    # -> x is (T, 50)
+BROWNIAN_SIGMA  = 0.10
+TARGET_PRE_SD   = 0.80       # keeps tanh off its saturated tails
+SIGMA_OBS_SWEEP = [0.00]     # paper adds no observation noise
+TIME_OFFSET     = 1
+
+# Left OFF by default: tanh output already lives in [-1,1] with roughly zero
+# mean, so ADV_EPSILON below is in exactly the same units as the advisor's runs
+# on raw data.  Turning it on rescales the eps-ball and breaks that comparison.
+STANDARDIZE = False
+
+# --- optimisation (Appendix B.1) ---------------------------------------------
+# "We train on batches with 5,000 samples each.  The first 2,500 training steps
+#  minimize the InfoNCE or supervised loss with lambda = 0; we then ramp up
+#  lambda to its maximum value over the following 2,500 steps, and continue to
+#  train until 20,000 total steps."
+LEARNING_RATE    = 3e-4
+MIN_TEMPERATURE  = 0.05
+INIT_TEMPERATURE = 1.0
+
+# --- the regularizer (paper Eq. 10 / 15) -------------------------------------
+LAMBDA_MAX     = 0.10      # "Regularization: Off (lambda = 0), On (lambda = 0.1)"
+JREG_ESTIMATOR = "proj"    # "proj" (Hoffman et al. 2019) | "exact"
+JREG_NPROJ     = 1         # Hoffman et al. recommend 1
+JREG_SUBBATCH  = 512       # unbiased sub-sample of the batch for the penalty
+JREG_AT        = "clean"   # "clean" | "adv" -- "clean" keeps the penalty
+                           # identical across rows of the design
+JREG_ON        = "both"    # "both" | "clean_only" | "adv_only": which of the
+                           # two updates in a doubled scheme carries the penalty
+
+# --- PGD: LITERAL transcription of cebra/solver/base.py::Solver.step ---------
+ATTACK_NORM     = "linf"   # "linf" | "l2"  (solver's `attack_norm`)
+ADV_EPSILON     = 0.05     # solver default `adv_epsilon`
+ADV_ALPHA_RULE  = "fork"   # "fork" -> ADV_ALPHA_RAW (the solver default)
+                           # "madry" -> 2.5*eps/steps  (ablation only)
+ADV_ALPHA_RAW   = 0.01     # solver default `adv_alpha`
+ADV_STEPS       = 10       # solver default `adv_steps`
+ADV_CLIP_RANGE  = False    # the fork does NOT clamp to a valid data range;
+                           # only the eps-ball projection is applied
+ADV_CACHE_POS_NEG = False  # False = re-encode positive/negative at every inner
+                           # step, exactly as _inference does.  True is
+                           # mathematically identical (parameters are frozen
+                           # during the attack) and ~2x faster.
+ADV_EPSILON_SWEEP = [0.05]         # e.g. [0.025, 0.05, 0.10, 0.20]
+
+# --- attribution -------------------------------------------------------------
+# The library supplies J_f ("neuron gradient").  The pseudo-inverse is taken
+# here so the rank truncation is under our control -- with
+# ARCH_VARIANT="cosine_sphere" an untruncated pinv amplifies the structurally
+# null direction and destroys the map.  A library-provided jf-inv, if present,
+# is cross-checked and reported but not used for the primary number.
+ATTR_METHOD_CANDIDATES = ["jacobian-based-batched", "jacobian-based",
+                          "neuron-gradient"]
+ATTR_NUM_BATCHES = 32
+
+# --- quality gates -----------------------------------------------------------
+# "We compute the R2 for predicting the auxiliary variable c from the feature
+#  space after a linear regression, and ensure that this metric is close to
+#  100% for both our baseline and contrastive learning models to remove
+#  performance as a potential confounder."
+R2_MIN              = 0.95     # per-arm floor on mean R2(z <- f)
+R2_PARITY_MAX       = 0.05     # max spread of R2 across arms within a seed
+SURROGATE_AUROC_MIN = 0.995
+JREG_SELFTEST_RTOL  = 0.15
+
+# --- arms --------------------------------------------------------------------
+# scheme: "clean_single" | "clean_double" | "fork_double" | "adv_single"
+ALL_ARMS = {
+    "cebra":       dict(scheme="clean_single", lam=0.0),
+    "cebra_2x":    dict(scheme="clean_double", lam=0.0),
+    "xcebra":      dict(scheme="clean_single", lam=LAMBDA_MAX),
+    "xcebra_2x":   dict(scheme="clean_double", lam=LAMBDA_MAX),
+    "acorn":       dict(scheme="fork_double",  lam=0.0),
+    "acorn_xreg":  dict(scheme="fork_double",  lam=LAMBDA_MAX),
+    # ablation: the adversarial update WITHOUT the preceding clean update
+    "acorn_1x":    dict(scheme="adv_single",   lam=0.0),
+}
+ARM_SUBSET = ["cebra", "cebra_2x", "xcebra", "xcebra_2x", "acorn", "acorn_xreg"]
+ARMS = {k: ALL_ARMS[k] for k in ARM_SUBSET}
+
+# --- reporting ---------------------------------------------------------------
+PRIMARY_METRIC     = "auroc_global"
+PRIMARY_COMPARISON = ("acorn", "cebra_2x")      # compute-matched
+SECONDARY_COMPARISONS = [("acorn", "cebra"),          # the as-published claim
+                         ("cebra_2x", "cebra"),       # size of the confound
+                         ("xcebra", "cebra"),         # the paper's own claim
+                         ("acorn", "xcebra_2x"),
+                         ("acorn_xreg", "acorn")]
+N_BOOTSTRAP = 1000     # "95% CI obtained through bootstrapping (n=1,000)"
+RESULT_CSV  = "attribution_benchmark_results.csv"
+SEED0       = 1234
+
+# --- scale presets -----------------------------------------------------------
+_SCALES = {
+    "dry":         dict(n_seeds=2,  T=8_000,   iters=300,    batch=256,
+                        map_pts=1500, attr_pts=1500, d_list=[6]),
+    "pilot":       dict(n_seeds=3,  T=40_000,  iters=4_000,  batch=1024,
+                        map_pts=4000, attr_pts=4000, d_list=[6]),
+    "paper_final": dict(n_seeds=10, T=100_000, iters=20_000, batch=5_000,
+                        map_pts=8000, attr_pts=8000, d_list=[6]),
+    "paper_table1":dict(n_seeds=10, T=100_000, iters=20_000, batch=5_000,
+                        map_pts=8000, attr_pts=8000, d_list=[4, 5, 6, 7, 8, 9]),
+}
+if DRY_RUN:
+    EXPERIMENT_SCALE = "dry"
+_S = _SCALES[EXPERIMENT_SCALE]
+N_SEEDS, T_SAMPLES, MAX_ITER = _S["n_seeds"], _S["T"], _S["iters"]
+BATCH_SIZE, MAP_POINTS, ATTR_POINTS = _S["batch"], _S["map_pts"], _S["attr_pts"]
+if EXPERIMENT_SCALE == "paper_table1":
+    D_LATENT_LIST = _S["d_list"]
+
+# the lambda schedule keeps the paper's 2500/2500-of-20000 shape at any length
+LAMBDA_WARMUP = max(1, int(round(MAX_ITER * 2500 / 20000)))
+LAMBDA_RAMP   = max(1, int(round(MAX_ITER * 2500 / 20000)))
+
+# ------------------------------------------------------------------------------
+# 2. ENVIRONMENT
+# ------------------------------------------------------------------------------
+
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
 
-from sklearn.metrics import roc_auc_score, average_precision_score
-from sklearn.linear_model import LinearRegression
+try:
+    from scipy import stats as _sps
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+    warnings.warn("scipy missing: Wilcoxon replaced by a sign test.")
 
-from utils.constants import CEBRA_DIR
-
-
-# # ============================================================
-# # 0) Import ONLY the custom CEBRA fork
-# # ============================================================
-# for name in list(sys.modules):
-#     if name == "cebra" or name.startswith("cebra."):
-#         del sys.modules[name]
-
-sys.path.insert(0, str(CEBRA_DIR))
-# importlib.invalidate_caches()
-
-import cebra
-from cebra import CEBRA
-
-print("Using CEBRA from:", cebra.__file__)
-print("CEBRA version:", getattr(cebra, "__version__", "unknown"))
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ============================================================
-# 1) Experiment mode
-# ============================================================
-# "stability":
-#   - one fixed data-generating process
-#   - many CEBRA training seeds
-#   - isolates optimization/training variance
-#
-# "paper_final":
-#   - 10 different synthetic datasets / mixing functions
-#   - one fixed training seed per dataset
-#   - mirrors the paper's idea of averaging over 10 different datasets
-#
-EXPERIMENT_MODE = "stability"
-
-STABILITY_DATA_SEED = 2025
-STABILITY_TRAIN_SEEDS = [38, 226, 1, 36, 989, 26, 84, 66, 27, 81, 49]
-
-FINAL_DATA_SEEDS = [101, 202, 303, 404, 505, 606, 707, 808, 909, 1010]
-FINAL_TRAIN_SEEDS = [38]
-
-if EXPERIMENT_MODE == "stability":
-    DATA_SEEDS = [STABILITY_DATA_SEED]
-    TRAIN_SEEDS = STABILITY_TRAIN_SEEDS
-elif EXPERIMENT_MODE == "paper_final":
-    DATA_SEEDS = FINAL_DATA_SEEDS
-    TRAIN_SEEDS = FINAL_TRAIN_SEEDS
-else:
-    raise ValueError("EXPERIMENT_MODE must be 'stability' or 'paper_final'.")
-
-
-# ============================================================
-# 2) Global config
-# ============================================================
-T = 100_000
-
-D1 = 3
-D2 = 3
-
-N1 = 25
-N2 = 25
-
-D_LATENT = D1 + D2
-D_OBS = N1 + N2
-OUTPUT_DIM = D_LATENT
-
-# Brownian motion
-BROWNIAN_SIGMA = 0.03
-
-# Injective mixing
-# g(z) = tanh(gain * W z), with W full-column-rank.
-# This is injective because W is injective and tanh is strictly monotone.
-MIX_GAIN = 1.5
-MIN_ABS_MIX_WEIGHT = 0.004
-
-# Train/test
-TRAIN_FRAC = 0.80
-
-# Paper reports batch size 5000 and 20k training steps.
-BATCH_SIZE = 5000
-MAX_ITER = 20_000
-
-# Keep your known-working architecture.
-# If your fork also has a no-dropout equivalent and you later want a
-# strict architecture ablation, test it separately; do not mix it into
-# the main benchmark without reporting it.
-MODEL_ARCHITECTURE = "offset36-model-more-dropout"
-TIME_OFFSETS = 4
-TEMPERATURE = 0.4
-NUM_HIDDEN_UNITS = 64
-
-# PGD: use the scale already defined as sensible defaults in your base.py.
-# Inputs are standardized before training, so epsilon has a consistent meaning.
-ADV_EPSILON = 0.05
-ADV_ALPHA = 0.01
-ADV_STEPS = 10
-ATTACK_NORM = "linf"
-
-# Attribution: use a CONTIGUOUS held-out segment.
-ATTR_POINTS = 10_000
-ATTR_MARGIN = 128
-ATTR_BATCH_SIZE = 128
-
-# Linear latent recovery sanity-check
-R2_TRAIN_POINTS = 20_000
-R2_TEST_POINTS = 10_000
-
-# Output
-ROOT_DIR = Path("Fake_dataset_stable")
-OUT_DIR = ROOT_DIR / "outputs"
-IMG_DIR = ROOT_DIR / "images"
-DATA_DIR = ROOT_DIR / "datasets"
-
-for p in [ROOT_DIR, OUT_DIR, IMG_DIR, DATA_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-DATASET_CFG = {
-    "name": "FIG5_INJECTIVE",
-    "T": T,
-    "D1": D1,
-    "D2": D2,
-    "N1": N1,
-    "N2": N2,
-    "sigma": BROWNIAN_SIGMA,
-    "mix_gain": MIX_GAIN,
-}
-
-
-# ============================================================
-# 3) Reproducibility
-# ============================================================
-def set_all_seeds(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    # Good for a reproducibility-focused synthetic benchmark.
+def _load_cebra():
     try:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    except Exception:
-        pass
+        import cebra
+        import cebra.models
+        import cebra.models.criterions as _crit
+    except Exception as exc:
+        raise SystemExit("cannot import cebra -- run from an environment where "
+                         f"your fork is on sys.path.  error: {exc}")
+    return cebra, _crit
 
 
-# ============================================================
-# 4) Brownian latent process
-# ============================================================
-def brownian_motion_box(
-    n_samples: int,
-    dim: int,
-    sigma: float,
-    seed: int,
-) -> np.ndarray:
-    """
-    Brownian motion constrained to [-1, 1]^dim.
+CEBRA, CRIT = _load_cebra()
 
-    z_0 ~ Uniform([-1,1]^dim)
-    z_t ~ truncated Normal(z_{t-1}, sigma^2 I)
 
-    Rejection sampling is used so accepted steps are inside the box.
-    """
-    rng = np.random.default_rng(seed)
+def _banner():
+    print("=" * 78)
+    print(f" scale={EXPERIMENT_SCALE}  arch={ARCH_VARIANT}  model={MODEL_NAME}")
+    print(f" seeds={N_SEEDS}  T={T_SAMPLES}  iters={MAX_ITER}  batch={BATCH_SIZE}")
+    print(f" d_list={D_LATENT_LIST}  device={DEVICE}  standardize={STANDARDIZE}")
+    print(f" lambda_max={LAMBDA_MAX} (warmup {LAMBDA_WARMUP} / ramp {LAMBDA_RAMP})"
+          f"  jreg={JREG_ESTIMATOR}/{JREG_NPROJ} sub={JREG_SUBBATCH}"
+          f" at={JREG_AT} on={JREG_ON}")
+    print(f" attack={ATTACK_NORM} eps={ADV_EPSILON} alpha={adv_alpha():.4g}"
+          f" ({ADV_ALPHA_RULE}) steps={ADV_STEPS} clip={ADV_CLIP_RANGE}"
+          f" cache_pos_neg={ADV_CACHE_POS_NEG}")
+    print(f" arms={list(ARMS)}")
+    print(f" PRIMARY: {PRIMARY_COMPARISON[0]} vs {PRIMARY_COMPARISON[1]}"
+          f"  on {PRIMARY_METRIC}")
+    print(f" total model fits = "
+          f"{N_SEEDS * len(D_LATENT_LIST) * len(ARMS) * len(SIGMA_OBS_SWEEP)}")
+    print("=" * 78)
 
-    z = np.empty((n_samples, dim), dtype=np.float32)
-    z[0] = rng.uniform(-1.0, 1.0, size=dim).astype(np.float32)
 
-    for t in range(1, n_samples):
-        prev = z[t - 1]
+# ------------------------------------------------------------------------------
+# 3. DATA GENERATING PROCESS
+# ------------------------------------------------------------------------------
 
-        nxt = prev + rng.normal(
-            loc=0.0,
-            scale=sigma,
-            size=dim,
-        ).astype(np.float32)
+def brownian_motion_box(T: int, d: int, sigma: float, rng) -> np.ndarray:
+    """z_1 ~ U[-1,1]^d ; z_t ~ N_[-1,1](z_{t-1}, sigma^2 I), TRUNCATED (clipped).
 
-        bad = (nxt < -1.0) | (nxt > 1.0)
-
-        while np.any(bad):
-            nxt[bad] = (
-                prev[bad]
-                + rng.normal(
-                    loc=0.0,
-                    scale=sigma,
-                    size=int(bad.sum()),
-                ).astype(np.float32)
-            )
-            bad = (nxt < -1.0) | (nxt > 1.0)
-
-        z[t] = nxt
-
+    The paper clips to the box rather than reflecting off it; clipping leaves a
+    little probability mass on the faces of the cube, reflecting does not."""
+    z = np.empty((T, d), dtype=np.float64)
+    z[0] = rng.uniform(-1.0, 1.0, size=d)
+    for t in range(1, T):
+        z[t] = np.clip(z[t - 1] + sigma * rng.normal(size=d), -1.0, 1.0)
     return z
 
 
-# ============================================================
-# 5) Guaranteed injective mixing functions
-# ============================================================
-def make_dense_orthogonal_matrix(
-    out_dim: int,
-    in_dim: int,
-    seed: int,
-    min_abs_weight: float = 0.004,
-    max_tries: int = 20_000,
-) -> torch.Tensor:
-    """
-    Create W in R^{out_dim x in_dim} with:
-      - orthonormal columns -> rank(W) = in_dim and condition number = 1
-      - dense entries, avoiding near-zero direct connections
+def orthonormal_columns(rows: int, cols: int, rng) -> np.ndarray:
+    """Dense [rows, cols] with orthonormal columns (reduced QR).
 
-    Requires out_dim >= in_dim.
-    """
-    if out_dim < in_dim:
-        raise ValueError(
-            f"Injective linear map requires out_dim >= in_dim, got {out_dim} < {in_dim}"
-        )
-
-    for attempt in range(max_tries):
-        g = torch.Generator(device="cpu")
-        g.manual_seed(int(seed + attempt))
-
-        A = torch.randn(out_dim, in_dim, generator=g, dtype=torch.float32)
-
-        # Reduced QR: Q has orthonormal columns.
-        Q, _ = torch.linalg.qr(A, mode="reduced")
-
-        if float(Q.abs().min()) >= float(min_abs_weight):
-            return Q.contiguous()
-
-    raise RuntimeError(
-        f"Could not generate a dense orthogonal matrix after {max_tries} attempts. "
-        f"Try decreasing min_abs_weight={min_abs_weight}."
-    )
+    Orthonormality keeps the mixing well-conditioned so the generator Jacobian
+    has no near-zero entries that would blur the ground truth; the Gaussian
+    seed makes it dense almost surely, so every declared edge in `gt` is real."""
+    assert rows >= cols
+    q, _ = np.linalg.qr(rng.normal(size=(rows, cols)))
+    return q[:, :cols]
 
 
-class InjectiveMixer(nn.Module):
-    """
-    Smooth, nonlinear, guaranteed-injective map:
-        x = tanh(gain * W z)
+@dataclass
+class Mixer:
+    """x1 = tanh(g1 W1 z[:d1]) (N1 neurons) ; x2 = tanh(g2 W2 z) (N2 neurons).
 
-    W has full column rank and tanh is strictly monotonic.
-    """
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        seed: int,
-        gain: float = 1.5,
-    ):
-        super().__init__()
+    Figure 5: "z1 is connected to both x1 and x2, while z2 is connected only to
+    x2 [...] g1 takes 3 (d1) latent variables as input and outputs 25 neurons
+    (n1), whereas g2 takes 6 (d1+d2) latent variables as input and outputs 25
+    neurons (n2)."  """
+    W1: np.ndarray            # [N1, d1]
+    W2: np.ndarray            # [N2, d]
+    d1: int
+    gain1: float = 1.0
+    gain2: float = 1.0
 
-        W = make_dense_orthogonal_matrix(
-            out_dim=out_dim,
-            in_dim=in_dim,
-            seed=seed,
-            min_abs_weight=MIN_ABS_MIX_WEIGHT,
-        )
+    def pre(self, z):
+        return (self.gain1 * z[:, :self.d1] @ self.W1.T,
+                self.gain2 * z @ self.W2.T)
 
-        self.register_buffer("W", W)
-        self.gain = float(gain)
+    def __call__(self, z):
+        p1, p2 = self.pre(z)
+        return np.concatenate([np.tanh(p1), np.tanh(p2)], axis=1)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        pre = self.gain * (z @ self.W.T)
-        return torch.tanh(pre)
+    def generator_jacobian(self, z) -> np.ndarray:
+        """dx/dz, [S, C, D].  Unique -- this is what `gt` is derived from."""
+        S, d = z.shape
+        p1, p2 = self.pre(z)
+        s1 = 1.0 - np.tanh(p1) ** 2
+        s2 = 1.0 - np.tanh(p2) ** 2
+        n1 = self.W1.shape[0]
+        J = np.zeros((S, n1 + self.W2.shape[0], d))
+        J[:, :n1, :self.d1] = s1[:, :, None] * (self.gain1 * self.W1)[None]
+        J[:, n1:, :]        = s2[:, :, None] * (self.gain2 * self.W2)[None]
+        return J
 
 
-# ============================================================
-# 6) Ground-truth structure
-# ============================================================
-def make_binary_ground_truth() -> np.ndarray:
-    """
-    Rows: latent dimensions [z1(3), z2(3)]
-    Cols: observed variables [x1(25), x2(25)]
+def generate_dataset(d: int, sigma_obs: float, data_seed: int) -> dict:
+    rng = np.random.default_rng(data_seed)
+    d1 = d // 2 + d % 2
+    z = brownian_motion_box(T_SAMPLES, d, BROWNIAN_SIGMA, rng)
+    W1 = orthonormal_columns(N1, d1, rng)
+    W2 = orthonormal_columns(N2, d, rng)
+    mix = Mixer(W1=W1, W2=W2, d1=d1)
+    sub = z[rng.choice(T_SAMPLES, size=min(5000, T_SAMPLES), replace=False)]
+    mix.gain1 = TARGET_PRE_SD / max(float(np.std(sub[:, :d1] @ W1.T)), 1e-12)
+    mix.gain2 = TARGET_PRE_SD / max(float(np.std(sub @ W2.T)), 1e-12)
+    x = mix(z)
+    if sigma_obs > 0:
+        x = x + sigma_obs * rng.normal(size=x.shape)
+    return dict(z=z, x=x, mix=mix, d=d, d1=d1, d2=d - d1, seed=data_seed)
 
-    z1 -> x1 and x2
-    z2 -> x2 only
-    """
-    gt = np.zeros((D_LATENT, D_OBS), dtype=bool)
 
-    # z1 affects x1 and x2
-    gt[:D1, :] = True
-
-    # z2 affects x2 only
-    gt[D1:, N1:] = True
-
+def ground_truth(d: int, d1: int) -> np.ndarray:
+    """gt[C, D] = 1 iff neuron i is generated from latent j.  Support of dx/dz."""
+    gt = np.zeros((D_OBS, d), dtype=np.int8)
+    gt[:N1, :d1] = 1        # x1 sees z1 only
+    gt[N1:, :] = 1          # x2 sees z1 and z2
     return gt
 
 
-# ============================================================
-# 7) Generate ONE synthetic dataset
-# ============================================================
-def generate_synthetic_data(data_seed: int):
-    """
-    Figure-5-style data:
-      z1: 3 latent dims
-      z2: 3 latent dims
-      g1: z1       -> 25 observed variables
-      g2: [z1,z2]  -> 25 observed variables
-      x = [x1,x2]  -> 50 observed variables
-    """
-    # All six latent coordinates follow the same Brownian rule.
-    latent = brownian_motion_box(
-        n_samples=T,
-        dim=D_LATENT,
-        sigma=BROWNIAN_SIGMA,
-        seed=data_seed,
-    )
-
-    z1 = latent[:, :D1]
-    z2 = latent[:, D1:]
-
-    g1 = InjectiveMixer(
-        in_dim=D1,
-        out_dim=N1,
-        seed=data_seed + 10_000,
-        gain=MIX_GAIN,
-    ).to(device).eval()
-
-    g2 = InjectiveMixer(
-        in_dim=D_LATENT,
-        out_dim=N2,
-        seed=data_seed + 20_000,
-        gain=MIX_GAIN,
-    ).to(device).eval()
-
-    z_t = torch.from_numpy(latent).to(device=device, dtype=torch.float32)
-
-    with torch.no_grad():
-        x1 = g1(z_t[:, :D1])
-        x2 = g2(z_t)
-        x_raw = torch.cat([x1, x2], dim=1).cpu().numpy().astype(np.float32)
-
-    gt_bool = make_binary_ground_truth()
-
-    return {
-        "x_raw": x_raw,
-        "latent": latent.astype(np.float32),
-        "z1": z1.astype(np.float32),
-        "z2": z2.astype(np.float32),
-        "gt_bool": gt_bool,
-        "g1": g1,
-        "g2": g2,
-    }
-
-
-# ============================================================
-# 8) Train-only standardization
-# ============================================================
-def split_and_standardize(x_raw: np.ndarray, latent: np.ndarray):
-    split_idx = int(TRAIN_FRAC * len(x_raw))
-
-    train_x_raw = x_raw[:split_idx]
-    test_x_raw = x_raw[split_idx:]
-
-    train_latent = latent[:split_idx]
-    test_latent = latent[split_idx:]
-
-    # IMPORTANT: statistics are estimated from training data only.
-    mu = train_x_raw.mean(axis=0, keepdims=True).astype(np.float32)
-    sd = train_x_raw.std(axis=0, keepdims=True).astype(np.float32)
-
-    # Avoid division by numerical zero.
-    sd = np.maximum(sd, 1e-6).astype(np.float32)
-
-    train_x = ((train_x_raw - mu) / sd).astype(np.float32)
-    test_x = ((test_x_raw - mu) / sd).astype(np.float32)
-
-    return {
-        "split_idx": split_idx,
-        "train_x": train_x,
-        "test_x": test_x,
-        "train_latent": train_latent.astype(np.float32),
-        "test_latent": test_latent.astype(np.float32),
-        "mu": mu,
-        "sd": sd,
-    }
-
-
-# ============================================================
-# 9) Oracle generator-Jacobian check
-# ============================================================
-def compute_oracle_generator_map(
-    latent_np: np.ndarray,
-    g1: nn.Module,
-    g2: nn.Module,
-    feature_sd: np.ndarray,
-    n_points: int = 128,
-) -> np.ndarray:
-    """
-    Compute |J_g| averaged over points.
-
-    Because training inputs are standardized feature-wise, each observed
-    derivative is divided by the corresponding feature standard deviation.
-    """
-    idx = np.linspace(
-        0,
-        len(latent_np) - 1,
-        min(n_points, len(latent_np)),
-    ).astype(int)
-
-    z = torch.tensor(
-        latent_np[idx],
-        dtype=torch.float32,
-        device=device,
-        requires_grad=True,
-    )
-
-    x1 = g1(z[:, :D1])
-    x2 = g2(z)
-    x = torch.cat([x1, x2], dim=1)
-
-    # Feature standardization: x_std_j = (x_j - mu_j) / sd_j
-    sd_t = torch.tensor(
-        feature_sd.reshape(-1),
-        dtype=torch.float32,
-        device=device,
-    )
-    x_std = x / sd_t[None, :]
-
-    oracle = torch.zeros(
-        D_LATENT,
-        D_OBS,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    # Each output feature is sample-wise independent, so grad(sum_j x[:,j], z)
-    # returns the per-sample derivative for that feature.
-    for feature_idx in range(D_OBS):
-        grad = torch.autograd.grad(
-            x_std[:, feature_idx].sum(),
-            z,
-            retain_graph=True,
-            create_graph=False,
-        )[0]
-
-        oracle[:, feature_idx] = grad.abs().mean(dim=0)
-
-    return oracle.detach().cpu().numpy().astype(np.float32)
-
-
-# ============================================================
-# 10) Metrics / attribution utils
-# ============================================================
-def cleanup_cuda(*objs):
-    for obj in objs:
-        try:
-            del obj
-        except Exception:
-            pass
-
-    gc.collect()
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-
-
-def reduce_attr_map(arr):
-    """
-    Return [latent_dim, observed_dim] after taking absolute values and
-    averaging across samples if a sample dimension exists.
-    """
-    if torch.is_tensor(arr):
-        arr = arr.detach().cpu().numpy()
+def split_data(data: dict) -> dict:
+    """Disjoint train / map-fit / attribution segments."""
+    T = T_SAMPLES
+    assert MAP_POINTS + ATTR_POINTS < T // 2, "held-out segments too large"
+    train_end = T - (MAP_POINTS + ATTR_POINTS) - TIME_OFFSET - 1
+    idx_train = np.arange(0, train_end)
+    idx_map   = np.arange(train_end, train_end + MAP_POINTS)
+    idx_attr  = np.arange(train_end + MAP_POINTS,
+                          train_end + MAP_POINTS + ATTR_POINTS)
+    if STANDARDIZE:
+        mu = data["x"][idx_train].mean(0, keepdims=True)
+        sd = data["x"][idx_train].std(0, keepdims=True) + 1e-8
     else:
-        arr = np.asarray(arr)
-
-    arr = np.abs(arr)
-
-    if arr.ndim == 3:
-        return arr.mean(axis=0).astype(np.float32)
-
-    if arr.ndim == 2:
-        return arr.astype(np.float32)
-
-    if arr.ndim == 1:
-        return arr[None, :].astype(np.float32)
-
-    raise ValueError(f"Unsupported attribution shape: {arr.shape}")
+        mu = np.zeros((1, D_OBS))
+        sd = np.ones((1, D_OBS))
+    xs = (data["x"] - mu) / sd     # diagonal rescale: zeros of dx/dz unchanged
+    return dict(xs=xs, mu=mu, sd=sd, idx_train=idx_train,
+                idx_map=idx_map, idx_attr=idx_attr)
 
 
-def align_attr_to_gt(attr_map: np.ndarray, gt_bool: np.ndarray) -> np.ndarray:
-    if attr_map.shape == gt_bool.shape:
-        return attr_map
+# ------------------------------------------------------------------------------
+# 4. METRIC MACHINERY
+# ------------------------------------------------------------------------------
 
-    if attr_map.T.shape == gt_bool.shape:
-        return attr_map.T
-
-    raise ValueError(
-        f"Cannot align attribution shape {attr_map.shape} "
-        f"to GT shape {gt_bool.shape}"
-    )
-
-
-def compute_binary_scores(attr_map: np.ndarray, gt_bool: np.ndarray):
-    y_true = gt_bool.ravel().astype(np.int64)
-    y_score = np.asarray(attr_map, dtype=np.float64).ravel()
-
-    auroc = float(roc_auc_score(y_true, y_score))
-    auprc = float(average_precision_score(y_true, y_score))
-
-    return auroc, auprc
+def squeeze_to_3d(a: np.ndarray, name: str) -> np.ndarray:
+    """Collapse trailing singleton axes ONLY.  Never average over a real axis:
+    a signed mean over a lag axis cancels opposite-sign entries and turns a
+    genuine edge into a zero."""
+    a = np.asarray(a)
+    while a.ndim > 3:
+        if a.shape[-1] == 1:
+            a = a[..., 0]
+        else:
+            raise ValueError(f"{name}: non-singleton extra axis {a.shape}")
+    if a.ndim != 3:
+        raise ValueError(f"{name}: expected 3 dims, got {a.shape}")
+    return a
 
 
-def save_heatmap(mat, path, title):
-    fig, ax = plt.subplots(figsize=(11, 4.8))
-    im = ax.imshow(mat, aspect="auto", cmap="cividis")
-    ax.set_title(title)
-    ax.set_xlabel("Observed feature")
-    ax.set_ylabel("Latent dimension")
-    fig.colorbar(im, ax=ax, shrink=0.90)
-    fig.tight_layout()
-    fig.savefig(path, dpi=250, bbox_inches="tight")
-    plt.close(fig)
+def canonicalize_jf(jf: np.ndarray, out_dim: int, name: str) -> np.ndarray:
+    """-> [S, O, C]."""
+    jf = squeeze_to_3d(jf, name)
+    if jf.shape[1] == out_dim and jf.shape[2] == D_OBS:
+        return jf
+    if jf.shape[2] == out_dim and jf.shape[1] == D_OBS:
+        return np.swapaxes(jf, 1, 2)
+    raise ValueError(f"{name}: cannot orient {jf.shape} to [S,{out_dim},{D_OBS}]")
 
 
-def get_contiguous_attr_segment(test_x: np.ndarray) -> np.ndarray:
-    start = min(ATTR_MARGIN, max(0, len(test_x) - ATTR_POINTS))
+def truncated_pinv(jf: np.ndarray, drop: int) -> np.ndarray:
+    """Batched pinv of J_f with rank truncation.  [S,O,C] -> [S,C,O].
 
-    end = min(
-        start + ATTR_POINTS,
-        len(test_x),
-    )
-
-    x = test_x[start:end]
-
-    if len(x) < 100:
-        raise ValueError(
-            f"Attribution segment is too short: {len(x)} samples."
-        )
-
-    return x.astype(np.float32)
+    With an L2-normalised head, J_f = (1/|u|)(I - f f^T) A is rank deficient by
+    exactly one; keeping that direction lets the pinv divide by a numerically
+    zero singular value and blow up an arbitrary direction."""
+    U, S, Vh = np.linalg.svd(jf, full_matrices=False)
+    S = S.copy()
+    if drop > 0:
+        S[:, -drop:] = 0.0
+    inv = np.zeros_like(S)
+    good = S > np.maximum(1e-10 * S[:, :1], 1e-30)
+    inv[good] = 1.0 / S[good]
+    return np.einsum("ski,sk,sok->sio", Vh, inv, U)      # V diag(1/s) U^T
 
 
-# ============================================================
-# 11) CEBRA model
-# ============================================================
-def build_model(adversarial: bool):
-    """
-    We DO NOT modify base.py.
+def fit_linear_maps(f: np.ndarray, z: np.ndarray, ridge: float = 1e-6):
+    """A_z2e [O,D] with f ~ A z ; B_e2z [O,D] with z ~ f B ; R2 per latent dim.
 
-    We only pass PGD hyperparameters to your existing implementation.
-    """
-    return CEBRA(
-        batch_size=BATCH_SIZE,
-        temperature=TEMPERATURE,
-        model_architecture=MODEL_ARCHITECTURE,
-        time_offsets=TIME_OFFSETS,
-        max_iterations=MAX_ITER,
-        output_dimension=OUTPUT_DIM,
-        verbose=True,
-
-        # Keep this benchmark on the ordinary Solver path.
-        # In your custom base.py, hybrid adversarial code has separate behavior.
-        hybrid=False,
-
-        training_mode="adversarial" if adversarial else "clean",
-
-        # IMPORTANT: no hard-coded epsilon=5.
-        adv_epsilon=ADV_EPSILON if adversarial else 0.0,
-        adv_alpha=ADV_ALPHA if adversarial else 0.0,
-        adv_steps=ADV_STEPS if adversarial else 0,
-        attack_norm=ATTACK_NORM,
-
-        num_hidden_units=NUM_HIDDEN_UNITS,
-        device="cuda_if_available",
-    )
+    A_z2e is what the alignment needs (df/dz).  B_e2z gives the paper's "R2 for
+    predicting the auxiliary variable from the feature space"."""
+    f = np.asarray(f, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    fc = f - f.mean(0, keepdims=True)
+    zc = z - z.mean(0, keepdims=True)
+    O, D = f.shape[1], z.shape[1]
+    G = zc.T @ zc
+    G = G + ridge * np.trace(G) / max(D, 1) * np.eye(D)
+    A_z2e = np.linalg.solve(G, zc.T @ fc).T                  # [O, D]
+    H = fc.T @ fc
+    H = H + ridge * np.trace(H) / max(O, 1) * np.eye(O)
+    B_e2z = np.linalg.solve(H, fc.T @ zc)                    # [O, D]
+    ss_res = ((zc - fc @ B_e2z) ** 2).sum(0)
+    r2 = 1.0 - ss_res / ((zc ** 2).sum(0) + 1e-30)
+    return A_z2e, B_e2z, r2
 
 
-# ============================================================
-# 12) Latent recovery sanity-check
-# ============================================================
-def latent_linear_r2(
-    model,
-    train_x,
-    train_latent,
-    test_x,
-    test_latent,
-):
-    """
-    Check whether the learned representation contains the six ground-truth
-    latents linearly. This helps separate representation failure from
-    attribution failure.
-    """
-    try:
-        # Use contiguous temporal windows. Do NOT subsample with linspace
-        # before passing data through an offset/temporal encoder.
-        n_train = min(R2_TRAIN_POINTS, len(train_x))
-        n_test = min(R2_TEST_POINTS, len(test_x))
+def align_to_latents(Q: np.ndarray, A_z2e: np.ndarray) -> np.ndarray:
+    """R[s,i,d] = dx_i/dz_d = sum_o Q[s,i,o] A_z2e[o,d].  [S,C,O] -> [S,C,D].
+    Exactly invariant to f -> M f: Q -> Q M^{-1}, A -> M A."""
+    return np.einsum("sio,od->sid", Q, A_z2e)
 
-        train_x_r2 = train_x[:n_train]
-        train_z_r2 = train_latent[:n_train]
 
-        test_x_r2 = test_x[:n_test]
-        test_z_r2 = test_latent[:n_test]
+def aggregate_map(R: np.ndarray) -> np.ndarray:
+    """[S,C,D] -> [C,D].  ABSOLUTE value BEFORE the mean: a signed average over
+    timepoints cancels a real edge whose sign flips along the trajectory."""
+    return np.abs(R).mean(axis=0)
 
-        emb_train = model.transform(train_x_r2)
-        emb_test = model.transform(test_x_r2)
 
-        emb_train = np.asarray(emb_train)
-        emb_test = np.asarray(emb_test)
+def score_variants(M: np.ndarray) -> Dict[str, np.ndarray]:
+    """Global z-score (primary; monotone, hence auROC-equivalent to raw) plus a
+    per-latent-column normalisation, which is NOT auROC-equivalent."""
+    return {"global": (M - M.mean()) / (M.std() + 1e-30),
+            "colnorm": (M - M.mean(0, keepdims=True)) /
+                       (M.std(0, keepdims=True) + 1e-30)}
 
-        reg = LinearRegression()
-        reg.fit(emb_train, train_z_r2)
 
-        return float(
-            reg.score(
-                emb_test,
-                test_z_r2,
-            )
-        )
-
-    except Exception as exc:
-        print("WARNING: Could not compute latent R2:", repr(exc))
+def _auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    s = np.asarray(scores, dtype=np.float64).ravel()
+    y = np.asarray(labels).ravel().astype(bool)
+    n_pos, n_neg = int(y.sum()), int((~y).sum())
+    if n_pos == 0 or n_neg == 0:
         return float("nan")
+    order = np.argsort(s, kind="mergesort")
+    ranks = np.empty_like(s)
+    ss = s[order]
+    i = 0
+    while i < len(s):
+        j = i
+        while j + 1 < len(s) and ss[j + 1] == ss[i]:
+            j += 1
+        ranks[order[i:j + 1]] = 0.5 * (i + j) + 1.0
+        i = j + 1
+    return (ranks[y].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
-# ============================================================
-# 13) Train + attribute one run
-# ============================================================
-def train_and_score_one_run(
-    data_seed: int,
-    train_seed: int,
-    train_x: np.ndarray,
-    train_latent: np.ndarray,
-    test_x: np.ndarray,
-    test_latent: np.ndarray,
-    gt_bool: np.ndarray,
-    adversarial: bool,
-):
-    # Critical: this seed changes ONLY model/training randomness.
-    set_all_seeds(train_seed)
+def _auprc(scores: np.ndarray, labels: np.ndarray) -> float:
+    s = np.asarray(scores, dtype=np.float64).ravel()
+    y = np.asarray(labels).ravel().astype(bool)
+    if y.sum() == 0:
+        return float("nan")
+    y = y[np.argsort(-s, kind="mergesort")]
+    tp = np.cumsum(y)
+    prec = tp / np.arange(1, len(y) + 1)
+    rec = tp / y.sum()
+    return float(np.sum(np.diff(np.concatenate([[0.0], rec])) * prec))
 
-    model_name = "ACORN" if adversarial else "CEBRA"
 
-    print("\n" + "=" * 90)
-    print(
-        f"data_seed={data_seed} | train_seed={train_seed} | "
-        f"model={model_name}"
-    )
-    print("=" * 90)
+def binary_scores(M: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
+    out = {}
+    for key, s in score_variants(M).items():
+        out[f"auroc_{key}"] = _auc(s, gt)
+        out[f"auprc_{key}"] = _auprc(s, gt)
+    return out
 
-    model = build_model(adversarial=adversarial)
 
-    # Two continuous auxiliary blocks, preserving your original setup.
-    z1_train = train_latent[:, :D1]
-    z2_train = train_latent[:, D1:]
+# ------------------------------------------------------------------------------
+# 5. VALIDATION OF THE METRIC ITSELF
+# ------------------------------------------------------------------------------
 
-    model.fit(
-        train_x.astype(np.float32),
-        z1_train.astype(np.float32),
-        z2_train.astype(np.float32),
-    )
+def validate_alignment_metric(data: dict, sp: dict, gt: np.ndarray, seed: int):
+    """End-to-end test of the PRIMARY scoring path on a known-perfect encoder.
 
-    run_tag = (
-        f"{DATASET_CFG['name']}_"
-        f"dseed{data_seed}_"
-        f"tseed{train_seed}_"
-        f"{model_name}"
-    )
-
-    save_path = OUT_DIR / f"{run_tag}.pth"
-
-    try:
-        model.save(str(save_path))
-        print("Saved model:", save_path)
-    except Exception as exc:
-        print("WARNING: Could not save model:", repr(exc))
-
-    # --------------------------------------------------------
-    # Representation sanity check
-    # --------------------------------------------------------
-    r2 = latent_linear_r2(
-        model=model,
-        train_x=train_x,
-        train_latent=train_latent,
-        test_x=test_x,
-        test_latent=test_latent,
-    )
-    print(f"Latent linear R2: {r2:.4f}")
-
-    # --------------------------------------------------------
-    # Attribution on CONTIGUOUS held-out data
-    # --------------------------------------------------------
-    trained_model = model.solver_.model.to(device)
-
-    if hasattr(trained_model, "split_outputs"):
-        trained_model.split_outputs = False
-
-    trained_model.eval()
-
-    attr_x = get_contiguous_attr_segment(test_x)
-
-    input_tensor = torch.from_numpy(attr_x).to(
-        device=device,
-        dtype=torch.float32,
-    )
-    input_tensor.requires_grad_(True)
-
-    method = cebra.attribution.init(
-        name="jacobian-based-batched",
-        model=trained_model,
-        input_data=input_tensor,
-        output_dimension=int(
-            getattr(trained_model, "num_output", OUTPUT_DIM)
-        ),
-    )
-
-    attr_batch_size = min(ATTR_BATCH_SIZE, len(attr_x))
-    result = method.compute_attribution_map(
-        batch_size=attr_batch_size
-    )
-
-    print("Attribution keys:", list(result.keys()))
-
-    if "jf" not in result:
-        raise KeyError(
-            f"'jf' not found. Available keys: {list(result.keys())}"
-        )
-
-    if "jf-inv-svd" in result:
-        inv_key = "jf-inv-svd"
-    elif "jf-inv" in result:
-        inv_key = "jf-inv"
+    Builds the exact composition of the true inverse mixing with a random
+    linear reparametrisation, plus whatever head ARCH_VARIANT prescribes.  If
+    the pipeline is correct auROC must be ~1.  Failure here means the METRIC is
+    broken, not the model, so the run aborts rather than emitting numbers
+    nobody can interpret."""
+    rng = np.random.default_rng(seed)
+    d = data["d"]
+    O = d + OUT_EXTRA
+    z = data["z"][sp["idx_attr"]]                          # [S, d]
+    Jg = data["mix"].generator_jacobian(z) / sp["sd"][0][None, :, None]
+    Jzx = np.linalg.pinv(Jg)                               # [S, d, C] = dz/dx
+    A = rng.normal(size=(O, d))                            # the indeterminacy
+    if _ARCH["normalize"]:
+        u = z @ A.T
+        nrm = np.linalg.norm(u, axis=1, keepdims=True) + 1e-12
+        f = u / nrm
+        I = np.eye(O)
+        dfdz = (I[None] - f[:, :, None] * f[:, None, :]) @ A[None] / nrm[:, :, None]
     else:
-        raise KeyError(
-            f"No inverse-Jacobian attribution found. "
-            f"Available keys: {list(result.keys())}"
-        )
-
-    jf_raw = reduce_attr_map(result["jf"])
-    jfinv_raw = reduce_attr_map(result[inv_key])
-
-    jf_map = align_attr_to_gt(jf_raw, gt_bool)
-    jfinv_map = align_attr_to_gt(jfinv_raw, gt_bool)
-
-    auroc_jf, auprc_jf = compute_binary_scores(
-        jf_map,
-        gt_bool,
-    )
-
-    auroc_jfinv, auprc_jfinv = compute_binary_scores(
-        jfinv_map,
-        gt_bool,
-    )
-
-    print(
-        f"JF     | AUROC={auroc_jf:.4f} | AUPRC={auprc_jf:.4f}"
-    )
-    print(
-        f"JF-INV | AUROC={auroc_jfinv:.4f} | AUPRC={auprc_jfinv:.4f}"
-    )
-
-    np.savez_compressed(
-        OUT_DIR / f"{run_tag}_attrs.npz",
-        jf=jf_map.astype(np.float32),
-        jfinv=jfinv_map.astype(np.float32),
-        gt=gt_bool.astype(np.uint8),
-        latent_r2=np.array([r2], dtype=np.float32),
-        auroc_jf=np.array([auroc_jf], dtype=np.float32),
-        auprc_jf=np.array([auprc_jf], dtype=np.float32),
-        auroc_jfinv=np.array([auroc_jfinv], dtype=np.float32),
-        auprc_jfinv=np.array([auprc_jfinv], dtype=np.float32),
-    )
-
-    save_heatmap(
-        jf_map,
-        IMG_DIR / f"{run_tag}_JF.png",
-        f"{run_tag} | JF",
-    )
-
-    save_heatmap(
-        jfinv_map,
-        IMG_DIR / f"{run_tag}_JF_INV.png",
-        f"{run_tag} | JF-INV",
-    )
-
-    cleanup_cuda(
-        method,
-        trained_model,
-        input_tensor,
-        model,
-    )
-
-    return {
-        "setup": DATASET_CFG["name"],
-        "experiment_mode": EXPERIMENT_MODE,
-        "data_seed": data_seed,
-        "train_seed": train_seed,
-        "model": model_name,
-        "training_mode": (
-            "adversarial"
-            if adversarial
-            else "clean"
-        ),
-        "adv_epsilon": (
-            ADV_EPSILON
-            if adversarial
-            else 0.0
-        ),
-        "adv_alpha": (
-            ADV_ALPHA
-            if adversarial
-            else 0.0
-        ),
-        "adv_steps": (
-            ADV_STEPS
-            if adversarial
-            else 0
-        ),
-        "latent_r2": r2,
-        "auroc_jf": auroc_jf,
-        "auprc_jf": auprc_jf,
-        "auroc_jfinv": auroc_jfinv,
-        "auprc_jfinv": auprc_jfinv,
-    }
+        f = z @ A.T
+        dfdz = np.broadcast_to(A[None], (len(z), O, d))
+    jf = dfdz @ Jzx                                        # [S, O, C] = df/dx
+    A_z2e, _, r2 = fit_linear_maps(f, z)
+    Q = truncated_pinv(jf, PINV_DROP)
+    res = binary_scores(aggregate_map(align_to_latents(Q, A_z2e)), gt)
+    print(f"    [validate] surrogate auROC={res['auroc_global']:.4f} "
+          f"auPRC={res['auprc_global']:.4f} R2min={r2.min():.4f}")
+    if not (res["auroc_global"] >= SURROGATE_AUROC_MIN):
+        raise RuntimeError(
+            f"alignment metric failed its own sanity check "
+            f"(auROC={res['auroc_global']:.4f} < {SURROGATE_AUROC_MIN}). "
+            f"Do not trust any model comparison until this passes.")
+    return res
 
 
-# ============================================================
-# 14) Paired summary
-# ============================================================
-def make_paired_summary(results_df: pd.DataFrame):
-    metrics = [
-        "latent_r2",
-        "auroc_jf",
-        "auprc_jf",
-        "auroc_jfinv",
-        "auprc_jfinv",
-    ]
+# ------------------------------------------------------------------------------
+# 6. MODEL, CRITERION, SAMPLER
+# ------------------------------------------------------------------------------
+
+def build_model(d: int) -> Tuple[nn.Module, nn.Module]:
+    model = CEBRA.models.init(MODEL_NAME, D_OBS, NUM_UNITS,
+                              d + OUT_EXTRA).to(DEVICE)
+    if len(model.get_offset()) != 1:
+        raise RuntimeError(
+            f"{MODEL_NAME} has receptive field {len(model.get_offset())}; this "
+            f"benchmark assumes an instantaneous (offset-1) encoder so that "
+            f"J_f is a plain [O, C] matrix per timepoint.")
+    if bool(getattr(model, "normalize", None)) != _ARCH["normalize"]:
+        raise RuntimeError(
+            f"{MODEL_NAME}.normalize={getattr(model, 'normalize', None)} but "
+            f"ARCH_VARIANT={ARCH_VARIANT} expects {_ARCH['normalize']}")
+    if CRITERION == "cosine":
+        crit = CRIT.LearnableCosineInfoNCE(temperature=INIT_TEMPERATURE,
+                                           min_temperature=MIN_TEMPERATURE)
+    else:
+        crit = CRIT.LearnableEuclideanInfoNCE(temperature=INIT_TEMPERATURE,
+                                              min_temperature=MIN_TEMPERATURE)
+    return model, crit.to(DEVICE)
+
+
+def flat(e: torch.Tensor) -> torch.Tensor:
+    return e if e.dim() == 2 else e.reshape(e.shape[0], -1)
+
+
+class TimeSampler:
+    """CEBRA's `time` conditional.  Returns 3D [B, C, 1] tensors, the same shape
+    cebra.data loaders hand to Solver.step, so the attack code below operates on
+    exactly the tensor layout the fork perturbs."""
+
+    def __init__(self, X: torch.Tensor, idx_train: np.ndarray, gen):
+        self.X = X                                    # [T, C]
+        self.base = int(idx_train[0])
+        self.hi = len(idx_train) - TIME_OFFSET - 1
+        self.gen = gen
+
+    def __call__(self, batch: int):
+        i = torch.randint(0, self.hi, (batch,), generator=self.gen,
+                          device=self.X.device) + self.base
+        j = torch.randint(0, self.hi, (batch,), generator=self.gen,
+                          device=self.X.device) + self.base
+        return (self.X[i].unsqueeze(-1),
+                self.X[i + TIME_OFFSET].unsqueeze(-1),
+                self.X[j].unsqueeze(-1))
+
+
+# ------------------------------------------------------------------------------
+# 7. THE JACOBIAN-FROBENIUS REGULARIZER  (paper Eq. 10 / 15)
+# ------------------------------------------------------------------------------
+
+def jacobian_frobenius_sq(model: nn.Module, x: torch.Tensor,
+                          estimator: str = "proj", n_proj: int = 1
+                          ) -> torch.Tensor:
+    """E_x ||J_f(x)||_F^2, differentiable w.r.t. the model parameters.
+
+    exact: O backward passes, sum_o ||d f_o / d x||^2.
+    proj : Hoffman et al. (2019).  For v uniform on the unit sphere in R^O,
+           E_v ||v^T J||^2 = tr(J J^T)/O = ||J||_F^2 / O, so
+           (O / n_proj) * sum_mu ||d (v_mu . f) / d x||^2 is unbiased.  One
+           projection replaces O backward passes -- this is what makes the
+           penalty affordable at batch 5000."""
+    x = x.detach().requires_grad_(True)
+    out = flat(model(x))
+    O = out.shape[1]
+    total = 0.0
+    if estimator == "exact":
+        for o in range(O):
+            g, = torch.autograd.grad(out[:, o].sum(), x,
+                                     create_graph=True, retain_graph=True)
+            total = total + (g ** 2).flatten(1).sum(1)
+        return total.mean()
+    for _ in range(n_proj):
+        v = torch.randn(out.shape, device=out.device, dtype=out.dtype)
+        v = v / (v.norm(dim=1, keepdim=True) + 1e-12)
+        g, = torch.autograd.grad((out * v).sum(), x,
+                                 create_graph=True, retain_graph=True)
+        total = total + (g ** 2).flatten(1).sum(1)
+    return (O / n_proj) * total.mean()
+
+
+_JREG_TESTED = {"done": False}
+
+
+def selftest_jreg(model: nn.Module, x: torch.Tensor):
+    """The projection estimator is only useful if it is unbiased for THIS
+    model.  Compare against the exact value on a small batch."""
+    if _JREG_TESTED["done"]:
+        return
+    xs = x[:64]
+    exact = float(jacobian_frobenius_sq(model, xs, "exact"))
+    est = float(np.mean([float(jacobian_frobenius_sq(model, xs, "proj", 8))
+                         for _ in range(24)]))
+    rel = abs(est - exact) / max(exact, 1e-12)
+    print(f"    [validate] ||J||_F^2 exact={exact:.5f} proj={est:.5f} "
+          f"rel.err={rel:.3f}")
+    if rel > JREG_SELFTEST_RTOL:
+        raise RuntimeError(
+            f"Hoffman projection estimator biased by {rel:.1%} -- refusing to "
+            f"run a regularized arm on an untrustworthy penalty.")
+    _JREG_TESTED["done"] = True
+
+
+def lambda_at(it: int, lam_max: float) -> float:
+    """0 for LAMBDA_WARMUP iterations, then a linear ramp over LAMBDA_RAMP.
+
+    "The first 2,500 training steps minimize the InfoNCE [...] loss with
+     lambda = 0; we then ramp up lambda to its maximum value over the following
+     2,500 steps, and continue to train until 20,000 total steps."
+
+    The counter advances per ITERATION, not per optimizer step, so lambda
+    reaches its maximum at the same point in the run for single- and
+    double-update arms."""
+    if lam_max <= 0.0:
+        return 0.0
+    if it < LAMBDA_WARMUP:
+        return 0.0
+    return lam_max * min(1.0, max(0.0, (it - LAMBDA_WARMUP) / float(LAMBDA_RAMP)))
+
+
+# ==============================================================================
+# 8. THE ATTACK -- literal transcription of cebra/solver/base.py::Solver.step
+# ==============================================================================
+# The three helpers below are copied verbatim from the fork so that the l2
+# branch is bit-for-bit the same geometry.
+
+def _l2_normalize(t: torch.Tensor, eps: float = 1e-12):
+    """Per-sample L2 normalisation (zero vectors stay zero)."""
+    flat_ = t.reshape(t.size(0), -1)
+    norm = flat_.norm(p=2, dim=1, keepdim=True).clamp(min=eps)
+    return t / norm.view(-1, *([1] * (t.dim() - 1)))
+
+
+def _rand_radius_like(t: torch.Tensor):
+    """U(0,1) radius shaped like t but broadcastable (B,1,1,...)."""
+    return torch.rand([t.size(0)] + [1] * (t.dim() - 1), device=t.device)
+
+
+def _proj_l2_ball(adv: torch.Tensor, orig: torch.Tensor, epsilon: float):
+    """Project adv back to the closed L2 ball of radius eps around orig."""
+    delta = adv - orig
+    flat_ = delta.reshape(delta.size(0), -1)
+    norm = flat_.norm(p=2, dim=1, keepdim=True).clamp(min=1e-12)
+    factor = torch.where(norm > epsilon, norm / epsilon, torch.ones_like(norm))
+    delta = delta / factor.view(-1, *([1] * (delta.dim() - 1)))
+    return orig + delta
+
+
+def adv_alpha() -> float:
+    if ADV_ALPHA_RULE == "madry":
+        return 2.5 * ADV_EPSILON / max(ADV_STEPS, 1)
+    return ADV_ALPHA_RAW
+
+
+def pgd_attack(model, crit, x_ref, x_pos, x_neg, lo, hi) -> torch.Tensor:
+    """Maximise the InfoNCE loss w.r.t. the REFERENCE inputs only.
+
+    Faithful to Solver.step:
+      * only batch.reference is perturbed; positive and negative stay clean
+      * linf init:  reference + U(-eps, +eps) over the whole eps-cube
+      * l2   init:  reference + _l2_normalize(randn) * U(0,1) * eps
+      * linf step:  x_adv += alpha * grad.sign(), then
+                    torch.max(torch.min(x_adv, ref+eps), ref-eps)
+      * l2   step:  x_adv += alpha * _l2_normalize(grad), then _proj_l2_ball
+      * the gradient comes from torch.autograd.grad(loss, x_adv), so model
+        parameters are never touched by the attack
+      * NO clamp to a valid data range -- the fork applies none (ADV_CLIP_RANGE
+        exposes it as an off-by-default option)
+      * positive/negative are re-encoded at every inner step because
+        _inference(adv_batch) re-runs the whole batch.  Parameters are frozen
+        during the attack so caching them is mathematically identical;
+        ADV_CACHE_POS_NEG=True enables that ~2x speedup.
+    """
+    eps, alpha = ADV_EPSILON, adv_alpha()
+
+    if ATTACK_NORM == "linf":
+        perturb = torch.empty_like(x_ref).uniform_(-eps, eps)
+        x_adv = (x_ref + perturb).clone().detach()
+    elif ATTACK_NORM == "l2":
+        noise = _l2_normalize(torch.randn_like(x_ref))
+        noise = noise * _rand_radius_like(x_ref) * eps
+        x_adv = (x_ref + noise).clone().detach()
+    else:
+        raise ValueError(f"unknown ATTACK_NORM={ATTACK_NORM}")
+    if ADV_CLIP_RANGE:
+        x_adv = x_adv.clamp(lo, hi)
+    x_adv.requires_grad_(True)
+
+    e_pos = e_neg = None
+    if ADV_CACHE_POS_NEG:
+        with torch.no_grad():
+            e_pos = flat(model(x_pos)).detach()
+            e_neg = flat(model(x_neg)).detach()
+
+    for _ in range(ADV_STEPS):
+        with torch.enable_grad():
+            ep = e_pos if e_pos is not None else flat(model(x_pos))
+            en = e_neg if e_neg is not None else flat(model(x_neg))
+            loss, _, _ = crit(flat(model(x_adv)), ep, en)
+        grad_x, = torch.autograd.grad(loss, x_adv, retain_graph=False,
+                                      create_graph=False)
+        with torch.no_grad():
+            if ATTACK_NORM == "linf":
+                x_adv = x_adv + alpha * grad_x.sign()
+                x_adv = torch.max(torch.min(x_adv, x_ref + eps), x_ref - eps)
+            else:
+                x_adv = x_adv + alpha * _l2_normalize(grad_x)
+                x_adv = _proj_l2_ball(x_adv, x_ref, eps)
+            if ADV_CLIP_RANGE:
+                x_adv = x_adv.clamp(lo, hi)
+        x_adv = x_adv.detach().requires_grad_(True)
+
+    return x_adv.detach()
+
+
+# ------------------------------------------------------------------------------
+# 9. TRAINING
+# ------------------------------------------------------------------------------
+
+def _update(model, crit, opt, x_ref, x_pos, x_neg, lam, x_jreg, gen):
+    """One optimizer.step(), optionally carrying the lambda ||J||_F^2 penalty."""
+    opt.zero_grad(set_to_none=True)
+    loss, align, uniform = crit(flat(model(x_ref)), flat(model(x_pos)),
+                                flat(model(x_neg)))
+    total = loss
+    jval = 0.0
+    if lam > 0.0:
+        xj = x_jreg
+        if JREG_SUBBATCH and JREG_SUBBATCH < xj.shape[0]:
+            sel = torch.randint(0, xj.shape[0], (JREG_SUBBATCH,),
+                                generator=gen, device=xj.device)
+            xj = xj[sel]
+        jf2 = jacobian_frobenius_sq(model, xj, JREG_ESTIMATOR, JREG_NPROJ)
+        total = loss + lam * jf2
+        jval = float(jf2)
+    total.backward()
+    opt.step()
+    return float(loss), jval
+
+
+def expected_steps(scheme: str) -> int:
+    return MAX_ITER * (1 if scheme in ("clean_single", "adv_single") else 2)
+
+
+def train_arm(arm: str, data: dict, sp: dict, seed: int, verbose_every: int = 0):
+    cfg = ARMS[arm]
+    scheme, lam_max = cfg["scheme"], cfg["lam"]
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    model, crit = build_model(data["d"])
+    opt = torch.optim.Adam(list(model.parameters()) + list(crit.parameters()),
+                           lr=LEARNING_RATE)
+    X = torch.from_numpy(sp["xs"].astype(np.float32)).to(DEVICE)
+    sampler = TimeSampler(X, sp["idx_train"], gen)
+    lo = float(X[sp["idx_train"]].min())
+    hi = float(X[sp["idx_train"]].max())
+
+    if lam_max > 0:
+        selftest_jreg(model, X[sp["idx_train"][:64]].unsqueeze(-1))
+
+    def lam_for(which: str, it: int) -> float:
+        if JREG_ON == "clean_only" and which != "clean":
+            return 0.0
+        if JREG_ON == "adv_only" and which != "adv":
+            return 0.0
+        return lambda_at(it, lam_max)
+
+    n_steps, hist, t0 = 0, [], time.time()
+    for it in range(MAX_ITER):
+        x_ref, x_pos, x_neg = sampler(BATCH_SIZE)
+        nce_c = nce_a = float("nan")
+        j_c = j_a = 0.0
+
+        # ---- update 1: the fork's UNCONDITIONAL clean update -----------------
+        if scheme in ("clean_single", "clean_double", "fork_double"):
+            nce_c, j_c = _update(model, crit, opt, x_ref, x_pos, x_neg,
+                                 lam_for("clean", it), x_ref, gen)
+            n_steps += 1
+
+        # ---- update 2 -------------------------------------------------------
+        if scheme in ("fork_double", "adv_single"):
+            # NOTE: the attack is built AFTER the clean step, i.e. with the
+            # already-updated parameters -- exactly as in Solver.step, where
+            # the adversarial branch follows self.optimizer.step().
+            x_adv = pgd_attack(model, crit, x_ref, x_pos, x_neg, lo, hi)
+            xj = x_ref if JREG_AT == "clean" else x_adv
+            nce_a, j_a = _update(model, crit, opt, x_adv, x_pos, x_neg,
+                                 lam_for("adv", it), xj, gen)
+            n_steps += 1
+        elif scheme == "clean_double":
+            # the compute-matched control: a SECOND clean update on the SAME
+            # batch, so `acorn` vs `cebra_2x` differs only by the attack
+            nce_a, j_a = _update(model, crit, opt, x_ref, x_pos, x_neg,
+                                 lam_for("adv", it), x_ref, gen)
+            n_steps += 1
+
+        hist.append((nce_c, nce_a, max(j_c, j_a), lambda_at(it, lam_max)))
+        if verbose_every and (it % verbose_every == 0 or it == MAX_ITER - 1):
+            print(f"      [{arm:10s}] it={it:6d} nce_clean={nce_c:8.4f} "
+                  f"nce_2nd={nce_a:8.4f} |J|^2={max(j_c, j_a):9.4f} "
+                  f"lam={lambda_at(it, lam_max):.3f} tau={crit.temperature:.4f}")
+
+    exp = expected_steps(scheme)
+    assert n_steps == exp, f"{arm}: {n_steps} steps, expected {exp}"
+    model.eval()
+    tail = hist[-50:]
+    return dict(model=model, crit=crit, n_steps=n_steps,
+                seconds=time.time() - t0,
+                final_nce=float(np.nanmean([h[1] if not math.isnan(h[1])
+                                            else h[0] for h in tail])),
+                final_jfro=float(np.mean([h[2] for h in tail])),
+                temperature=float(crit.temperature))
+
+
+@torch.no_grad()
+def embed(model, xs: np.ndarray, idx: np.ndarray, chunk: int = 4096) -> np.ndarray:
+    out = []
+    for s in range(0, len(idx), chunk):
+        xb = torch.from_numpy(xs[idx[s:s + chunk]].astype(np.float32)).to(DEVICE)
+        out.append(flat(model(xb.unsqueeze(-1))).cpu().numpy())
+    return np.concatenate(out, 0).astype(np.float64)
+
+
+# ------------------------------------------------------------------------------
+# 10. ATTRIBUTION (library-provided Jacobian; the pinv is taken here)
+# ------------------------------------------------------------------------------
+
+_ATTR_REPORTED = {"done": False}
+
+
+def _pick(dct: dict, keys: Sequence[str]):
+    for k in keys:
+        for kk in dct:
+            if str(kk).lower().replace("_", "-") == k:
+                return dct[kk]
+    return None
+
+
+def _to_np(v):
+    if v is None:
+        return None
+    return v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
+
+
+def library_jacobian(model, xs, idx, out_dim):
+    """Call cebra.attribution for J_f (the paper's "neuron gradient").
+
+    Registry names and return signatures differ between xCEBRA revisions, so
+    the available options are printed once and several call shapes are tried.
+    Only J_f is needed; the "inverted neuron gradient" is formed here with
+    truncated_pinv so the rank truncation stays explicit."""
+    import cebra.attribution
+    x = torch.from_numpy(xs[idx].astype(np.float32)).to(DEVICE).unsqueeze(-1)
+    if not _ATTR_REPORTED["done"]:
+        try:
+            print("    [attr] registry options:", cebra.attribution.get_options())
+        except Exception as exc:
+            print("    [attr] get_options() unavailable:", exc)
+    errors = []
+    for name in ATTR_METHOD_CANDIDATES:
+        for kw in (dict(model=model, input_data=x, output_dimension=out_dim,
+                        num_batches=ATTR_NUM_BATCHES),
+                   dict(model=model, input_data=x, output_dimension=out_dim),
+                   dict(model=model, input_data=x)):
+            try:
+                res = cebra.attribution.init(name, **kw).compute_attribution_map()
+            except Exception as exc:
+                errors.append(f"{name}{list(kw)}: {type(exc).__name__}: {exc}")
+                continue
+            jf = jfinv = None
+            if isinstance(res, dict):
+                if not _ATTR_REPORTED["done"]:
+                    print(f"    [attr] '{name}' -> dict keys: "
+                          f"{sorted(map(str, res.keys()))}")
+                jf = _pick(res, ["jf", "jacobian", "neuron-gradient"])
+                jfinv = _pick(res, ["jf-inv", "jf-inv-svd", "jf-inv-lsq",
+                                    "inverted-neuron-gradient"])
+            elif isinstance(res, (tuple, list)) and len(res) == 2:
+                jf, jfinv = res
+            else:
+                jf = res
+            jf = _to_np(jf)
+            if jf is None:
+                errors.append(f"{name}: no J_f in {type(res)}")
+                continue
+            _ATTR_REPORTED["done"] = True
+            return canonicalize_jf(jf, out_dim, f"jf[{name}]"), _to_np(jfinv)
+    raise RuntimeError("cebra.attribution could not be called. Tried:\n  " +
+                       "\n  ".join(errors))
+
+
+# ------------------------------------------------------------------------------
+# 11. PER-SEED RUNNER
+# ------------------------------------------------------------------------------
+
+def run_seed(d: int, sigma_obs: float, seed_i: int) -> List[dict]:
+    seed = SEED0 + 977 * seed_i
+    print(f"\n--- d={d} sigma_obs={sigma_obs} seed={seed} "
+          f"({seed_i + 1}/{N_SEEDS}) ---")
+    data = generate_dataset(d, sigma_obs, seed)
+    gt = ground_truth(d, data["d1"])
+    sp = split_data(data)
+    print(f"    gt density={gt.mean():.3f}  d1={data['d1']} d2={data['d2']}")
+    validate_alignment_metric(data, sp, gt, seed)
 
     rows = []
+    for arm in ARMS:
+        tr = train_arm(arm, data, sp, seed, verbose_every=max(1, MAX_ITER // 4))
+        f_map = embed(tr["model"], sp["xs"], sp["idx_map"])
+        A_z2e, _, r2 = fit_linear_maps(f_map, data["z"][sp["idx_map"]])
+        jf, jfinv_lib = library_jacobian(tr["model"], sp["xs"], sp["idx_attr"],
+                                          d + OUT_EXTRA)
+        jf = jf.astype(np.float64)
+        Q = truncated_pinv(jf, PINV_DROP)
+        M_inv = aggregate_map(align_to_latents(Q, A_z2e))
+        res = binary_scores(M_inv, gt)
+        # the un-inverted "neuron gradient", for the paper's own comparison
+        res_fwd = {f"{k}_jf": v for k, v in
+                   binary_scores(aggregate_map(np.swapaxes(jf, 1, 2)), gt).items()}
+        xcheck = float("nan")
+        if jfinv_lib is not None:
+            try:
+                Ql = np.swapaxes(canonicalize_jf(jfinv_lib, d + OUT_EXTRA,
+                                                 "jfinv_lib"), 1, 2)
+                Ml = aggregate_map(align_to_latents(Ql.astype(np.float64), A_z2e))
+                xcheck = float(np.corrcoef(Ml.ravel(), M_inv.ravel())[0, 1])
+            except Exception as exc:
+                print(f"    [attr] library jf-inv cross-check skipped: {exc}")
+        sing = np.linalg.svd(jf, compute_uv=False)
+        row = dict(arm=arm, scheme=ARMS[arm]["scheme"], lam=ARMS[arm]["lam"],
+                   seed=seed, d=d, sigma_obs=sigma_obs,
+                   r2_mean=float(r2.mean()), r2_min=float(r2.min()),
+                   final_nce=tr["final_nce"], final_jfro=tr["final_jfro"],
+                   temperature=tr["temperature"], seconds=tr["seconds"],
+                   n_steps=tr["n_steps"],
+                   sv_ratio=float(np.median(sing[:, -1] / (sing[:, 0] + 1e-30))),
+                   libinv_corr=xcheck, **res, **res_fwd)
+        rows.append(row)
+        print(f"    [{arm:10s}] auROC={row['auroc_global']:.4f} "
+              f"auPRC={row['auprc_global']:.4f} "
+              f"(jf-only={row['auroc_global_jf']:.4f}) "
+              f"R2={row['r2_mean']:.4f} steps={row['n_steps']} "
+              f"{row['seconds']:.0f}s")
 
-    for metric in metrics:
-        piv = results_df.pivot_table(
-            index=["data_seed", "train_seed"],
-            columns="model",
-            values=metric,
-            aggfunc="first",
-        )
+    r2s = [r["r2_mean"] for r in rows]
+    ok = min(r2s) >= R2_MIN and (max(r2s) - min(r2s)) <= R2_PARITY_MAX
+    if not ok:
+        print(f"    !! seed EXCLUDED: R2 range [{min(r2s):.3f}, {max(r2s):.3f}] "
+              f"violates R2_MIN={R2_MIN} / parity={R2_PARITY_MAX}.  Comparing "
+              f"attribution across arms of unequal representation quality "
+              f"measures representation quality, not attribution.")
+    for r in rows:
+        r["included"] = bool(ok)
+    return rows
 
-        if "CEBRA" not in piv.columns or "ACORN" not in piv.columns:
+
+# ------------------------------------------------------------------------------
+# 12. STATISTICS
+# ------------------------------------------------------------------------------
+
+def paired_stats(a, b, rng) -> dict:
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    n = min(len(a), len(b))
+    a, b = a[:n], b[:n]
+    m = np.isfinite(a) & np.isfinite(b)
+    dif = a[m] - b[m]
+    n = len(dif)
+    out = dict(n=n, mean_diff=float(dif.mean()) if n else float("nan"),
+               n_wins=int((dif > 0).sum()))
+    if n < 2:
+        out.update(p=float("nan"), ci_lo=float("nan"), ci_hi=float("nan"),
+                   test="n/a")
+        return out
+    if HAVE_SCIPY and np.any(dif != 0):
+        out["p"], out["test"] = float(_sps.wilcoxon(dif).pvalue), "wilcoxon"
+    else:
+        nz, k = int((dif != 0).sum()), int((dif > 0).sum())
+        out["p"] = float(_sps.binomtest(k, nz, 0.5).pvalue) if (
+            HAVE_SCIPY and nz) else float("nan")
+        out["test"] = "sign"
+    boot = np.array([rng.choice(dif, size=n, replace=True).mean()
+                     for _ in range(N_BOOTSTRAP)])
+    out["ci_lo"], out["ci_hi"] = [float(v) for v in np.percentile(boot, [2.5, 97.5])]
+    return out
+
+
+def report(rows: List[dict]):
+    rng = np.random.default_rng(0)
+    inc = [r for r in rows if r["included"]]
+    n_arms = max(1, len(ARMS))
+    print("\n" + "=" * 78)
+    print(f" RESULTS  included seeds: {len(inc)//n_arms} of {len(rows)//n_arms}")
+    print(f" pre-registered primary metric     : {PRIMARY_METRIC}")
+    print(f" pre-registered primary comparison : "
+          f"{PRIMARY_COMPARISON[0]} vs {PRIMARY_COMPARISON[1]} (compute matched)")
+    print("=" * 78)
+
+    print(f"\n{'arm':<12}{'steps':>7}{'auROC':>19}{'auPRC':>19}{'R2':>9}"
+          f"{'|J|_F^2':>11}")
+    for arm in ARMS:
+        sel = [r for r in inc if r["arm"] == arm]
+        if not sel:
+            print(f"{arm:<12}{'--':>7}")
             continue
+        v = np.array([r[PRIMARY_METRIC] for r in sel])
+        p = np.array([r["auprc_global"] for r in sel])
+        q = np.array([r["r2_mean"] for r in sel])
+        j = np.array([r["final_jfro"] for r in sel])
+        sd = lambda t: t.std(ddof=1) if len(t) > 1 else 0.0
+        print(f"{arm:<12}{sel[0]['n_steps']:>7}"
+              f"{v.mean():>11.4f} +-{sd(v):.4f}"
+              f"{p.mean():>11.4f} +-{sd(p):.4f}"
+              f"{q.mean():>9.4f}{j.mean():>11.3f}")
 
-        piv = piv.dropna(
-            subset=["CEBRA", "ACORN"]
-        )
+    def get(arm):
+        return np.array([r[PRIMARY_METRIC] for r in
+                         sorted([x for x in inc if x["arm"] == arm],
+                                key=lambda z: (z["d"], z["sigma_obs"], z["seed"]))])
 
-        if len(piv) == 0:
+    print("\npaired comparisons on", PRIMARY_METRIC)
+    for tag, (x, y) in ([("PRIMARY", PRIMARY_COMPARISON)] +
+                        [("secondary", c) for c in SECONDARY_COMPARISONS]):
+        if x not in ARMS or y not in ARMS:
             continue
+        s = paired_stats(get(x), get(y), rng)
+        print(f"  [{tag:9s}] {x:>11s} - {y:<11s} diff={s['mean_diff']:+.4f} "
+              f"95%CI[{s['ci_lo']:+.4f},{s['ci_hi']:+.4f}] p={s['p']:.4g} "
+              f"({s['test']}) wins {s['n_wins']}/{s['n']}")
 
-        diff = (
-            piv["ACORN"].to_numpy()
-            - piv["CEBRA"].to_numpy()
-        )
+    print("""
+How to read this
+  cebra_2x - cebra        the size of the doubled-update confound alone.  If
+                          this is large, every previously reported acorn-vs-
+                          cebra number was partly measuring optimisation
+                          budget, not adversarial training.
+  xcebra - cebra          the paper's own claim, reproduced on your data.  If
+                          this is not positive, something upstream is wrong
+                          and the rest of the table is uninterpretable.
+  acorn - cebra_2x        PRIMARY.  Positive => PGD itself buys identifiable
+                          attribution.  First-order, linf adversarial training
+                          penalises eps*||grad_x L||_1, the dual-norm analogue
+                          of the paper's Frobenius penalty, so this is the
+                          mechanistically expected direction.
+  acorn - xcebra_2x       does the implicit penalty match the explicit one?
+  acorn_xreg - acorn      do the two mechanisms stack, or are they redundant?
 
-        rows.append({
-            "metric": metric,
-            "n_pairs": len(diff),
-            "CEBRA_mean": float(piv["CEBRA"].mean()),
-            "CEBRA_std": float(piv["CEBRA"].std(ddof=1)) if len(piv) > 1 else 0.0,
-            "ACORN_mean": float(piv["ACORN"].mean()),
-            "ACORN_std": float(piv["ACORN"].std(ddof=1)) if len(piv) > 1 else 0.0,
-            "ACORN_minus_CEBRA_mean": float(diff.mean()),
-            "ACORN_minus_CEBRA_std": float(diff.std(ddof=1)) if len(diff) > 1 else 0.0,
-            "ACORN_better_fraction": float((diff > 0).mean()),
-        })
+Secondary p-values are uncorrected for multiplicity; only the PRIMARY line
+supports a confirmatory claim.""")
 
-    return pd.DataFrame(rows)
+    if rows:
+        keys = list(rows[0].keys())
+        with open(RESULT_CSV, "w") as fh:
+            fh.write(",".join(keys) + "\n")
+            for r in rows:
+                fh.write(",".join(str(r.get(k, "")) for k in keys) + "\n")
+        print(f"\nwrote {RESULT_CSV}  ({len(rows)} rows)")
 
 
-# ============================================================
-# 15) Main
-# ============================================================
+# ------------------------------------------------------------------------------
+# 13. MAIN
+# ------------------------------------------------------------------------------
+
 def main():
-    print("\n" + "#" * 100)
-    print("STABLE SYNTHETIC CEBRA / PGD BENCHMARK")
-    print("#" * 100)
-    print("Experiment mode:", EXPERIMENT_MODE)
-    print("Data seeds:", DATA_SEEDS)
-    print("Training seeds:", TRAIN_SEEDS)
-    print("Device:", device)
-    print(
-        f"PGD: eps={ADV_EPSILON}, alpha={ADV_ALPHA}, "
-        f"steps={ADV_STEPS}, norm={ATTACK_NORM}"
-    )
+    _banner()
+    rows: List[dict] = []
+    for d in D_LATENT_LIST:
+        for sigma_obs in SIGMA_OBS_SWEEP:
+            for i in range(N_SEEDS):
+                rows.extend(run_seed(d, sigma_obs, i))
+    report(rows)
 
-    config_to_save = {
-        "experiment_mode": EXPERIMENT_MODE,
-        "data_seeds": DATA_SEEDS,
-        "train_seeds": TRAIN_SEEDS,
-        "T": T,
-        "D1": D1,
-        "D2": D2,
-        "N1": N1,
-        "N2": N2,
-        "brownian_sigma": BROWNIAN_SIGMA,
-        "mix_gain": MIX_GAIN,
-        "batch_size": BATCH_SIZE,
-        "max_iterations": MAX_ITER,
-        "model_architecture": MODEL_ARCHITECTURE,
-        "temperature": TEMPERATURE,
-        "num_hidden_units": NUM_HIDDEN_UNITS,
-        "adv_epsilon": ADV_EPSILON,
-        "adv_alpha": ADV_ALPHA,
-        "adv_steps": ADV_STEPS,
-        "attack_norm": ATTACK_NORM,
-        "attr_points": ATTR_POINTS,
-    }
-
-    with open(
-        ROOT_DIR / "experiment_config.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            config_to_save,
-            f,
-            indent=2,
-        )
-
-    all_rows = []
-
-    for data_seed in DATA_SEEDS:
-        print("\n" + "#" * 100)
-        print(f"GENERATING DATASET | data_seed={data_seed}")
-        print("#" * 100)
-
-        # ----------------------------------------------------
-        # Generate data ONCE for this data seed.
-        # ----------------------------------------------------
-        set_all_seeds(data_seed)
-
-        data = generate_synthetic_data(
-            data_seed=data_seed
-        )
-
-        split = split_and_standardize(
-            x_raw=data["x_raw"],
-            latent=data["latent"],
-        )
-
-        gt_bool = data["gt_bool"]
-
-        # ----------------------------------------------------
-        # Verify the ground-truth generator Jacobian.
-        # ----------------------------------------------------
-        oracle_map = compute_oracle_generator_map(
-            latent_np=data["latent"],
-            g1=data["g1"],
-            g2=data["g2"],
-            feature_sd=split["sd"],
-            n_points=128,
-        )
-
-        oracle_auroc, oracle_auprc = compute_binary_scores(
-            oracle_map,
-            gt_bool,
-        )
-
-        print(
-            f"Oracle generator map | "
-            f"AUROC={oracle_auroc:.6f} | "
-            f"AUPRC={oracle_auprc:.6f}"
-        )
-
-        if oracle_auroc < 0.999:
-            print(
-                "WARNING: Oracle AUROC is below 0.999. "
-                "Inspect the mixing function before interpreting CEBRA results."
-            )
-
-        save_heatmap(
-            gt_bool.astype(np.float32),
-            IMG_DIR / f"dseed{data_seed}_GT.png",
-            f"Ground truth | data_seed={data_seed}",
-        )
-
-        save_heatmap(
-            oracle_map,
-            IMG_DIR / f"dseed{data_seed}_ORACLE_JG.png",
-            f"Oracle |J_g| | data_seed={data_seed}",
-        )
-
-        np.savez_compressed(
-            DATA_DIR / f"synthetic_dseed{data_seed}.npz",
-            x_raw=data["x_raw"],
-            latent=data["latent"],
-            train_x=split["train_x"],
-            test_x=split["test_x"],
-            train_latent=split["train_latent"],
-            test_latent=split["test_latent"],
-            mean=split["mu"],
-            std=split["sd"],
-            gt=gt_bool.astype(np.uint8),
-            oracle_map=oracle_map.astype(np.float32),
-            oracle_auroc=np.array(
-                [oracle_auroc],
-                dtype=np.float32,
-            ),
-            oracle_auprc=np.array(
-                [oracle_auprc],
-                dtype=np.float32,
-            ),
-        )
-
-        # ----------------------------------------------------
-        # Train clean / adversarial on EXACTLY THE SAME DATA.
-        # ----------------------------------------------------
-        for train_seed in TRAIN_SEEDS:
-            for adversarial in [False, True]:
-                cleanup_cuda()
-
-                row = train_and_score_one_run(
-                    data_seed=data_seed,
-                    train_seed=train_seed,
-                    train_x=split["train_x"],
-                    train_latent=split["train_latent"],
-                    test_x=split["test_x"],
-                    test_latent=split["test_latent"],
-                    gt_bool=gt_bool,
-                    adversarial=adversarial,
-                )
-
-                row["oracle_auroc"] = oracle_auroc
-                row["oracle_auprc"] = oracle_auprc
-
-                all_rows.append(row)
-
-                # Save incrementally so a long run can be resumed/analyzed
-                # even if a later seed fails.
-                pd.DataFrame(all_rows).to_csv(
-                    OUT_DIR / "results_detailed_partial.csv",
-                    index=False,
-                )
-
-        cleanup_cuda(
-            data["g1"],
-            data["g2"],
-        )
-
-    # ========================================================
-    # Final result tables
-    # ========================================================
-    results_df = pd.DataFrame(all_rows)
-
-    detailed_path = OUT_DIR / "results_detailed.csv"
-    results_df.to_csv(
-        detailed_path,
-        index=False,
-    )
-
-    summary_df = (
-        results_df
-        .groupby(
-            ["model", "training_mode"],
-            as_index=False,
-        )
-        .agg(
-            n_runs=("train_seed", "count"),
-
-            latent_r2_mean=("latent_r2", "mean"),
-            latent_r2_std=("latent_r2", "std"),
-
-            auroc_jf_mean=("auroc_jf", "mean"),
-            auroc_jf_std=("auroc_jf", "std"),
-
-            auprc_jf_mean=("auprc_jf", "mean"),
-            auprc_jf_std=("auprc_jf", "std"),
-
-            auroc_jfinv_mean=("auroc_jfinv", "mean"),
-            auroc_jfinv_std=("auroc_jfinv", "std"),
-
-            auprc_jfinv_mean=("auprc_jfinv", "mean"),
-            auprc_jfinv_std=("auprc_jfinv", "std"),
-        )
-    )
-
-    summary_path = OUT_DIR / "results_summary.csv"
-    summary_df.to_csv(
-        summary_path,
-        index=False,
-    )
-
-    paired_df = make_paired_summary(
-        results_df
-    )
-
-    paired_path = OUT_DIR / "results_paired_comparison.csv"
-    paired_df.to_csv(
-        paired_path,
-        index=False,
-    )
-
-    print("\n" + "=" * 120)
-    print("SUMMARY")
-    print("=" * 120)
-    print(summary_df.to_string(index=False))
-
-    print("\n" + "=" * 120)
-    print("PAIRED ACORN - CEBRA")
-    print("=" * 120)
-    print(paired_df.to_string(index=False))
-
-    print("\nSaved:")
-    print("  ", detailed_path)
-    print("  ", summary_path)
-    print("  ", paired_path)
-
-    print("\nDONE.")
 
 if __name__ == "__main__":
     main()
