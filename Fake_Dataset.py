@@ -249,19 +249,44 @@ except Exception:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# def _load_cebra():
+#     try:
+#         import cebra
+#         import cebra.models
+#         import cebra.models.criterions as _crit
+#     except Exception as exc:
+#         raise SystemExit("cannot import cebra -- run from an environment where "
+#                          f"your fork is on sys.path.  error: {exc}")
+#     return cebra, _crit
+
+
 def _load_cebra():
+    import sys
+    from pathlib import Path
+
+    cebra_dir = Path(__file__).resolve().parent / "CEBRA-original"
+
+    for module_name in list(sys.modules):
+        if module_name == "cebra" or module_name.startswith("cebra."):
+            del sys.modules[module_name]
+
+    sys.path.insert(0, str(cebra_dir))
+
     try:
         import cebra
         import cebra.models
         import cebra.models.criterions as _crit
     except Exception as exc:
-        raise SystemExit("cannot import cebra -- run from an environment where "
-                         f"your fork is on sys.path.  error: {exc}")
+        raise SystemExit(
+            f"cannot import ORIGINAL CEBRA from {cebra_dir}. error: {exc}"
+        )
+
+    print("CEBRA loaded from:", cebra.__file__)
+
     return cebra, _crit
 
 
 CEBRA, CRIT = _load_cebra()
-
 
 def _banner():
     print("=" * 78)
