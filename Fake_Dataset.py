@@ -13,7 +13,7 @@ import numpy as np
 # 1. CONFIG
 # ==============================================================================
 
-DRY_RUN = True                 # <<< smoke test.  Set False for real runs.
+DRY_RUN = False                # <<< smoke test.  Set False for real runs.
 STAGE   = "both"               # "select" | "evaluate" | "both"
 
 # where the ORIGINAL (unmodified) CEBRA lives.  We deliberately use clean CEBRA
