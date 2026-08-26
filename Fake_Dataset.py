@@ -81,7 +81,7 @@ import numpy as np
 # 1. CONFIG
 # ------------------------------------------------------------------------------
 
-DRY_RUN = True                # <<< set False for the real run
+DRY_RUN = False                # <<< set False for the real run
 EXPERIMENT_SCALE = "pilot"    # "dry" | "pilot" | "paper_final" | "paper_table1"
 
 # --- architecture -------------------------------------------------------------
