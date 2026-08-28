@@ -107,7 +107,10 @@ def get_active_block():
     print("\n" + "=" * 80)
     print("FINDING ACTIVE NATURAL-IMAGE BLOCK")
     print("=" * 80)
-    table = "intervals/Natural_Images_Lum_Matched_set_ophys_H_2019_presentations"
+    table = (
+        "intervals/"
+        "Natural_Images_Lum_Matched_set_ophys_G_2019_presentations"
+    )
     with h5py.File(NWB_PATH, "r") as f:
         g = f[table]
         active = np.asarray(g["active"][:]).astype(bool)
