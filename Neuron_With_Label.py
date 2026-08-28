@@ -11,19 +11,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-
 from utils.constants import CEBRA_DIR
 from utils.min_distance import min_l2_distance
 
 for module_name in list(sys.modules):
     if module_name == "cebra" or module_name.startswith("cebra."):
         del sys.modules[module_name]
-
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 import cebra.attribution
 from cebra import CEBRA
-
 print("\nUsing CEBRA from:")
 print(cebra.__file__)
 
@@ -35,15 +32,12 @@ os.makedirs(OUT, exist_ok=True)
 
 BIN_MS = 50.0
 BIN_SEC = BIN_MS / 1000.0
-
 SMOOTH_SD_MS = 100.0
 SMOOTH_SIGMA_BINS = SMOOTH_SD_MS / BIN_MS
 SMOOTH_KERNEL_SIZE = 17
-
 PRESENCE_RATIO_MIN = 0.90
 ISI_VIOLATIONS_MAX = 0.50
 AMPLITUDE_CUTOFF_MAX = 0.10
-
 SEED = 42
 LATENT_DIM = 128
 NUM_HIDDEN_UNITS = 128
@@ -55,12 +49,10 @@ MODEL_ARCH = "offset36-model-more-dropout"
 DEVICE = "cuda_if_available"
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
-
 ATTR_N_CHUNKS = 16
 ATTR_CHUNK_LEN = 128
 ATTR_BATCH_SIZE = 16
-
-TOP_K_ACORN = 20
+TOP_K_PRINT = 20
 
 def seed_all(seed):
     random.seed(seed)
@@ -68,7 +60,6 @@ def seed_all(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
 seed_all(SEED)
 
 class GaussianSmoothing(nn.Module):
@@ -371,25 +362,69 @@ def train_and_attribute(X, adversarial=False, adv_epsilon=0.0):
     jf, jfinv = compute_attribution(model, X, model_name)
     return jf, jfinv, model
 
-def print_top_acorn_neurons(acorn_jf, top_k=20):
-    print("\n" + "=" * 90)
-    print(f"TOP-{top_k} ACORN NEURONS BY FORWARD JACOBIAN SCORE")
-    print("=" * 90)
-    if acorn_jf.ndim != 2:
-        raise RuntimeError(f"Expected ACORN JF to be 2D, got shape {acorn_jf.shape}")
-    if acorn_jf.shape[0] != LATENT_DIM:
-        raise RuntimeError(f"Expected first dimension to be latent={LATENT_DIM}, got {acorn_jf.shape}")
-    neuron_scores = np.mean(acorn_jf, axis=0)
-    top_k = min(top_k, len(neuron_scores))
-    top_indices = np.argsort(neuron_scores)[::-1][:top_k]
+def save_neuron_scores(clean_jf, acorn_jf):
+    print("\n" + "=" * 100)
+    print("CALCULATING ALL CLEAN + ACORN NEURON SCORES")
+    print("=" * 100)
+    clean_scores = np.mean(clean_jf, axis=0)
+    acorn_scores = np.mean(acorn_jf, axis=0)
+    n_neurons = clean_scores.shape[0]
+    assert acorn_scores.shape[0] == n_neurons
+    clean_order = np.argsort(clean_scores)[::-1]
+    acorn_order = np.argsort(acorn_scores)[::-1]
+    clean_rank = np.empty(n_neurons, dtype=np.int64)
+    acorn_rank = np.empty(n_neurons, dtype=np.int64)
+    clean_rank[clean_order] = np.arange(1, n_neurons + 1)
+    acorn_rank[acorn_order] = np.arange(1, n_neurons + 1)
+    df = pd.DataFrame({
+        "neuron_index": np.arange(n_neurons, dtype=np.int64),
+        "clean_jf_score": clean_scores.astype(np.float64),
+        "acorn_jf_score": acorn_scores.astype(np.float64),
+        "clean_rank": clean_rank,
+        "acorn_rank": acorn_rank,
+    })
+    csv_path = os.path.join(OUT, f"Neuron_Jacobian_Scores_{SESSION_ID}.csv")
+    df.to_csv(csv_path, index=False, float_format="%.12e")
+    print("\nSaved all neuron scores:")
+    print(csv_path)
+    print("\nCSV shape:", df.shape)
+    print("Expected rows:", n_neurons)
+
+    print("\n" + "=" * 80)
+    print(f"TOP-{TOP_K_PRINT} CLEAN NEURONS")
+    print("=" * 80)
+    print("\nRank   Neuron index   CLEAN JF score")
+    print("-" * 55)
+    for rank in range(min(TOP_K_PRINT, n_neurons)):
+        idx = clean_order[rank]
+        print(f"{rank + 1:>4d}   {idx:>12d}   {clean_scores[idx]:.12f}")
+
+    print("\n" + "=" * 80)
+    print(f"TOP-{TOP_K_PRINT} ACORN NEURONS")
+    print("=" * 80)
     print("\nRank   Neuron index   ACORN JF score")
-    print("-" * 50)
-    for rank, idx in enumerate(top_indices, start=1):
-        print(f"{rank:>4d}   {idx:>12d}   {neuron_scores[idx]:.12f}")
-    print("-" * 50)
-    print("\nZERO-BASED TOP INDICES:")
-    print(top_indices.tolist())
-    return top_indices, neuron_scores[top_indices]
+    print("-" * 55)
+    for rank in range(min(TOP_K_PRINT, n_neurons)):
+        idx = acorn_order[rank]
+        print(f"{rank + 1:>4d}   {idx:>12d}   {acorn_scores[idx]:.12f}")
+
+    print("\nZERO-BASED CLEAN TOP-20:")
+    print(clean_order[:TOP_K_PRINT].tolist())
+    print("\nZERO-BASED ACORN TOP-20:")
+    print(acorn_order[:TOP_K_PRINT].tolist())
+
+    print("\n" + "=" * 80)
+    print("SCORE SUMMARY")
+    print("=" * 80)
+    print("\nCLEAN:")
+    print("min :", float(clean_scores.min()))
+    print("mean:", float(clean_scores.mean()))
+    print("max :", float(clean_scores.max()))
+    print("\nACORN:")
+    print("min :", float(acorn_scores.min()))
+    print("mean:", float(acorn_scores.mean()))
+    print("max :", float(acorn_scores.max()))
+    return df
 
 def save_forward_plot(clean_jf, acorn_jf):
     vmax = max(float(np.nanmax(clean_jf)), float(np.nanmax(acorn_jf)))
@@ -453,7 +488,6 @@ def main():
 
     train_x_np = X_smooth.astype(np.float32, copy=False)
     n_time, n_units = train_x_np.shape
-
     print("\n" + "=" * 80)
     print("FINAL MODEL INPUT")
     print("=" * 80)
@@ -487,22 +521,22 @@ def main():
     print("ACORN JF:", acorn_jf.shape)
     print("CLEAN JFINV:", clean_inv.shape)
     print("ACORN JFINV:", acorn_inv.shape)
-
     assert clean_jf.shape == (LATENT_DIM, n_units)
     assert acorn_jf.shape == (LATENT_DIM, n_units)
     assert clean_inv.shape == (n_units, LATENT_DIM)
     assert acorn_inv.shape == (n_units, LATENT_DIM)
 
-    print_top_acorn_neurons(acorn_jf, top_k=TOP_K_ACORN)
+    score_df = save_neuron_scores(clean_jf, acorn_jf)
     save_forward_plot(clean_jf, acorn_jf)
     save_inverse_plot(clean_inv, acorn_inv)
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("DONE")
-    print("=" * 80)
-    print("\nONLY TWO FILES SAVED:")
+    print("=" * 100)
+    print("\nFILES SAVED:")
     print(os.path.join(OUT, "JF_CLEAN_vs_ACORN.png"))
     print(os.path.join(OUT, "JFINV_CLEAN_vs_ACORN.png"))
+    print(os.path.join(OUT, f"Neuron_Jacobian_Scores_{SESSION_ID}.csv"))
 
 if __name__ == "__main__":
     main()
