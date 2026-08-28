@@ -24,7 +24,7 @@ from cebra import CEBRA
 print("\nUsing CEBRA from:")
 print(cebra.__file__)
 
-SESSION_ID = 1119946360
+SESSION_ID = 1104058216 #1119946360
 NWB_PATH = f"data/AllenVBN/ecephys_sessions/ecephys_session_{SESSION_ID}.nwb"
 UNITS_CSV = "data/units.csv"
 OUT = f"AllenVBN_Jacobian_Plots_{SESSION_ID}"
