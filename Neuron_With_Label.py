@@ -11,20 +11,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+
 from utils.constants import CEBRA_DIR
 from utils.min_distance import min_l2_distance
 
 for module_name in list(sys.modules):
     if module_name == "cebra" or module_name.startswith("cebra."):
         del sys.modules[module_name]
+
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 import cebra.attribution
 from cebra import CEBRA
+
 print("\nUsing CEBRA from:")
 print(cebra.__file__)
 
-SESSION_ID = 1104058216 #1119946360
+SESSION_ID = 1104058216
 NWB_PATH = f"data/AllenVBN/ecephys_sessions/ecephys_session_{SESSION_ID}.nwb"
 UNITS_CSV = "data/units.csv"
 OUT = f"AllenVBN_Jacobian_Plots_{SESSION_ID}"
@@ -32,12 +35,15 @@ os.makedirs(OUT, exist_ok=True)
 
 BIN_MS = 50.0
 BIN_SEC = BIN_MS / 1000.0
+
 SMOOTH_SD_MS = 100.0
 SMOOTH_SIGMA_BINS = SMOOTH_SD_MS / BIN_MS
 SMOOTH_KERNEL_SIZE = 17
+
 PRESENCE_RATIO_MIN = 0.90
 ISI_VIOLATIONS_MAX = 0.50
 AMPLITUDE_CUTOFF_MAX = 0.10
+
 SEED = 42
 LATENT_DIM = 128
 NUM_HIDDEN_UNITS = 128
@@ -49,9 +55,12 @@ MODEL_ARCH = "offset36-model-more-dropout"
 DEVICE = "cuda_if_available"
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
+
 ATTR_N_CHUNKS = 16
 ATTR_CHUNK_LEN = 128
 ATTR_BATCH_SIZE = 16
+
+TOP_K_ACORN = 20
 
 def seed_all(seed):
     random.seed(seed)
@@ -59,6 +68,7 @@ def seed_all(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
 seed_all(SEED)
 
 class GaussianSmoothing(nn.Module):
@@ -99,7 +109,11 @@ def load_qc_metadata():
     units = pd.read_csv(UNITS_CSV)
     session_units = units[units["ecephys_session_id"] == SESSION_ID].copy()
     print("Total units:", len(session_units))
-    qc = session_units[(session_units["presence_ratio"] >= PRESENCE_RATIO_MIN) & (session_units["isi_violations"] <= ISI_VIOLATIONS_MAX) & (session_units["amplitude_cutoff"] <= AMPLITUDE_CUTOFF_MAX)].copy()
+    qc = session_units[
+        (session_units["presence_ratio"] >= PRESENCE_RATIO_MIN) &
+        (session_units["isi_violations"] <= ISI_VIOLATIONS_MAX) &
+        (session_units["amplitude_cutoff"] <= AMPLITUDE_CUTOFF_MAX)
+    ].copy()
     print("QC-pass units:", len(qc))
     return qc
 
@@ -107,10 +121,7 @@ def get_active_block():
     print("\n" + "=" * 80)
     print("FINDING ACTIVE NATURAL-IMAGE BLOCK")
     print("=" * 80)
-    table = (
-        "intervals/"
-        "Natural_Images_Lum_Matched_set_ophys_G_2019_presentations"
-    )
+    table = "intervals/Natural_Images_Lum_Matched_set_ophys_G_2019_presentations"
     with h5py.File(NWB_PATH, "r") as f:
         g = f[table]
         active = np.asarray(g["active"][:]).astype(bool)
@@ -360,6 +371,26 @@ def train_and_attribute(X, adversarial=False, adv_epsilon=0.0):
     jf, jfinv = compute_attribution(model, X, model_name)
     return jf, jfinv, model
 
+def print_top_acorn_neurons(acorn_jf, top_k=20):
+    print("\n" + "=" * 90)
+    print(f"TOP-{top_k} ACORN NEURONS BY FORWARD JACOBIAN SCORE")
+    print("=" * 90)
+    if acorn_jf.ndim != 2:
+        raise RuntimeError(f"Expected ACORN JF to be 2D, got shape {acorn_jf.shape}")
+    if acorn_jf.shape[0] != LATENT_DIM:
+        raise RuntimeError(f"Expected first dimension to be latent={LATENT_DIM}, got {acorn_jf.shape}")
+    neuron_scores = np.mean(acorn_jf, axis=0)
+    top_k = min(top_k, len(neuron_scores))
+    top_indices = np.argsort(neuron_scores)[::-1][:top_k]
+    print("\nRank   Neuron index   ACORN JF score")
+    print("-" * 50)
+    for rank, idx in enumerate(top_indices, start=1):
+        print(f"{rank:>4d}   {idx:>12d}   {neuron_scores[idx]:.12f}")
+    print("-" * 50)
+    print("\nZERO-BASED TOP INDICES:")
+    print(top_indices.tolist())
+    return top_indices, neuron_scores[top_indices]
+
 def save_forward_plot(clean_jf, acorn_jf):
     vmax = max(float(np.nanmax(clean_jf)), float(np.nanmax(acorn_jf)))
     if not np.isfinite(vmax) or vmax <= 0:
@@ -412,14 +443,17 @@ def main():
     print("Session:", SESSION_ID)
     print("Latent:", LATENT_DIM)
     print("Hidden:", NUM_HIDDEN_UNITS)
+
     qc_metadata = load_qc_metadata()
     t_start, t_stop = get_active_block()
     X_counts = build_spike_counts(qc_metadata, t_start, t_stop)
     X_smooth = smooth_spike_counts(X_counts)
     del X_counts
     gc.collect()
+
     train_x_np = X_smooth.astype(np.float32, copy=False)
     n_time, n_units = train_x_np.shape
+
     print("\n" + "=" * 80)
     print("FINAL MODEL INPUT")
     print("=" * 80)
@@ -431,17 +465,21 @@ def main():
     print("sigma:", SMOOTH_SIGMA_BINS, "bins")
     print("kernel:", SMOOTH_KERNEL_SIZE)
     print("\n*** NO NORMALIZATION ***")
+
     adv_epsilon = compute_adv_epsilon(train_x_np)
+
     clean_jf, clean_inv, clean_model = train_and_attribute(train_x_np, adversarial=False, adv_epsilon=0.0)
     del clean_model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
     acorn_jf, acorn_inv, acorn_model = train_and_attribute(train_x_np, adversarial=True, adv_epsilon=adv_epsilon)
     del acorn_model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
     print("\n" + "=" * 80)
     print("FINAL SHAPES")
     print("=" * 80)
@@ -449,12 +487,16 @@ def main():
     print("ACORN JF:", acorn_jf.shape)
     print("CLEAN JFINV:", clean_inv.shape)
     print("ACORN JFINV:", acorn_inv.shape)
+
     assert clean_jf.shape == (LATENT_DIM, n_units)
     assert acorn_jf.shape == (LATENT_DIM, n_units)
     assert clean_inv.shape == (n_units, LATENT_DIM)
     assert acorn_inv.shape == (n_units, LATENT_DIM)
+
+    print_top_acorn_neurons(acorn_jf, top_k=TOP_K_ACORN)
     save_forward_plot(clean_jf, acorn_jf)
     save_inverse_plot(clean_inv, acorn_inv)
+
     print("\n" + "=" * 80)
     print("DONE")
     print("=" * 80)
