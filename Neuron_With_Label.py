@@ -24,7 +24,7 @@ from cebra import CEBRA
 print("\nUsing CEBRA from:")
 print(cebra.__file__)
 
-SESSION_ID = 1104058216
+SESSION_ID = 1105543760
 NWB_PATH = f"data/AllenVBN/ecephys_sessions/ecephys_session_{SESSION_ID}.nwb"
 UNITS_CSV = "data/units.csv"
 OUT = f"AllenVBN_Jacobian_Plots_{SESSION_ID}"
@@ -108,26 +108,70 @@ def load_qc_metadata():
     print("QC-pass units:", len(qc))
     return qc
 
+# def get_active_block():
+#     print("\n" + "=" * 80)
+#     print("FINDING ACTIVE NATURAL-IMAGE BLOCK")
+#     print("=" * 80)
+#     table = "intervals/Natural_Images_Lum_Matched_set_ophys_G_2019_presentations"
+#     with h5py.File(NWB_PATH, "r") as f:
+#         g = f[table]
+#         active = np.asarray(g["active"][:]).astype(bool)
+#         stimulus_block = np.asarray(g["stimulus_block"][:])
+#         start_times = np.asarray(g["start_time"][:], dtype=np.float64)
+#         stop_times = np.asarray(g["stop_time"][:], dtype=np.float64)
+#         mask = active & (stimulus_block == 0)
+#         t_start = float(start_times[mask].min())
+#         t_stop = float(stop_times[mask].max())
+#         n_presentations = int(mask.sum())
+#     print("Active presentations:", n_presentations)
+#     print("Start:", t_start, "sec")
+#     print("Stop:", t_stop, "sec")
+#     print("Duration:", round((t_stop - t_start) / 60.0, 2), "minutes")
+#     return t_start, t_stop
 def get_active_block():
     print("\n" + "=" * 80)
     print("FINDING ACTIVE NATURAL-IMAGE BLOCK")
     print("=" * 80)
-    table = "intervals/Natural_Images_Lum_Matched_set_ophys_G_2019_presentations"
     with h5py.File(NWB_PATH, "r") as f:
-        g = f[table]
+        interval_names = list(f["intervals"].keys())
+        print("\nAvailable interval tables:")
+        for name in interval_names:
+            print(" ", name)
+        candidates = [name for name in interval_names if "Natural_Images" in name and "presentations" in name]
+        if len(candidates) == 0:
+            raise RuntimeError("No Natural Images presentation table found.\nAvailable tables: " + str(interval_names))
+        if len(candidates) > 1:
+            print("\nWARNING: multiple Natural Images tables found:")
+            for c in candidates:
+                print(" ", c)
+        table_name = candidates[0]
+        print("\nUsing table:")
+        print(table_name)
+        g = f["intervals"][table_name]
         active = np.asarray(g["active"][:]).astype(bool)
-        stimulus_block = np.asarray(g["stimulus_block"][:])
         start_times = np.asarray(g["start_time"][:], dtype=np.float64)
         stop_times = np.asarray(g["stop_time"][:], dtype=np.float64)
-        mask = active & (stimulus_block == 0)
+        mask = active.copy()
+        if "stimulus_block" in g:
+            stimulus_block = np.asarray(g["stimulus_block"][:])
+            print("\nActive stimulus blocks:")
+            blocks, counts = np.unique(stimulus_block[active], return_counts=True)
+            for block, count in zip(blocks, counts):
+                print(f"  block {block}: {count} presentations")
+            if np.any(active & (stimulus_block == 0)):
+                mask = active & (stimulus_block == 0)
+                print("\nUsing active stimulus_block == 0")
+        if mask.sum() == 0:
+            raise RuntimeError("No active Natural Images presentations found.")
         t_start = float(start_times[mask].min())
         t_stop = float(stop_times[mask].max())
         n_presentations = int(mask.sum())
-    print("Active presentations:", n_presentations)
+    print("\nActive presentations:", n_presentations)
     print("Start:", t_start, "sec")
     print("Stop:", t_stop, "sec")
     print("Duration:", round((t_stop - t_start) / 60.0, 2), "minutes")
     return t_start, t_stop
+
 
 def build_spike_counts(qc_metadata, t_start, t_stop):
     print("\n" + "=" * 80)
