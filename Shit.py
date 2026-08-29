@@ -3,89 +3,51 @@ import numpy as np
 from pathlib import Path
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 NWB_PATH = Path(
     "data/Area2_Bump/"
     "sub-Han_desc-train_behavior+ecephys.nwb"
 )
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def decode_value(x):
-    """Decode bytes/string-like NWB values for display."""
-    if isinstance(x, bytes):
-        return x.decode("utf-8", errors="replace")
-
-    if isinstance(x, np.bytes_):
-        return x.astype(str)
-
-    return x
-
-
-def get_timeseries_bin_ms(group):
+def get_rate_and_dt(group):
     """
-    Infer sampling/bin size of an NWB TimeSeries.
-
-    NWB usually stores:
-        starting_time.attrs['rate']
-
-    or explicit:
-        timestamps
+    Return (rate_hz, dt_ms) if sampling info exists.
     """
 
-    # --------------------------------------------------------
     # Explicit timestamps
-    # --------------------------------------------------------
     if "timestamps" in group:
+        ts = group["timestamps"]
 
-        timestamps = group["timestamps"]
+        if len(ts) >= 2:
+            n = min(1000, len(ts))
+            x = np.asarray(ts[:n], dtype=float)
 
-        if len(timestamps) >= 2:
-            # Don't load the whole timestamps array
-            n = min(len(timestamps), 1000)
-            ts = np.asarray(timestamps[:n], dtype=float)
-
-            dt = np.nanmedian(np.diff(ts))
+            dt = np.nanmedian(np.diff(x))
 
             if np.isfinite(dt) and dt > 0:
-                return dt * 1000.0
+                return 1.0 / dt, dt * 1000.0
 
-    # --------------------------------------------------------
-    # starting_time + rate
-    # --------------------------------------------------------
+    # NWB starting_time + rate
     if "starting_time" in group:
+        st = group["starting_time"]
 
-        starting_time = group["starting_time"]
-
-        if "rate" in starting_time.attrs:
-            rate = float(starting_time.attrs["rate"])
+        if "rate" in st.attrs:
+            rate = float(st.attrs["rate"])
 
             if rate > 0:
-                return 1000.0 / rate
+                return rate, 1000.0 / rate
 
-    # --------------------------------------------------------
-    # Occasionally rate may appear as an attribute elsewhere
-    # --------------------------------------------------------
-    if "rate" in group.attrs:
-        rate = float(group.attrs["rate"])
-
-        if rate > 0:
-            return 1000.0 / rate
-
-    return None
+    return None, None
 
 
-def find_data_groups(h5file):
+def inspect_timeseries(root, root_name):
     """
-    Find HDF5 groups that look like NWB TimeSeries:
-    group/data
+    Find groups containing a `data` dataset.
     """
+
+    print("\n" + "=" * 100)
+    print(root_name)
+    print("=" * 100)
 
     found = []
 
@@ -97,269 +59,242 @@ def find_data_groups(h5file):
         if "data" not in obj:
             return
 
-        data = obj["data"]
+        ds = obj["data"]
 
-        if not isinstance(data, h5py.Dataset):
+        if not isinstance(ds, h5py.Dataset):
             return
 
+        rate, dt_ms = get_rate_and_dt(obj)
+
+        full_path = f"{root.name}/{name}"
+
         found.append(
-            {
-                "path": name,
-                "shape": data.shape,
-                "dtype": str(data.dtype),
-                "bin_ms": get_timeseries_bin_ms(obj),
-            }
+            (
+                full_path,
+                ds.shape,
+                ds.dtype,
+                rate,
+                dt_ms,
+            )
         )
 
-    h5file.visititems(visitor)
+    root.visititems(visitor)
+
+    for path, shape, dtype, rate, dt_ms in found:
+
+        print("\nPATH:")
+        print(" ", path)
+
+        print(" shape :", shape)
+        print(" dtype :", dtype)
+
+        if rate is not None:
+            print(f" rate  : {rate:.6f} Hz")
+            print(f" dt    : {dt_ms:.6f} ms")
 
     return found
 
 
-def find_spikes_counts(h5file):
-    """
-    Locate NeuroTask spikes_counts TimeSeries.
-    """
-
-    candidates = []
-
-    def visitor(name, obj):
-
-        if not isinstance(obj, h5py.Group):
-            return
-
-        if name.split("/")[-1] != "spikes_counts":
-            return
-
-        if "data" not in obj:
-            return
-
-        candidates.append(name)
-
-    h5file.visititems(visitor)
-
-    if len(candidates) == 0:
-        raise RuntimeError(
-            "Could not find an NWB group named 'spikes_counts'."
-        )
-
-    print("\nspikes_counts candidates:")
-
-    for path in candidates:
-        print("  ", path)
-
-    # Prefer processing/spikes
-    for path in candidates:
-        if "processing/spikes" in path:
-            return path
-
-    return candidates[0]
-
-
-def print_sample(dataset, n=5):
-    """
-    Print a tiny sample without loading the complete dataset.
-    """
-
-    if dataset.ndim == 0:
-        try:
-            print("      sample:", decode_value(dataset[()]))
-        except Exception:
-            pass
-        return
-
-    if dataset.shape[0] == 0:
-        return
-
-    n = min(n, dataset.shape[0])
-
-    try:
-        arr = dataset[:n]
-
-        if arr.ndim == 1:
-            arr = [
-                decode_value(x)
-                for x in arr
-            ]
-
-        print("      sample:", arr)
-
-    except Exception as exc:
-        print("      sample could not be read:", exc)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
 print("=" * 100)
-print("AREA2_BUMP DIRECT NWB INSPECTION")
+print("AREA2_BUMP NWB INSPECTOR")
 print("=" * 100)
 
-print("\nFile:")
-print(NWB_PATH)
-
-if not NWB_PATH.exists():
-    raise FileNotFoundError(NWB_PATH)
-
+print("File:", NWB_PATH)
 print(
-    f"Size: {NWB_PATH.stat().st_size / 1024**3:.3f} GB"
+    "Size:",
+    f"{NWB_PATH.stat().st_size / 1024**3:.3f} GB"
 )
 
 
 with h5py.File(NWB_PATH, "r") as f:
 
     # ========================================================
-    # TOP LEVEL
+    # UNITS
     # ========================================================
 
     print("\n" + "=" * 100)
-    print("TOP-LEVEL NWB GROUPS")
+    print("UNITS / SPIKES")
     print("=" * 100)
 
-    for name in f.keys():
-        print(name)
+    if "units" not in f:
 
-    # ========================================================
-    # FIND SPIKES
-    # ========================================================
-
-    spikes_path = find_spikes_counts(f)
-    spikes_group = f[spikes_path]
-    spikes_ds = spikes_group["data"]
-
-    print("\n" + "=" * 100)
-    print("NEURAL DATA")
-    print("=" * 100)
-
-    print("path       :", spikes_path)
-    print("shape      :", spikes_ds.shape)
-    print("dtype      :", spikes_ds.dtype)
-
-    bin_ms = get_timeseries_bin_ms(
-        spikes_group
-    )
-
-    print("bin size   :", bin_ms, "ms")
-
-    if spikes_ds.ndim != 2:
-        raise RuntimeError(
-            f"Expected spikes_counts to be 2D, "
-            f"got shape {spikes_ds.shape}"
-        )
-
-    n_time = spikes_ds.shape[0]
-    n_neurons = spikes_ds.shape[1]
-
-    print("time bins  :", n_time)
-    print("neurons    :", n_neurons)
-
-    if bin_ms is not None:
-        duration_sec = (
-            n_time * bin_ms / 1000.0
-        )
-
-        print(
-            "duration   :",
-            f"{duration_sec:.2f} sec"
-        )
-
-        print(
-            "duration   :",
-            f"{duration_sec / 60:.2f} min"
-        )
-
-    # Tiny neural sample
-    sample_rows = min(5, n_time)
-    sample_neurons = min(10, n_neurons)
-
-    print(
-        f"\nFirst {sample_rows} bins × "
-        f"first {sample_neurons} neurons:"
-    )
-
-    print(
-        spikes_ds[
-            :sample_rows,
-            :sample_neurons
-        ]
-    )
-
-    # ========================================================
-    # FIND ALL TIMESERIES-LIKE DATA
-    # ========================================================
-
-    series = find_data_groups(f)
-
-    print("\n" + "=" * 100)
-    print("ALL DATA/TIMESERIES GROUPS")
-    print("=" * 100)
-
-    for item in series:
-
-        print(
-            f"{item['path']:70s} "
-            f"shape={str(item['shape']):20s} "
-            f"dtype={item['dtype']:12s} "
-            f"bin_ms={item['bin_ms']}"
-        )
-
-    # ========================================================
-    # FIND SIGNALS ALIGNED EXACTLY TO NEURAL TIMELINE
-    # ========================================================
-
-    aligned = []
-
-    for item in series:
-
-        path = item["path"]
-
-        if path == spikes_path:
-            continue
-
-        shape = item["shape"]
-
-        if len(shape) == 0:
-            continue
-
-        if shape[0] == n_time:
-            aligned.append(item)
-
-    print("\n" + "=" * 100)
-    print("SIGNALS ALIGNED WITH NEURAL TIMELINE")
-    print("=" * 100)
-
-    print(
-        "Number of aligned signals:",
-        len(aligned)
-    )
-
-    for item in aligned:
-
-        print("\n" + "-" * 100)
-
-        print("path :", item["path"])
-        print("shape:", item["shape"])
-        print("dtype:", item["dtype"])
-        print("bin  :", item["bin_ms"], "ms")
-
-        ds = f[item["path"]]["data"]
-
-        print_sample(ds, n=5)
-
-    # ========================================================
-    # INTERVAL TABLES / TRIALS
-    # ========================================================
-
-    print("\n" + "=" * 100)
-    print("INTERVALS / TRIAL TABLES")
-    print("=" * 100)
-
-    if "intervals" not in f:
-
-        print("No /intervals group found.")
+        print("No /units table found.")
 
     else:
+
+        units = f["units"]
+
+        print("\nColumns:")
+
+        for key in units.keys():
+
+            obj = units[key]
+
+            if isinstance(obj, h5py.Dataset):
+
+                print(
+                    f"{key:35s}",
+                    f"shape={str(obj.shape):20s}",
+                    f"dtype={obj.dtype}"
+                )
+
+        # ----------------------------------------------------
+        # Number of units
+        # ----------------------------------------------------
+
+        if "id" in units:
+
+            n_units = len(units["id"])
+
+            print("\nNumber of units:", n_units)
+
+            print(
+                "Unit IDs:",
+                units["id"][:min(20, n_units)]
+            )
+
+        # ----------------------------------------------------
+        # Standard NWB ragged spike times
+        # ----------------------------------------------------
+
+        if (
+            "spike_times" in units
+            and
+            "spike_times_index" in units
+        ):
+
+            spike_times = units["spike_times"]
+            spike_index = units["spike_times_index"][:]
+
+            print("\nSpike times found.")
+
+            print(
+                "Total spikes:",
+                len(spike_times)
+            )
+
+            print(
+                "spike_times shape:",
+                spike_times.shape
+            )
+
+            print(
+                "spike_times_index shape:",
+                spike_index.shape
+            )
+
+            # number of spikes per neuron
+            previous = 0
+            counts = []
+
+            first_spike = np.inf
+            last_spike = -np.inf
+
+            for end in spike_index:
+
+                end = int(end)
+
+                counts.append(
+                    end - previous
+                )
+
+                if end > previous:
+
+                    unit_spikes = spike_times[
+                        previous:end
+                    ]
+
+                    first_spike = min(
+                        first_spike,
+                        float(unit_spikes[0])
+                    )
+
+                    last_spike = max(
+                        last_spike,
+                        float(unit_spikes[-1])
+                    )
+
+                previous = end
+
+            counts = np.asarray(counts)
+
+            print(
+                "\nSpikes per unit:"
+            )
+
+            print(
+                " min   :",
+                counts.min()
+            )
+
+            print(
+                " mean  :",
+                counts.mean()
+            )
+
+            print(
+                " median:",
+                np.median(counts)
+            )
+
+            print(
+                " max   :",
+                counts.max()
+            )
+
+            print(
+                "\nSpike time range:"
+            )
+
+            print(
+                " first:",
+                first_spike,
+                "sec"
+            )
+
+            print(
+                " last :",
+                last_spike,
+                "sec"
+            )
+
+            print(
+                " duration:",
+                (last_spike - first_spike) / 60,
+                "min"
+            )
+
+    # ========================================================
+    # PROCESSING
+    # ========================================================
+
+    if "processing" in f:
+
+        processing_series = inspect_timeseries(
+            f["processing"],
+            "PROCESSING TIMESERIES"
+        )
+
+    # ========================================================
+    # ACQUISITION
+    # ========================================================
+
+    if "acquisition" in f:
+
+        acquisition_series = inspect_timeseries(
+            f["acquisition"],
+            "ACQUISITION TIMESERIES"
+        )
+
+    # ========================================================
+    # TRIAL / INTERVAL TABLES
+    # ========================================================
+
+    print("\n" + "=" * 100)
+    print("INTERVAL TABLES")
+    print("=" * 100)
+
+    if "intervals" in f:
 
         intervals = f["intervals"]
 
@@ -369,75 +304,34 @@ with h5py.File(NWB_PATH, "r") as f:
 
             print("\nTABLE:", table_name)
 
-            if isinstance(table, h5py.Group):
-
-                for col in table.keys():
-
-                    obj = table[col]
-
-                    if isinstance(
-                        obj,
-                        h5py.Dataset
-                    ):
-
-                        print(
-                            f"  {col:30s} "
-                            f"shape={str(obj.shape):15s} "
-                            f"dtype={obj.dtype}"
-                        )
-
-                # Trial count
-                if "id" in table:
-                    print(
-                        "  rows:",
-                        len(table["id"])
-                    )
-
-                elif "start_time" in table:
-                    print(
-                        "  rows:",
-                        len(table["start_time"])
-                    )
-
-    # ========================================================
-    # UNITS TABLE
-    # ========================================================
-
-    print("\n" + "=" * 100)
-    print("UNITS TABLE")
-    print("=" * 100)
-
-    if "units" in f:
-
-        units = f["units"]
-
-        if "id" in units:
-            print(
-                "units/id rows:",
-                len(units["id"])
-            )
-
-        print("columns:")
-
-        for col in units.keys():
-
-            obj = units[col]
-
-            if isinstance(
-                obj,
-                h5py.Dataset
-            ):
-
+            if "id" in table:
                 print(
-                    f"  {col:30s} "
-                    f"shape={str(obj.shape):20s} "
-                    f"dtype={obj.dtype}"
+                    "rows:",
+                    len(table["id"])
                 )
 
-    else:
-        print(
-            "No top-level /units table."
-        )
+            elif "start_time" in table:
+                print(
+                    "rows:",
+                    len(table["start_time"])
+                )
+
+            print("columns:")
+
+            for key in table.keys():
+
+                obj = table[key]
+
+                if isinstance(
+                    obj,
+                    h5py.Dataset
+                ):
+
+                    print(
+                        f"  {key:35s}"
+                        f" shape={str(obj.shape):20s}"
+                        f" dtype={obj.dtype}"
+                    )
 
 
 print("\n" + "=" * 100)
