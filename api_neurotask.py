@@ -1,11 +1,13 @@
 import pandas as pd
 import numpy as np
+
 try:
     import pyarrow.parquet as pq
 except ImportError:
-    pq = Nonefrom scipy.signal import decimate
-from sklearn.preprocessing import MinMaxScaler
+    pq = None
 
+from scipy.signal import decimate
+from sklearn.preprocessing import MinMaxScaler
 
 
 def load_and_filter_parquet(parquet_file_path, filter_letters=None):
