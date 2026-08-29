@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
-import pyarrow.parquet as pq
-from scipy.signal import decimate
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    pq = Nonefrom scipy.signal import decimate
 from sklearn.preprocessing import MinMaxScaler
 
 
