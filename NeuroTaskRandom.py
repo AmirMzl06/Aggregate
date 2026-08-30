@@ -364,7 +364,7 @@ def main():
     print("X_test :", X_test.shape)
     print("Y_test :", Y_test.shape)
     n_neurons = X_train.shape[1]
-    k = int(np.sqrt(n_neurons))
+    k = int(np.sqrt(n_neurons)) - 3
     k = max(1, min(k, n_neurons))
     print("\n" + "=" * 100)
     print("RANDOM BASELINE CONFIG")
