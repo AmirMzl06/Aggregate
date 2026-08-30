@@ -455,7 +455,7 @@ def train_full_model(X_train, adversarial=False):
 def get_topk(jf, jfinv, unit_ids, model_name):
     n_neurons = jf.shape[1]
     assert jfinv.shape[0] == n_neurons
-    k = int(np.sqrt(n_neurons)) + 7
+    k = int(np.sqrt(n_neurons)) - 3 
     k = max(k, 1)
     jf_scores = np.mean(jf, axis=0)
     jfinv_scores = np.mean(jfinv, axis=1)
