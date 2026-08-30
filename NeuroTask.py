@@ -228,6 +228,21 @@ def train_decoder(z_train_np, y_train_np, z_test_np, y_test_np, model_name):
         output_dim=2,
         dropout_rate=DECODER_DROPOUT,
     ).to(device)
+    print("\nChecking finite values...")
+    print("NaN z_train:", int(np.isnan(z_train_np).sum()))
+    print("NaN y_train:", int(np.isnan(y_train_np).sum()))
+    print("NaN z_test :", int(np.isnan(z_test_np).sum()))
+    print("NaN y_test :", int(np.isnan(y_test_np).sum()))
+    train_mask = np.isfinite(z_train_np).all(axis=1) & np.isfinite(y_train_np).all(axis=1)
+    test_mask = np.isfinite(z_test_np).all(axis=1) & np.isfinite(y_test_np).all(axis=1)
+    print("Decoder train bins before:", len(z_train_np))
+    print("Decoder train bins valid :", int(train_mask.sum()))
+    print("Decoder test bins before :", len(z_test_np))
+    print("Decoder test bins valid  :", int(test_mask.sum()))
+    z_train_np = z_train_np[train_mask]
+    y_train_np = y_train_np[train_mask]
+    z_test_np = z_test_np[test_mask]
+    y_test_np = y_test_np[test_mask]
     z_train = torch.from_numpy(z_train_np).float().to(device)
     y_train = torch.from_numpy(y_train_np).float().to(device)
     z_test = torch.from_numpy(z_test_np).float().to(device)
