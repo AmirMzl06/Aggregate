@@ -26,10 +26,10 @@ OUT = f"Perich_{DATASET_NAME}{DAY}_Jacobian"
 os.makedirs(OUT, exist_ok=True)
 
 SEED = 42
-LATENT_DIM = 128
-NUM_HIDDEN_UNITS = 128
+LATENT_DIM = 64
+NUM_HIDDEN_UNITS = 512
 BATCH_SIZE = 512
-MAX_ITER = 3000
+MAX_ITER = 5000
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
@@ -100,6 +100,7 @@ def compute_adv_epsilon(X):
     min_distance = float(min_l2_distance(x_tensor))
     adv_epsilon = min_distance / 2.0
     adv_epsilon = max(adv_epsilon, 1e-6)
+    adv_epsilon = 0.5
     adv_alpha = adv_epsilon / 5.0
     print("min L2 distance:", min_distance)
     print("epsilon:", adv_epsilon)
