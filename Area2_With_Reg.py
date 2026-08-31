@@ -809,7 +809,13 @@ def compute_full_attribution(solver, X_train, tag):
 
     for chunk_id, start in enumerate(starts, 1):
         chunk = X_train[start : start + ATTR_CHUNK_LEN].astype(np.float32, copy=False)
-        inp = torch.from_numpy(chunk).float().to(DEVICE)
+        inp = (
+            torch.from_numpy(chunk)
+            .float()
+            .to(DEVICE)
+            .detach()
+            .requires_grad_(True)
+        )
 
         method = cebra.attribution.init(
             name="jacobian-based-batched",
@@ -817,7 +823,10 @@ def compute_full_attribution(solver, X_train, tag):
             input_data=inp,
             output_dimension=LATENT_DIM,
         )
-        result = method.compute_attribution_map(batch_size=ATTR_BATCH_SIZE)
+        with torch.enable_grad():
+            result = method.compute_attribution_map(
+                batch_size=ATTR_BATCH_SIZE
+            )
 
         jf = _matrix_from_attr(result["jf"], n_neurons=n_neurons, inverse=False)
         inv_raw, inv_key = _get_inverse_from_result(result)
