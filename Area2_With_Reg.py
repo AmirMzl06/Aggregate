@@ -651,8 +651,25 @@ def train_representation(X_train, adversarial, name):
     # --------------------------------------------------------
     # ORIGINAL CEBRA TensorDataset + time-contrastive loader
     # --------------------------------------------------------
-    dataset = cebra.data.TensorDataset(torch.from_numpy(X_train).float())
-
+    neural_tensor = torch.from_numpy(X_train).float()
+    
+    # Low-level TensorDataset in original CEBRA requires at least one
+    # continuous/discrete index.
+    #
+    # IMPORTANT:
+    # This is ONLY a dummy chronological index required by TensorDataset.
+    # Since the loader below uses conditional="time", this index is NOT
+    # used as a behavioral label for positive-pair sampling.
+    time_index = torch.arange(
+        X_train.shape[0],
+        dtype=torch.float32
+    ).unsqueeze(1)
+    
+    dataset = cebra.data.TensorDataset(
+        neural=neural_tensor,
+        continuous=time_index,
+    )
+    
     model = cebra.models.init(
         name=MODEL_ARCH,
         num_neurons=dataset.input_dimension,
