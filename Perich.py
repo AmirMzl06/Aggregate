@@ -18,7 +18,7 @@ from cebra import CEBRA
 print("\nUsing CEBRA from:")
 print(cebra.__file__)
 
-PERICH_DATA_DIR = "/mnt/upmwmathis/scratch/hossein/mm_project/perich_data_valid_final_raw"
+PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 DATASET_NAME = "C-CO"
 DAY = 0
 NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{DATASET_NAME}{DAY}.npz")
