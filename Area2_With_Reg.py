@@ -24,7 +24,7 @@ from utils.min_distance import min_l2_distance
 # ============================================================
 # IMPORTANT: USE THE UNMODIFIED / ORIGINAL CEBRA FORK
 # ============================================================
-CEBRA_ORIGINAL_DIR = Path(CEBRA_DIR).resolve().parent / "CEBRA-Orginal"
+CEBRA_ORIGINAL_DIR = Path(CEBRA_DIR).resolve().parent / "CEBRA-original"
 
 if not CEBRA_ORIGINAL_DIR.exists():
     raise FileNotFoundError(
