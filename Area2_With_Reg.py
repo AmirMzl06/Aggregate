@@ -1,5 +1,5 @@
 #normal decoder
-
+import os
 import sys
 import gc
 import math
