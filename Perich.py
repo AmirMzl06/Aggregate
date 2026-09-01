@@ -379,9 +379,6 @@ def main():
         LATENT_DIM,
         "CLEAN"
     )
-
-    run_attribution(clean_model, X_attr, LATENT_DIM, "CLEAN")
-
     cleanup(clean_model, clean_decoder, Z_train_clean, Z_test_clean)
 
     # ---------------- ACORN ----------------
@@ -401,8 +398,6 @@ def main():
         LATENT_DIM,
         "ACORN"
     )
-
-    run_attribution(acorn_model, X_attr, LATENT_DIM, "ACORN")
 
     cleanup(acorn_model, acorn_decoder, Z_train_acorn, Z_test_acorn)
 
