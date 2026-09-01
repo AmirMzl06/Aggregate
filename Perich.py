@@ -33,7 +33,7 @@ SEED = 42
 LATENT_DIM = 64
 HIDDEN = 512
 BATCH_SIZE = 1024 * 2
-MAX_ITER = 3000
+MAX_ITER = 30
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
@@ -135,21 +135,43 @@ def get_inverse(result):
             return result[k]
     raise RuntimeError(f"No inverse Jacobian. Keys={list(result.keys())}")
 
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
 def compute_jacobian(model, X):
     net = model.solver_.model
     net.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     net = net.to(device)
-    x = torch.tensor(X[:128], dtype=torch.float32, device=device, requires_grad=True)
+    x = torch.tensor(
+        X[:128],
+        dtype=torch.float32,
+        device=device,
+        requires_grad=True
+    )
     attr = cebra.attribution.init(
         name="jacobian-based-batched",
         model=net,
         input_data=x,
         output_dimension=LATENT_DIM
     )
+
     result = attr.compute_attribution_map(batch_size=16)
-    jf = np.abs(result["jf"].detach().cpu().numpy()).squeeze()
-    jinv = np.abs(get_inverse(result).detach().cpu().numpy()).squeeze()
+    print("\nAttribution keys:")
+    print(result.keys())
+    print("JF raw type:", type(result["jf"]))
+    print("JF raw shape:", to_numpy(result["jf"]).shape)
+    inv = get_inverse(result)
+    print("JFINV raw type:", type(inv))
+    print("JFINV raw shape:", to_numpy(inv).shape)
+    jf = np.abs(
+        to_numpy(result["jf"])
+    ).squeeze()
+    jinv = np.abs(
+        to_numpy(inv)
+    ).squeeze()
     return jf, jinv
 
 def save_jacobian_plot(clean, acorn, name, title):
