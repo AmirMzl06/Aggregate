@@ -19,7 +19,7 @@ print(cebra.__file__)
 
 DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw"
 DATASET = "C-CO"
-DAY = 0
+DAY = 10
 NPZ_PATH = os.path.join(DATA_DIR, f"{DATASET}{DAY}.npz")
 SEED = 42
 LATENT_DIM = 64
