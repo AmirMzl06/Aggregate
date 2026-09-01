@@ -359,19 +359,6 @@ def main():
 
     # attr_window = min(ATTR_WINDOW, len(X_train))
     # X_attr = X_train[:attr_window]
-    run_attribution(
-        clean_model,
-        X_train,
-        LATENT_DIM,
-        "CLEAN"
-    )
-    run_attribution(
-        acorn_model,
-        X_train,
-        LATENT_DIM,
-        "ACORN"
-    )
-
     
     print(f"\nattribution reference window: first {attr_window} timesteps of X_train")
 
@@ -386,6 +373,12 @@ def main():
     train_decoder(clean_decoder, Z_train_clean, Y_train, epochs=2000)
     clean_train_r2 = evaluate(clean_decoder, Z_train_clean, Y_train, "CLEAN TRAIN")
     clean_test_r2 = evaluate(clean_decoder, Z_test_clean, Y_test, "CLEAN TEST")
+    run_attribution(
+        clean_model,
+        X_train,
+        LATENT_DIM,
+        "CLEAN"
+    )
 
     run_attribution(clean_model, X_attr, LATENT_DIM, "CLEAN")
 
@@ -402,6 +395,12 @@ def main():
     train_decoder(acorn_decoder, Z_train_acorn, Y_train, epochs=2000)
     acorn_train_r2 = evaluate(acorn_decoder, Z_train_acorn, Y_train, "ACORN TRAIN")
     acorn_test_r2 = evaluate(acorn_decoder, Z_test_acorn, Y_test, "ACORN TEST")
+    run_attribution(
+        acorn_model,
+        X_train,
+        LATENT_DIM,
+        "ACORN"
+    )
 
     run_attribution(acorn_model, X_attr, LATENT_DIM, "ACORN")
 
