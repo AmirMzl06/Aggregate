@@ -24,13 +24,13 @@ print(cebra.__file__)
 
 DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw"
 DATASET = "C-CO"
-DAY = 10
+DAY = 0
 NPZ_PATH = os.path.join(DATA_DIR, f"{DATASET}{DAY}.npz")
 SEED = 42
 LATENT_DIM = 64
 HIDDEN = 512
-BATCH_SIZE = 1024 * 2
-MAX_ITER = 3000
+BATCH_SIZE = 512
+MAX_ITER = 5000
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
