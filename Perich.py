@@ -1,7 +1,7 @@
 import os
 import sys
-import random
 import gc
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
+from utils.min_distance import min_l2_distance
+
 for module_name in list(sys.modules):
     if module_name == "cebra" or module_name.startswith("cebra."):
         del sys.modules[module_name]
@@ -16,6 +18,7 @@ sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 import cebra.attribution
 from cebra import CEBRA
+
 print("\nUsing CEBRA:")
 print(cebra.__file__)
 
@@ -23,20 +26,21 @@ DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw"
 DATASET = "C-CO"
 DAY = 10
 NPZ_PATH = os.path.join(DATA_DIR, f"{DATASET}{DAY}.npz")
-OUT = "Perich_CLEAN_ACORN_Jacobian"
-os.makedirs(OUT, exist_ok=True)
-
 SEED = 42
 LATENT_DIM = 64
 HIDDEN = 512
 BATCH_SIZE = 1024 * 2
-MAX_ITER = 3000
+MAX_ITER = 5000
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
-ADV_EPS = 0.5
-ADV_STEPS = 10
 DEVICE = "cuda_if_available"
+
+EPS_SAMPLE_SIZE = 2000
+ATTR_WINDOW = 5000
+IMG_DIR = "./image_perich"
+os.makedirs(IMG_DIR, exist_ok=True)
+
 
 def seed_all(seed):
     random.seed(seed)
@@ -44,29 +48,67 @@ def seed_all(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
 seed_all(SEED)
+rng = np.random.default_rng(SEED)
+
+
+def cleanup(*objs):
+    for o in objs:
+        del o
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
 
 def load_data():
+    print("\n")
     print("=" * 90)
     print("LOADING PERICH")
     print("=" * 90)
     print(NPZ_PATH)
     data = np.load(NPZ_PATH, allow_pickle=True)
+    print(data.files)
     X_train = data["train_data"].astype(np.float32)
     X_test = data["valid_data"].astype(np.float32)
     Y_train = data["train_label"].astype(np.float32)
     Y_test = data["valid_label"].astype(np.float32)
-    print("Labels:", Y_train.shape, Y_test.shape)
+    print("\nOriginal labels")
+    print("train:", Y_train.shape)
+    print("test :", Y_test.shape)
     Y_train = Y_train[:, 2:4]
     Y_test = Y_test[:, 2:4]
+    print("\nFinal")
     print("X train:", X_train.shape)
     print("X test :", X_test.shape)
     print("Y train:", Y_train.shape)
     print("Y test :", Y_test.shape)
     return X_train, X_test, Y_train, Y_test
 
-def build_model(adversarial=False):
-    return CEBRA(
+
+def diagnostic(X_train, X_test, Y_train, Y_test):
+    print("\n")
+    print("=" * 90)
+    print("DATA DIAGNOSTIC")
+    print("=" * 90)
+    for name, x in [("X_train", X_train), ("X_test", X_test), ("Y_train", Y_train), ("Y_test", Y_test)]:
+        print("\n", name)
+        print("shape:", x.shape)
+        print("mean :", float(x.mean()))
+        print("std  :", float(x.std()))
+        print("min  :", float(x.min()))
+        print("max  :", float(x.max()))
+        print("nan :", np.isnan(x).sum())
+
+
+def train_cebra(X_train, Y_train):
+    print("\n")
+    print("=" * 90)
+    print("TRAINING CLEAN CEBRA (SUPERVISED)")
+    print("=" * 90)
+    model = CEBRA(
         batch_size=BATCH_SIZE,
         temperature=TEMPERATURE,
         model_architecture=MODEL_ARCH,
@@ -74,137 +116,237 @@ def build_model(adversarial=False):
         max_iterations=MAX_ITER,
         output_dimension=LATENT_DIM,
         num_hidden_units=HIDDEN,
-        training_mode="adversarial" if adversarial else "clean",
-        adv_alpha=ADV_EPS / 5 if adversarial else 0.0,
-        adv_epsilon=ADV_EPS if adversarial else 0.0,
-        adv_steps=ADV_STEPS if adversarial else 0,
-        attack_norm="linf",
+        training_mode="clean",
         conditional="time_delta",
         device=DEVICE,
-        verbose=True,
+        verbose=True
     )
+    model.fit(X_train, Y_train)
+    return model
+
+
+def train_acorn(X_train, Y_train):
+    print("\n")
+    print("=" * 90)
+    print("TRAINING ACORN (SUPERVISED, ADVERSARIAL)")
+    print("=" * 90)
+    sample_n = min(EPS_SAMPLE_SIZE, len(X_train))
+    sample_idx = rng.choice(len(X_train), size=sample_n, replace=False)
+    eps = float(min_l2_distance(X_train[sample_idx])) / 2.0
+    eps = max(eps, 1e-6)
+    eps = 0.5
+    print("epsilon (from data):", eps)
+
+    model = CEBRA(
+        batch_size=BATCH_SIZE,
+        temperature=TEMPERATURE,
+        model_architecture=MODEL_ARCH,
+        time_offsets=TIME_OFFSETS,
+        max_iterations=MAX_ITER,
+        output_dimension=LATENT_DIM,
+        num_hidden_units=HIDDEN,
+        training_mode="adversarial",
+        conditional="time_delta",
+        adv_alpha=eps / 5,
+        adv_epsilon=eps,
+        adv_steps=10,
+        attack_norm="linf",
+        device=DEVICE,
+        verbose=True
+    )
+    model.fit(X_train, Y_train)
+    return model, eps
+
+
+def embedding_check(Z_train, Z_test):
+    print("\n")
+    print("=" * 90)
+    print("EMBEDDING")
+    print("=" * 90)
+    for n, z in [("Z_train", Z_train), ("Z_test", Z_test)]:
+        print("\n", n)
+        print(z.shape)
+        print("mean:", z.mean())
+        print("std :", z.std())
+
 
 class SimpleGRUDecoder(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, output_dim=2):
         super().__init__()
         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, output_dim)
+
     def forward(self, x):
         if x.ndim == 2:
             x = x.unsqueeze(1)
         out, _ = self.gru(x)
-        return self.fc(out[:, -1])
+        out = out[:, -1, :]
+        return self.fc(out)
+
 
 def train_decoder(model, X, Y, epochs=2000):
     model.train()
     X = torch.tensor(X, dtype=torch.float32, device="cuda")
     Y = torch.tensor(Y, dtype=torch.float32, device="cuda")
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
     for e in tqdm(range(epochs)):
-        opt.zero_grad()
+        optimizer.zero_grad()
         pred = model(X)
         loss = loss_fn(pred, Y)
         loss.backward()
-        opt.step()
+        optimizer.step()
         if e % 200 == 0:
             print("epoch", e, "loss", float(loss.detach()))
+
 
 def evaluate(model, X, Y, name):
     model.eval()
     with torch.no_grad():
-        pred = model(torch.tensor(X, dtype=torch.float32, device="cuda")).cpu().numpy()
-    print("\n" + "=" * 80)
+        X = torch.tensor(X, dtype=torch.float32, device="cuda")
+        pred = model(X).cpu().numpy()
+    print("\n")
+    print("=" * 80)
     print(name)
+    print("=" * 80)
     scores = []
     for i, n in enumerate(["vx", "vy"]):
-        r = r2_score(Y[:, i], pred[:, i])
-        scores.append(r)
-        print(n, "R2:", r)
-    print("Mean R2:", np.mean(scores))
+        r2 = r2_score(Y[:, i], pred[:, i])
+        scores.append(r2)
+        print(n, "R2:", r2)
+    mean_r2 = float(np.mean(scores))
+    print("Mean R2:", mean_r2)
+    print("\nExamples")
+    for i in range(5):
+        print("true:", Y[i], "pred:", pred[i])
+    return mean_r2
 
-def to_numpy(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
 
-def get_inverse(result):
-    return result["jf-inv-svd"]
-
-def orient_jacobian(arr):
-    arr = np.abs(to_numpy(arr)).squeeze()
-    print("Raw jacobian:", arr.shape)
+def reduce_attr_map(arr):
+    if torch.is_tensor(arr):
+        arr = arr.detach().cpu().numpy()
+    arr = np.abs(np.asarray(arr))
     if arr.ndim == 3:
         arr = arr.mean(axis=0)
-    print("After time averaging:", arr.shape)
-    if arr.shape == (88, 64):
-        arr = arr.T
-    print("Final:", arr.shape)
+    elif arr.ndim == 1:
+        arr = arr[None, :]
     return arr.astype(np.float32)
 
-def compute_jacobian(model, X):
-    print("\nComputing Jacobian")
-    net = model.solver_.model
-    net.eval()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    net = net.to(device)
-    n = min(len(X), 2048)
-    x = torch.tensor(X[:n], dtype=torch.float32, device=device, requires_grad=True)
-    attr = cebra.attribution.init(
-        name="jacobian-based-batched",
-        model=net,
-        input_data=x,
-        output_dimension=LATENT_DIM
-    )
-    result = attr.compute_attribution_map(batch_size=32)
-    print("Attribution keys:")
-    print(result.keys())
-    jf = orient_jacobian(result["jf"])
-    jinv = orient_jacobian(result["jf-inv-svd"])
-    return jf, jinv
 
-def save_plot(clean, acorn, filename, title):
-    print("Plot shapes:", clean.shape, acorn.shape)
-    fig, ax = plt.subplots(1, 2, figsize=(22, 8))
-    vmax = max(clean.max(), acorn.max())
-    im = ax[0].imshow(clean, aspect="auto", vmin=0, vmax=vmax)
-    ax[0].set_title("CLEAN")
-    ax[1].imshow(acorn, aspect="auto", vmin=0, vmax=vmax)
-    ax[1].set_title("ACORN")
-    fig.colorbar(im, ax=ax)
-    fig.suptitle(title)
-    path = os.path.join(OUT, filename)
+def save_heatmap(arr, path, title):
+    plt.figure(figsize=(10, 6))
+    plt.imshow(arr, aspect="auto", cmap="viridis")
+    plt.colorbar(label="absolute attribution")
+    plt.xlabel("Input channel")
+    plt.ylabel("Latent dimension")
+    plt.title(title)
+    plt.tight_layout()
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
-    print("Saved:", path)
+    print("saved:", path)
+
+
+def run_attribution(model, X_ref, output_dim, tag):
+    print("\n")
+    print("=" * 90)
+    print(f"ATTRIBUTION: {tag}")
+    print("=" * 90)
+
+    encoder = model.solver_.model.to("cuda" if torch.cuda.is_available() else "cpu")
+    if hasattr(encoder, "split_outputs"):
+        encoder.split_outputs = False
+    encoder.eval()
+
+    device = next(encoder.parameters()).device
+    x_tensor = torch.tensor(X_ref, dtype=torch.float32, device=device, requires_grad=True)
+
+    method = cebra.attribution.init(
+        name="jacobian-based-batched",
+        model=encoder,
+        input_data=x_tensor,
+        output_dimension=output_dim,
+    )
+    # batch_size = full window length, so no leftover chunk smaller than the
+    # model's receptive field ever gets built (see earlier crashes on this).
+    result = method.compute_attribution_map(batch_size=len(X_ref))
+
+    jf = result["jf"]
+    if "jf-inv-svd" in result:
+        jf_inv = result["jf-inv-svd"]
+    elif "jf-inv-lsq" in result:
+        jf_inv = result["jf-inv-lsq"]
+    else:
+        jf_inv = result["jf-inv"]
+
+    jf_matrix = reduce_attr_map(jf)
+    jf_inv_matrix = reduce_attr_map(jf_inv)
+
+    torch.save(jf, os.path.join(IMG_DIR, f"{tag}_jf.pt"))
+    torch.save(jf_inv, os.path.join(IMG_DIR, f"{tag}_jf_inv.pt"))
+    save_heatmap(jf_matrix, os.path.join(IMG_DIR, f"{tag}_jf.png"), f"{tag} - Jacobian")
+    save_heatmap(jf_inv_matrix, os.path.join(IMG_DIR, f"{tag}_jf_inv.png"), f"{tag} - Inverse Jacobian")
+
+    cleanup(encoder, x_tensor, method, result)
+
 
 def main():
+    print("\n")
+    print("=" * 90)
+    print("PERICH: CEBRA (CLEAN) vs ACORN + GRU DECODER + ATTRIBUTION")
+    print("=" * 90)
+
     X_train, X_test, Y_train, Y_test = load_data()
-    results = {}
-    for name, adv in [("CLEAN", False), ("ACORN", True)]:
-        print("\n")
-        print("#" * 90)
-        print("TRAINING", name)
-        print("#" * 90)
-        model = build_model(adv)
-        model.fit(X_train, Y_train)
-        Z_train = model.transform(X_train)
-        Z_test = model.transform(X_test)
-        decoder = SimpleGRUDecoder(LATENT_DIM, 128, 2).cuda()
-        train_decoder(decoder, Z_train, Y_train)
-        evaluate(decoder, Z_test, Y_test, name + " TEST")
-        jf, jinv = compute_jacobian(model, X_train)
-        results[name] = (jf, jinv)
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
-    save_plot(results["CLEAN"][0], results["ACORN"][0], "JF_CLEAN_vs_ACORN.png", "Forward Jacobian |dz/dx|")
-    save_plot(results["CLEAN"][1], results["ACORN"][1], "JFINV_CLEAN_vs_ACORN.png", "Inverse Jacobian")
+    diagnostic(X_train, X_test, Y_train, Y_test)
+
+    attr_window = min(ATTR_WINDOW, len(X_train))
+    X_attr = X_train[:attr_window]
+    print(f"\nattribution reference window: first {attr_window} timesteps of X_train")
+
+    # ---------------- CLEAN ----------------
+    clean_model = train_cebra(X_train, Y_train)
+    Z_train_clean = clean_model.transform(X_train)
+    Z_test_clean = clean_model.transform(X_test)
+    embedding_check(Z_train_clean, Z_test_clean)
+
+    clean_decoder = SimpleGRUDecoder(LATENT_DIM, 128, 2).cuda()
+    print("\nTRAINING CLEAN DECODER")
+    train_decoder(clean_decoder, Z_train_clean, Y_train, epochs=2000)
+    clean_train_r2 = evaluate(clean_decoder, Z_train_clean, Y_train, "CLEAN TRAIN")
+    clean_test_r2 = evaluate(clean_decoder, Z_test_clean, Y_test, "CLEAN TEST")
+
+    run_attribution(clean_model, X_attr, LATENT_DIM, "CLEAN")
+
+    cleanup(clean_model, clean_decoder, Z_train_clean, Z_test_clean)
+
+    # ---------------- ACORN ----------------
+    acorn_model, acorn_eps = train_acorn(X_train, Y_train)
+    Z_train_acorn = acorn_model.transform(X_train)
+    Z_test_acorn = acorn_model.transform(X_test)
+    embedding_check(Z_train_acorn, Z_test_acorn)
+
+    acorn_decoder = SimpleGRUDecoder(LATENT_DIM, 128, 2).cuda()
+    print("\nTRAINING ACORN DECODER")
+    train_decoder(acorn_decoder, Z_train_acorn, Y_train, epochs=2000)
+    acorn_train_r2 = evaluate(acorn_decoder, Z_train_acorn, Y_train, "ACORN TRAIN")
+    acorn_test_r2 = evaluate(acorn_decoder, Z_test_acorn, Y_test, "ACORN TEST")
+
+    run_attribution(acorn_model, X_attr, LATENT_DIM, "ACORN")
+
+    cleanup(acorn_model, acorn_decoder, Z_train_acorn, Z_test_acorn)
+
+    # ---------------- SUMMARY ----------------
+    print("\n")
+    print("=" * 90)
+    print("SUMMARY")
+    print("=" * 90)
+    print(f"CLEAN | eps=N/A          | train mean R2={clean_train_r2:.4f} | test mean R2={clean_test_r2:.4f}")
+    print(f"ACORN | eps={acorn_eps:.5f} | train mean R2={acorn_train_r2:.4f} | test mean R2={acorn_test_r2:.4f}")
+    print("\nattribution images saved to:", IMG_DIR)
     print("\nDONE")
+
 
 if __name__ == "__main__":
     main()
-
 
 # ##GRU
 # import os
