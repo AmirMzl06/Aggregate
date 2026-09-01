@@ -37,7 +37,11 @@ MODEL_ARCH = "offset36-model-more-dropout"
 DEVICE = "cuda_if_available"
 
 EPS_SAMPLE_SIZE = 2000
-ATTR_WINDOW = 5000
+
+ATTR_CHUNKS = 16
+ATTR_CHUNK_LEN = 256
+ATTR_BATCH = 64
+
 IMG_DIR = "./image_perich"
 os.makedirs(IMG_DIR, exist_ok=True)
 
@@ -222,6 +226,16 @@ def evaluate(model, X, Y, name):
     return mean_r2
 
 
+# def reduce_attr_map(arr):
+#     if torch.is_tensor(arr):
+#         arr = arr.detach().cpu().numpy()
+#     arr = np.abs(np.asarray(arr))
+#     if arr.ndim == 3:
+#         arr = arr.mean(axis=0)
+#     elif arr.ndim == 1:
+#         arr = arr[None, :]
+#     return arr.astype(np.float32)
+
 def reduce_attr_map(arr):
     if torch.is_tensor(arr):
         arr = arr.detach().cpu().numpy()
@@ -231,6 +245,51 @@ def reduce_attr_map(arr):
     elif arr.ndim == 1:
         arr = arr[None, :]
     return arr.astype(np.float32)
+
+def run_attribution(model, X_train, output_dim, tag):
+    print("\n")
+    print("=" * 90)
+    print(f"ATTRIBUTION CHUNKED: {tag}")
+    print("=" * 90)
+    encoder = model.solver_.model
+    device = next(encoder.parameters()).device
+    encoder.eval()
+    if hasattr(encoder, "split_outputs"):
+        encoder.split_outputs = False
+    N = len(X_train)
+    starts = np.linspace(0, max(0, N - ATTR_CHUNK_LEN), ATTR_CHUNKS).astype(int)
+    jf_list = []
+    jfinv_list = []
+    for i, start in enumerate(starts):
+        print(f"chunk {i+1}/{ATTR_CHUNKS} | start={start}")
+        chunk = X_train[start:start + ATTR_CHUNK_LEN]
+        x_tensor = torch.tensor(chunk, dtype=torch.float32, device=device, requires_grad=True)
+        method = cebra.attribution.init(
+            name="jacobian-based-batched",
+            model=encoder,
+            input_data=x_tensor,
+            output_dimension=output_dim
+        )
+        result = method.compute_attribution_map(batch_size=min(64, len(chunk)))
+        jf = reduce_attr_map(result["jf"])
+        if "jf-inv-svd" in result:
+            jinv = reduce_attr_map(result["jf-inv-svd"])
+        elif "jf-inv-lsq" in result:
+            jinv = reduce_attr_map(result["jf-inv-lsq"])
+        else:
+            jinv = reduce_attr_map(result["jf-inv"])
+        print("JF:", jf.shape, "JFINV:", jinv.shape)
+        jf_list.append(jf)
+        jfinv_list.append(jinv)
+        del x_tensor, method, result
+        torch.cuda.empty_cache()
+    JF_final = np.mean(np.stack(jf_list), axis=0)
+    JFINV_final = np.mean(np.stack(jfinv_list), axis=0)
+    print("\nFINAL JF:", JF_final.shape)
+    print("FINAL JFINV:", JFINV_final.shape)
+    save_heatmap(JF_final, os.path.join(IMG_DIR, f"{tag}_JF.png"), f"{tag} Forward Jacobian")
+    save_heatmap(JFINV_final, os.path.join(IMG_DIR, f"{tag}_JFINV.png"), f"{tag} Inverse Jacobian")
+    return JF_final, JFINV_final
 
 
 def save_heatmap(arr, path, title):
@@ -298,8 +357,22 @@ def main():
     X_train, X_test, Y_train, Y_test = load_data()
     diagnostic(X_train, X_test, Y_train, Y_test)
 
-    attr_window = min(ATTR_WINDOW, len(X_train))
-    X_attr = X_train[:attr_window]
+    # attr_window = min(ATTR_WINDOW, len(X_train))
+    # X_attr = X_train[:attr_window]
+    run_attribution(
+        clean_model,
+        X_train,
+        LATENT_DIM,
+        "CLEAN"
+    )
+    run_attribution(
+        acorn_model,
+        X_train,
+        LATENT_DIM,
+        "ACORN"
+    )
+
+    
     print(f"\nattribution reference window: first {attr_window} timesteps of X_train")
 
     # ---------------- CLEAN ----------------
