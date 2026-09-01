@@ -9,16 +9,13 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
-
 for module_name in list(sys.modules):
     if module_name == "cebra" or module_name.startswith("cebra."):
         del sys.modules[module_name]
 sys.path.insert(0, str(CEBRA_DIR))
-
 import cebra
 import cebra.attribution
 from cebra import CEBRA
-
 print("\nUsing CEBRA:")
 print(cebra.__file__)
 
@@ -33,7 +30,7 @@ SEED = 42
 LATENT_DIM = 64
 HIDDEN = 512
 BATCH_SIZE = 1024 * 2
-MAX_ITER = 30
+MAX_ITER = 3000
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
@@ -47,7 +44,6 @@ def seed_all(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
 seed_all(SEED)
 
 def load_data():
@@ -60,15 +56,13 @@ def load_data():
     X_test = data["valid_data"].astype(np.float32)
     Y_train = data["train_label"].astype(np.float32)
     Y_test = data["valid_label"].astype(np.float32)
-    print("Original labels:")
-    print(Y_train.shape, Y_test.shape)
+    print("Labels:", Y_train.shape, Y_test.shape)
     Y_train = Y_train[:, 2:4]
     Y_test = Y_test[:, 2:4]
-    print("Final:")
-    print("X_train", X_train.shape)
-    print("X_test ", X_test.shape)
-    print("Y_train", Y_train.shape)
-    print("Y_test ", Y_test.shape)
+    print("X train:", X_train.shape)
+    print("X test :", X_test.shape)
+    print("Y train:", Y_train.shape)
+    print("Y test :", Y_test.shape)
     return X_train, X_test, Y_train, Y_test
 
 def build_model(adversarial=False):
@@ -87,7 +81,7 @@ def build_model(adversarial=False):
         attack_norm="l2",
         conditional="time_delta",
         device=DEVICE,
-        verbose=True
+        verbose=True,
     )
 
 class SimpleGRUDecoder(nn.Module):
@@ -120,69 +114,66 @@ def evaluate(model, X, Y, name):
     model.eval()
     with torch.no_grad():
         pred = model(torch.tensor(X, dtype=torch.float32, device="cuda")).cpu().numpy()
-    scores = []
     print("\n" + "=" * 80)
     print(name)
+    scores = []
     for i, n in enumerate(["vx", "vy"]):
         r = r2_score(Y[:, i], pred[:, i])
         scores.append(r)
         print(n, "R2:", r)
     print("Mean R2:", np.mean(scores))
 
-def get_inverse(result):
-    for k in ["jf-inv-svd", "jf-inv", "jf-inv-lsq"]:
-        if k in result:
-            return result[k]
-    raise RuntimeError(f"No inverse Jacobian. Keys={list(result.keys())}")
-
 def to_numpy(x):
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
 
+def get_inverse(result):
+    return result["jf-inv-svd"]
+
+def orient_jacobian(arr):
+    arr = np.abs(to_numpy(arr)).squeeze()
+    print("Raw jacobian:", arr.shape)
+    if arr.ndim == 3:
+        arr = arr.mean(axis=0)
+    print("After time averaging:", arr.shape)
+    if arr.shape == (88, 64):
+        arr = arr.T
+    print("Final:", arr.shape)
+    return arr.astype(np.float32)
+
 def compute_jacobian(model, X):
+    print("\nComputing Jacobian")
     net = model.solver_.model
     net.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     net = net.to(device)
-    x = torch.tensor(
-        X[:128],
-        dtype=torch.float32,
-        device=device,
-        requires_grad=True
-    )
+    n = min(len(X), 2048)
+    x = torch.tensor(X[:n], dtype=torch.float32, device=device, requires_grad=True)
     attr = cebra.attribution.init(
         name="jacobian-based-batched",
         model=net,
         input_data=x,
         output_dimension=LATENT_DIM
     )
-
-    result = attr.compute_attribution_map(batch_size=16)
-    print("\nAttribution keys:")
+    result = attr.compute_attribution_map(batch_size=32)
+    print("Attribution keys:")
     print(result.keys())
-    print("JF raw type:", type(result["jf"]))
-    print("JF raw shape:", to_numpy(result["jf"]).shape)
-    inv = get_inverse(result)
-    print("JFINV raw type:", type(inv))
-    print("JFINV raw shape:", to_numpy(inv).shape)
-    jf = np.abs(
-        to_numpy(result["jf"])
-    ).squeeze()
-    jinv = np.abs(
-        to_numpy(inv)
-    ).squeeze()
+    jf = orient_jacobian(result["jf"])
+    jinv = orient_jacobian(result["jf-inv-svd"])
     return jf, jinv
 
-def save_jacobian_plot(clean, acorn, name, title):
-    fig, axes = plt.subplots(1, 2, figsize=(22, 8))
-    im = axes[0].imshow(clean, aspect="auto")
-    axes[0].set_title("CLEAN")
-    axes[1].imshow(acorn, aspect="auto")
-    axes[1].set_title("ACORN")
-    fig.colorbar(im, ax=axes)
+def save_plot(clean, acorn, filename, title):
+    print("Plot shapes:", clean.shape, acorn.shape)
+    fig, ax = plt.subplots(1, 2, figsize=(22, 8))
+    vmax = max(clean.max(), acorn.max())
+    im = ax[0].imshow(clean, aspect="auto", vmin=0, vmax=vmax)
+    ax[0].set_title("CLEAN")
+    ax[1].imshow(acorn, aspect="auto", vmin=0, vmax=vmax)
+    ax[1].set_title("ACORN")
+    fig.colorbar(im, ax=ax)
     fig.suptitle(title)
-    path = os.path.join(OUT, name)
+    path = os.path.join(OUT, filename)
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
     print("Saved:", path)
@@ -201,34 +192,18 @@ def main():
         Z_test = model.transform(X_test)
         decoder = SimpleGRUDecoder(LATENT_DIM, 128, 2).cuda()
         train_decoder(decoder, Z_train, Y_train)
-        evaluate(decoder, Z_train, Y_train, name + " TRAIN")
         evaluate(decoder, Z_test, Y_test, name + " TEST")
         jf, jinv = compute_jacobian(model, X_train)
         results[name] = (jf, jinv)
         del model
         gc.collect()
         torch.cuda.empty_cache()
-    save_jacobian_plot(
-        results["CLEAN"][0],
-        results["ACORN"][0],
-        "JF_CLEAN_vs_ACORN.png",
-        "Forward Jacobian"
-    )
-    save_jacobian_plot(
-        results["CLEAN"][1],
-        results["ACORN"][1],
-        "JFINV_CLEAN_vs_ACORN.png",
-        "Inverse Jacobian"
-    )
+    save_plot(results["CLEAN"][0], results["ACORN"][0], "JF_CLEAN_vs_ACORN.png", "Forward Jacobian |dz/dx|")
+    save_plot(results["CLEAN"][1], results["ACORN"][1], "JFINV_CLEAN_vs_ACORN.png", "Inverse Jacobian")
     print("\nDONE")
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 
 # ##GRU
