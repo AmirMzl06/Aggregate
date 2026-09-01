@@ -305,47 +305,47 @@ def save_heatmap(arr, path, title):
     print("saved:", path)
 
 
-def run_attribution(model, X_ref, output_dim, tag):
-    print("\n")
-    print("=" * 90)
-    print(f"ATTRIBUTION: {tag}")
-    print("=" * 90)
+# def run_attribution(model, X_ref, output_dim, tag):
+#     print("\n")
+#     print("=" * 90)
+#     print(f"ATTRIBUTION: {tag}")
+#     print("=" * 90)
 
-    encoder = model.solver_.model.to("cuda" if torch.cuda.is_available() else "cpu")
-    if hasattr(encoder, "split_outputs"):
-        encoder.split_outputs = False
-    encoder.eval()
+#     encoder = model.solver_.model.to("cuda" if torch.cuda.is_available() else "cpu")
+#     if hasattr(encoder, "split_outputs"):
+#         encoder.split_outputs = False
+#     encoder.eval()
 
-    device = next(encoder.parameters()).device
-    x_tensor = torch.tensor(X_ref, dtype=torch.float32, device=device, requires_grad=True)
+#     device = next(encoder.parameters()).device
+#     x_tensor = torch.tensor(X_ref, dtype=torch.float32, device=device, requires_grad=True)
 
-    method = cebra.attribution.init(
-        name="jacobian-based-batched",
-        model=encoder,
-        input_data=x_tensor,
-        output_dimension=output_dim,
-    )
-    # batch_size = full window length, so no leftover chunk smaller than the
-    # model's receptive field ever gets built (see earlier crashes on this).
-    result = method.compute_attribution_map(batch_size=len(X_ref))
+#     method = cebra.attribution.init(
+#         name="jacobian-based-batched",
+#         model=encoder,
+#         input_data=x_tensor,
+#         output_dimension=output_dim,
+#     )
+#     # batch_size = full window length, so no leftover chunk smaller than the
+#     # model's receptive field ever gets built (see earlier crashes on this).
+#     result = method.compute_attribution_map(batch_size=len(X_ref))
 
-    jf = result["jf"]
-    if "jf-inv-svd" in result:
-        jf_inv = result["jf-inv-svd"]
-    elif "jf-inv-lsq" in result:
-        jf_inv = result["jf-inv-lsq"]
-    else:
-        jf_inv = result["jf-inv"]
+#     jf = result["jf"]
+#     if "jf-inv-svd" in result:
+#         jf_inv = result["jf-inv-svd"]
+#     elif "jf-inv-lsq" in result:
+#         jf_inv = result["jf-inv-lsq"]
+#     else:
+#         jf_inv = result["jf-inv"]
 
-    jf_matrix = reduce_attr_map(jf)
-    jf_inv_matrix = reduce_attr_map(jf_inv)
+#     jf_matrix = reduce_attr_map(jf)
+#     jf_inv_matrix = reduce_attr_map(jf_inv)
 
-    # torch.save(jf, os.path.join(IMG_DIR, f"{tag}_jf.pt"))
-    # torch.save(jf_inv, os.path.join(IMG_DIR, f"{tag}_jf_inv.pt"))
-    save_heatmap(jf_matrix, os.path.join(IMG_DIR, f"{tag}_jf.png"), f"{tag} - Jacobian")
-    save_heatmap(jf_inv_matrix, os.path.join(IMG_DIR, f"{tag}_jf_inv.png"), f"{tag} - Inverse Jacobian")
+#     # torch.save(jf, os.path.join(IMG_DIR, f"{tag}_jf.pt"))
+#     # torch.save(jf_inv, os.path.join(IMG_DIR, f"{tag}_jf_inv.pt"))
+#     save_heatmap(jf_matrix, os.path.join(IMG_DIR, f"{tag}_jf.png"), f"{tag} - Jacobian")
+#     save_heatmap(jf_inv_matrix, os.path.join(IMG_DIR, f"{tag}_jf_inv.png"), f"{tag} - Inverse Jacobian")
 
-    cleanup(encoder, x_tensor, method, result)
+#     cleanup(encoder, x_tensor, method, result)
 
 
 def main():
@@ -360,7 +360,7 @@ def main():
     # attr_window = min(ATTR_WINDOW, len(X_train))
     # X_attr = X_train[:attr_window]
     
-    print(f"\nattribution reference window: first {attr_window} timesteps of X_train")
+    # print(f"\nattribution reference window: first {attr_window} timesteps of X_train")
 
     # ---------------- CLEAN ----------------
     clean_model = train_cebra(X_train, Y_train)
