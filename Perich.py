@@ -30,7 +30,7 @@ SEED = 42
 LATENT_DIM = 64
 HIDDEN = 512
 BATCH_SIZE = 1024 * 2
-MAX_ITER = 5000
+MAX_ITER = 3000
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
@@ -281,8 +281,8 @@ def run_attribution(model, X_ref, output_dim, tag):
     jf_matrix = reduce_attr_map(jf)
     jf_inv_matrix = reduce_attr_map(jf_inv)
 
-    torch.save(jf, os.path.join(IMG_DIR, f"{tag}_jf.pt"))
-    torch.save(jf_inv, os.path.join(IMG_DIR, f"{tag}_jf_inv.pt"))
+    # torch.save(jf, os.path.join(IMG_DIR, f"{tag}_jf.pt"))
+    # torch.save(jf_inv, os.path.join(IMG_DIR, f"{tag}_jf_inv.pt"))
     save_heatmap(jf_matrix, os.path.join(IMG_DIR, f"{tag}_jf.png"), f"{tag} - Jacobian")
     save_heatmap(jf_inv_matrix, os.path.join(IMG_DIR, f"{tag}_jf_inv.png"), f"{tag} - Inverse Jacobian")
 
