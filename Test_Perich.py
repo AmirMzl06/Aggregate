@@ -7,7 +7,7 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
-from utils.gru_decoder_monkey import MonkeyDecoder
+from gru_decoder_monkey import MonkeyDecoder
 
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
