@@ -299,12 +299,12 @@ def train_decoder(Z_train, Y_train, tag):
     x = torch.tensor(Z_train, dtype=torch.float32, device=device)
     y = torch.tensor(Y_train, dtype=torch.float32, device=device)
     decoder = MonkeyDecoder(
-        input_dim=LATENT_DIM,
-        hidden_dim=DECODER_HIDDEN,
-        output_dim=Y_train.shape[1],
-        dropout=DECODER_DROPOUT,
-        bidirectional=False,
-        layers=DECODER_LAYERS,
+        LATENT_DIM,
+        DECODER_HIDDEN,
+        DECODER_LAYERS,
+        DECODER_DROPOUT,
+        False,
+        Y_train.shape[1],
         n_train_steps=DECODER_STEPS
     ).to(device)
     print(decoder)
