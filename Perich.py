@@ -397,7 +397,6 @@ def main():
     print("Attack norm:", ATTACK_NORM)
     print("Decoder:", "TwoLayerMLP")
     print("Decoder hidden:", DECODER_HIDDEN)
-    print("Decoder layers:", DECODER_LAYERS)
     print("Decoder steps:", DECODER_STEPS)
     print("No normalization")
     print("No Jacobian regularizer")
