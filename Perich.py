@@ -9,7 +9,6 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_squared_error
 from utils.constants import CEBRA_DIR
-from gru_decoder_monkey import MonkeyDecoder
 
 for module_name in list(sys.modules):
     if module_name == "cebra" or module_name.startswith("cebra."):
@@ -49,12 +48,8 @@ ATTR_N_CHUNKS = 16
 ATTR_CHUNK_LEN = 128
 ATTR_BATCH_SIZE = 16
 
-DECODER_HIDDEN = 512
-DECODER_LAYERS = 2
-DECODER_DROPOUT = 0.4
-DECODER_BIDIRECTIONAL = False
+DECODER_HIDDEN = 128
 DECODER_STEPS = 10000
-DECODER_ADV = False
 
 def seed_all(seed):
     random.seed(seed)
@@ -163,93 +158,107 @@ def train_representation(X_train, adversarial=False, label=""):
     model.fit(X_train.astype(np.float32, copy=False))
     return model
 
+class TwoLayerMLP(torch.nn.Module):
+    def __init__(self, input_dim=LATENT_DIM, hidden_dim=DECODER_HIDDEN, output_dim=2):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def build_decoder():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    decoder = MonkeyDecoder(
-        LATENT_DIM,
-        DECODER_HIDDEN,
-        DECODER_LAYERS,
-        DECODER_DROPOUT,
-        DECODER_BIDIRECTIONAL,
-        2,
-        n_train_steps=DECODER_STEPS,
-        device=device,
+    decoder = TwoLayerMLP(
+        input_dim=LATENT_DIM,
+        hidden_dim=DECODER_HIDDEN,
+        output_dim=2
     ).to(device)
     return decoder, device
 
 def train_decoder(model, X_train, X_test, Y_train, Y_test, condition_name):
     print("\n" + "=" * 100)
-    print(f"MONKEY GRU DECODER — {condition_name}")
+    print(f"TWO LAYER MLP DECODER — {condition_name}")
     print("=" * 100)
-    Z_train = model.transform(X_train.astype(np.float32, copy=False))
-    Z_test = model.transform(X_test.astype(np.float32, copy=False))
-    Z_train = np.asarray(Z_train, dtype=np.float32)
-    Z_test = np.asarray(Z_test, dtype=np.float32)
-    print("Raw embedding train:", Z_train.shape)
-    print("Raw embedding test :", Z_test.shape)
+
+    Z_train = np.asarray(model.transform(X_train.astype(np.float32, copy=False)), dtype=np.float32)
+    Z_test = np.asarray(model.transform(X_test.astype(np.float32, copy=False)), dtype=np.float32)
+
+    print("Embedding train:", Z_train.shape)
+    print("Embedding test :", Z_test.shape)
+
     train_mask = np.isfinite(Z_train).all(axis=1) & np.isfinite(Y_train).all(axis=1)
     test_mask = np.isfinite(Z_test).all(axis=1) & np.isfinite(Y_test).all(axis=1)
+
     Z_train = Z_train[train_mask]
     y_train = Y_train[train_mask]
     Z_test = Z_test[test_mask]
     y_test = Y_test[test_mask]
-    print("Decoder train:", Z_train.shape)
-    print("Decoder test :", Z_test.shape)
-    if Z_train.ndim != 2:
-        raise RuntimeError(f"Expected Z_train = time x latent, got {Z_train.shape}")
-    if Z_train.shape[1] != LATENT_DIM:
-        raise RuntimeError(f"Expected latent dimension {LATENT_DIM}, got {Z_train.shape[1]}")
-    xtr = torch.from_numpy(Z_train).float()
-    ytr = torch.from_numpy(y_train).float()
-    xte = torch.from_numpy(Z_test).float()
-    yte = torch.from_numpy(y_test).float()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    xtr = torch.from_numpy(Z_train).float().to(device)
+    ytr = torch.from_numpy(y_train).float().to(device)
+    xte = torch.from_numpy(Z_test).float().to(device)
+    yte = torch.from_numpy(y_test).float().to(device)
+
     seed_all(SEED)
-    decoder, device = build_decoder()
-    xte = xte.to(device)
-    yte = yte.to(device)
-    print("\nDecoder config")
-    print("hidden:", DECODER_HIDDEN)
-    print("layers:", DECODER_LAYERS)
-    print("dropout:", DECODER_DROPOUT)
-    print("bidirectional:", DECODER_BIDIRECTIONAL)
-    print("steps:", DECODER_STEPS)
-    print("decoder adversarial:", DECODER_ADV)
-    print("\nTraining MonkeyDecoder...")
-    decoder.fit(xtr, ytr, seed=SEED, adv=DECODER_ADV)
-    professor_mean_r2 = decoder.score(xte, yte, device)
+
+    decoder = TwoLayerMLP(
+        input_dim=LATENT_DIM,
+        hidden_dim=DECODER_HIDDEN,
+        output_dim=2
+    ).to(device)
+
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    loss_fn = torch.nn.MSELoss()
+
+    print("\nTraining MLP decoder...")
+    decoder.train()
+
+    for epoch in range(DECODER_STEPS):
+        optimizer.zero_grad()
+        pred = decoder(xtr)
+        loss = loss_fn(pred, ytr)
+        loss.backward()
+        optimizer.step()
+
+        if epoch == 0 or (epoch + 1) % 1000 == 0:
+            print(f"epoch {epoch+1}/{DECODER_STEPS} loss={loss.item():.6f}")
+
     decoder.eval()
+
     with torch.no_grad():
-        prediction_tensor, true_tensor = decoder.forward_window(
-            xte,
-            yte,
-            device
-        )
-        prediction = prediction_tensor.float().cpu().numpy()
-        true_values = true_tensor.float().cpu().numpy()
-    # true_values = yte.float().cpu().numpy()
-    if prediction.shape != true_values.shape:
-        raise RuntimeError(f"Decoder prediction shape mismatch: pred={prediction.shape}, true={true_values.shape}")
+        prediction = decoder(xte).cpu().numpy()
+
+    true_values = yte.cpu().numpy()
+
     mse = mean_squared_error(true_values, prediction)
-    r2_vx = r2_score(true_values[:, 0], prediction[:, 0])
-    r2_vy = r2_score(true_values[:, 1], prediction[:, 1])
-    direct_mean_r2 = (r2_vx + r2_vy) / 2.0
+    r2_vx = r2_score(true_values[:,0], prediction[:,0])
+    r2_vy = r2_score(true_values[:,1], prediction[:,1])
+    mean_r2 = (r2_vx + r2_vy) / 2.0
+
     print("\nRESULT")
-    print("MSE             :", mse)
-    print("R2 vx           :", r2_vx)
-    print("R2 vy           :", r2_vy)
-    print("Mean R2 direct  :", direct_mean_r2)
-    print("Mean R2 score() :", professor_mean_r2)
-    mean_r2 = float(professor_mean_r2)
+    print("MSE:", mse)
+    print("R2 vx:", r2_vx)
+    print("R2 vy:", r2_vy)
+    print("Mean R2:", mean_r2)
+
     del decoder, xtr, ytr, xte, yte
     cleanup()
+
     return {
         "condition": condition_name,
         "n_neurons": int(X_train.shape[1]),
         "mse": float(mse),
         "r2_vx": float(r2_vx),
         "r2_vy": float(r2_vy),
-        "mean_r2": mean_r2,
-        "direct_mean_r2": float(direct_mean_r2),
+        "mean_r2": float(mean_r2),
+        "direct_mean_r2": float(mean_r2),
     }
 
 def to_numpy(x):
@@ -386,7 +395,7 @@ def main():
     print("ACORN alpha:", ADV_ALPHA)
     print("ACORN steps:", ADV_STEPS)
     print("Attack norm:", ATTACK_NORM)
-    print("Decoder:", "MonkeyDecoder")
+    print("Decoder:", "TwoLayerMLP")
     print("Decoder hidden:", DECODER_HIDDEN)
     print("Decoder layers:", DECODER_LAYERS)
     print("Decoder steps:", DECODER_STEPS)
