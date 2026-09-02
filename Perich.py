@@ -34,7 +34,7 @@ SEED = 42
 LATENT_DIM = 64
 NUM_HIDDEN_UNITS = 512
 BATCH_SIZE = 512
-MAX_ITER = 5000
+MAX_ITER = 5
 TEMPERATURE = 0.4
 TIME_OFFSETS = 4
 MODEL_ARCH = "offset36-model-more-dropout"
@@ -53,7 +53,7 @@ DECODER_HIDDEN = 512
 DECODER_LAYERS = 2
 DECODER_DROPOUT = 0.4
 DECODER_BIDIRECTIONAL = False
-DECODER_STEPS = 10000
+DECODER_STEPS = 10
 DECODER_ADV = False
 
 def seed_all(seed):
@@ -217,9 +217,14 @@ def train_decoder(model, X_train, X_test, Y_train, Y_test, condition_name):
     professor_mean_r2 = decoder.score(xte, yte, device)
     decoder.eval()
     with torch.no_grad():
-        prediction = decoder(xte.to(device))
-        prediction = prediction.float().cpu().numpy()
-    true_values = yte.float().cpu().numpy()
+        prediction_tensor, true_tensor = decoder.forward_window(
+            xte,
+            yte,
+            device
+        )
+        prediction = prediction_tensor.float().cpu().numpy()
+        true_values = true_tensor.float().cpu().numpy()
+    # true_values = yte.float().cpu().numpy()
     if prediction.shape != true_values.shape:
         raise RuntimeError(f"Decoder prediction shape mismatch: pred={prediction.shape}, true={true_values.shape}")
     mse = mean_squared_error(true_values, prediction)
