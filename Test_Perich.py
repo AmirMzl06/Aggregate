@@ -46,7 +46,7 @@ MODEL_ARCH = "offset36-model-more-dropout"
 
 ADV_EPS = 0.5
 ADV_STEPS = 10
-ATTACK_NORM = "l2"
+ATTACK_NORM = "linf"
 
 DECODER_HIDDEN = 512
 DECODER_LAYERS = 2
