@@ -1710,13 +1710,9 @@ def main():
     print("Session:", f"{DATASET_NAME}{DAY}")
     print("NPZ:", NPZ_PATH)
     print("Latent:", LATENT_DIM)
-    print("No normalization")
-    print("No decoder")
-    print("No Jacobian regularizer")
     X_train, X_test, Y_train, Y_test, unit_ids = load_perich_session()
     print("\nTraining only uses:")
     print("X_train:", X_train.shape)
-    print("Validation data is NOT used for CEBRA/ACORN training.")
     adv_epsilon = compute_adv_epsilon(X_train)
     clean_jf, clean_inv, clean_model = train_and_attribute(X_train, adversarial=False, adv_epsilon=0.0)
     del clean_model
