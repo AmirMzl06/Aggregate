@@ -1,497 +1,407 @@
-import os, sys, random, gc
+import os
+import sys
+import gc
+import random
 import numpy as np
 import torch
-import torch.nn as nn
-from sklearn.metrics import r2_score, mean_squared_error
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
+from utils.gru_decoder_monkey import MonkeyDecoder
 
-for m in list(sys.modules):
-    if m == "cebra" or m.startswith("cebra."):
-        del sys.modules[m]
 sys.path.insert(0, str(CEBRA_DIR))
-
+import cebra
 from cebra import CEBRA
+import cebra.attribution
+
+print("\nUsing CEBRA:")
+print(cebra.__file__)
 
 PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
-SESSION = "C-CO0"
-NPZ_PATH = os.path.join(PERICH_DATA_DIR, SESSION + ".npz")
+DATASET_NAME = "C-CO"
+DAY = 0
+SESSION = f"{DATASET_NAME}{DAY}"
+NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION}.npz")
+OUT = f"Teacher_test_{SESSION}"
+os.makedirs(OUT, exist_ok=True)
+
+SEED = 42
+
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+seed_all(SEED)
+
+LATENT_DIM = 64
+HIDDEN = 64
+BATCH_SIZE = 2048
+MAX_ITER = 5000
+TEMPERATURE = 0.4
+OFFSET = 1
+MODEL_ARCH = "offset36-model-more-dropout"
+
+ADV_EPS = 0.5
+ADV_STEPS = 10
+ATTACK_NORM = "l2"
+
+DECODER_HIDDEN = 512
+DECODER_LAYERS = 2
+DECODER_DROPOUT = 0.4
+DECODER_STEPS = 2500
+
+ATTR_CHUNKS = 16
+ATTR_LEN = 128
+ATTR_BATCH = 16
+
+def load_perich():
+    print("\n" + "=" * 90)
+    print("LOADING PERICH")
+    print("=" * 90)
+    print("File:", NPZ_PATH)
+    data = np.load(NPZ_PATH, allow_pickle=True)
+    train_data = data["train_data"].astype(np.float32)
+    valid_data = data["valid_data"].astype(np.float32)
+    train_label = data["train_label"].astype(np.float32)
+    valid_label = data["valid_label"].astype(np.float32)
+    Y_train = train_label
+    Y_test = valid_label
+    print("\nRAW")
+    print("X train:", train_data.shape)
+    print("X test :", valid_data.shape)
+    print("Y train:", Y_train.shape)
+    print("Y test :", Y_test.shape)
+    mean = train_data.mean(0)
+    std = train_data.std(0) + 1e-3
+    train_data = (train_data - mean) / std
+    test_mean = valid_data.mean(0)
+    test_std = valid_data.std(0) + 1e-3
+    valid_data = (valid_data - test_mean) / test_std
+    print("\nAFTER NORMALIZATION")
+    print("train mean:", float(train_data.mean()), "std:", float(train_data.std()))
+    print("test mean:", float(valid_data.mean()), "std:", float(valid_data.std()))
+    return (
+        train_data.astype(np.float32),
+        valid_data.astype(np.float32),
+        Y_train.astype(np.float32),
+        Y_test.astype(np.float32)
+    )
+
+def build_cebra(adversarial=False):
+    print("\nBuilding CEBRA")
+    print("mode:", "ACORN" if adversarial else "CLEAN")
+    if adversarial:
+        return CEBRA(
+            batch_size=BATCH_SIZE,
+            temperature=TEMPERATURE,
+            model_architecture=MODEL_ARCH,
+            time_offsets=OFFSET,
+            max_iterations=MAX_ITER,
+            output_dimension=LATENT_DIM,
+            num_hidden_units=HIDDEN,
+            training_mode="adversarial",
+            adv_alpha=ADV_EPS / 5,
+            adv_epsilon=ADV_EPS,
+            adv_steps=ADV_STEPS,
+            attack_norm=ATTACK_NORM,
+            device="cuda_if_available",
+            verbose=True
+        )
+    else:
+        return CEBRA(
+            batch_size=BATCH_SIZE,
+            temperature=TEMPERATURE,
+            model_architecture=MODEL_ARCH,
+            time_offsets=OFFSET,
+            max_iterations=MAX_ITER,
+            output_dimension=LATENT_DIM,
+            num_hidden_units=HIDDEN,
+            training_mode="clean",
+            device="cuda_if_available",
+            verbose=True
+        )
+def train_cebra(X_train, adversarial=False):
+    model = build_cebra(adversarial=adversarial)
+    name = "ACORN" if adversarial else "CLEAN"
+    print("\n" + "=" * 90)
+    print("TRAINING", name)
+    print("=" * 90)
+    model.fit(X_train.astype(np.float32))
+    return model
+
+def train_decoder(Z_train, Y_train, tag):
+    print("\n" + "=" * 90)
+    print("TRAIN DECODER:", tag)
+    print("=" * 90)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = torch.tensor(Z_train, dtype=torch.float32, device=device)
+    y = torch.tensor(Y_train, dtype=torch.float32, device=device)
+    decoder = MonkeyDecoder(
+        LATENT_DIM,
+        DECODER_HIDDEN,
+        DECODER_LAYERS,
+        DECODER_DROPOUT,
+        False,
+        Y_train.shape[1],
+        n_train_steps=DECODER_STEPS
+    ).to(device)
+    print(decoder)
+    decoder.fit(x, y)
+    return decoder
+
+def evaluate_decoder(decoder, Z_test, Y_test, tag):
+    print("\n" + "=" * 90)
+    print(tag)
+    print("=" * 90)
+    device = next(decoder.parameters()).device
+    decoder.eval()
+    with torch.no_grad():
+        pred = decoder(torch.tensor(Z_test, dtype=torch.float32, device=device))
+        pred = pred.cpu().numpy()
+    r2s = []
+    for i in range(Y_test.shape[1]):
+        r2 = r2_score(Y_test[:, i], pred[:, i])
+        r2s.append(r2)
+        print("dim", i, "R2:", r2)
+    mean_r2 = float(np.mean(r2s))
+    print("Mean R2:", mean_r2)
+    return mean_r2
+import os, sys, gc, random
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
+from utils.constants import CEBRA_DIR
+from utils.gru_decoder_monkey import MonkeyDecoder
+
+sys.path.insert(0, str(CEBRA_DIR))
+import cebra
+from cebra import CEBRA
+import cebra.attribution
+
+print("\nUsing CEBRA:")
+print(cebra.__file__)
+
+PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
+DATASET_NAME = "C-CO"
+DAY = 0
+SESSION = f"{DATASET_NAME}{DAY}"
+NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION}.npz")
+OUT = f"Teacher_test_{SESSION}"
+os.makedirs(OUT, exist_ok=True)
 
 SEED = 42
 LATENT_DIM = 64
-NUM_HIDDEN_UNITS = 512
-BATCH_SIZE = 512
+HIDDEN = 64
+BATCH_SIZE = 2048
 MAX_ITER = 5000
 TEMPERATURE = 0.4
-TIME_OFFSETS = 4
+OFFSET = 1
 MODEL_ARCH = "offset36-model-more-dropout"
+ADV_EPS = 0.5
+ADV_STEPS = 10
+ATTACK_NORM = "l2"
+DECODER_HIDDEN = 512
+DECODER_LAYERS = 2
+DECODER_DROPOUT = 0.4
+DECODER_STEPS = 2500
+ATTR_CHUNKS = 16
+ATTR_LEN = 128
+ATTR_BATCH = 16
 
-DECODER_HIDDEN = 128
-DECODER_STEPS = 10000
-
-def seed_all(s):
-    random.seed(s)
-    np.random.seed(s)
-    torch.manual_seed(s)
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+        torch.cuda.manual_seed_all(seed)
+seed_all(SEED)
 
-class Decoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(LATENT_DIM, DECODER_HIDDEN),
-            nn.ReLU(),
-            nn.Linear(DECODER_HIDDEN, 2)
+def load_perich():
+    print("\n" + "=" * 90)
+    print("LOADING PERICH")
+    print("=" * 90)
+    print("File:", NPZ_PATH)
+    data = np.load(NPZ_PATH, allow_pickle=True)
+    train_data = data["train_data"].astype(np.float32)
+    valid_data = data["valid_data"].astype(np.float32)
+    train_label = data["train_label"].astype(np.float32)
+    valid_label = data["valid_label"].astype(np.float32)
+    Y_train = train_label
+    Y_test = valid_label
+    print("\nRAW")
+    print("X train:", train_data.shape)
+    print("X test :", valid_data.shape)
+    print("Y train:", Y_train.shape)
+    print("Y test :", Y_test.shape)
+    mean = train_data.mean(0)
+    std = train_data.std(0) + 1e-3
+    train_data = (train_data - mean) / std
+    test_mean = valid_data.mean(0)
+    test_std = valid_data.std(0) + 1e-3
+    valid_data = (valid_data - test_mean) / test_std
+    print("\nAFTER NORMALIZATION")
+    print("train mean:", float(train_data.mean()), "std:", float(train_data.std()))
+    print("test mean:", float(valid_data.mean()), "std:", float(valid_data.std()))
+    return (train_data.astype(np.float32), valid_data.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
+
+def build_cebra(adversarial=False):
+    print("\nBuilding CEBRA")
+    print("mode:", "ACORN" if adversarial else "CLEAN")
+    if adversarial:
+        return CEBRA(
+            batch_size=BATCH_SIZE,
+            temperature=TEMPERATURE,
+            model_architecture=MODEL_ARCH,
+            time_offsets=OFFSET,
+            max_iterations=MAX_ITER,
+            output_dimension=LATENT_DIM,
+            num_hidden_units=HIDDEN,
+            training_mode="adversarial",
+            adv_alpha=ADV_EPS / 5,
+            adv_epsilon=ADV_EPS,
+            adv_steps=ADV_STEPS,
+            attack_norm=ATTACK_NORM,
+            device="cuda_if_available",
+            verbose=True
         )
-    def forward(self,x):
-        return self.net(x)
+    else:
+        return CEBRA(
+            batch_size=BATCH_SIZE,
+            temperature=TEMPERATURE,
+            model_architecture=MODEL_ARCH,
+            time_offsets=OFFSET,
+            max_iterations=MAX_ITER,
+            output_dimension=LATENT_DIM,
+            num_hidden_units=HIDDEN,
+            training_mode="clean",
+            device="cuda_if_available",
+            verbose=True
+        )
 
-def main():
-    seed_all(SEED)
+def train_cebra(X_train, adversarial=False):
+    model = build_cebra(adversarial=adversarial)
+    name = "ACORN" if adversarial else "CLEAN"
+    print("\n" + "=" * 90)
+    print("TRAINING", name)
+    print("=" * 90)
+    model.fit(X_train.astype(np.float32))
+    return model
 
-    data=np.load(NPZ_PATH, allow_pickle=True)
-    Xtr=data["train_data"].astype(np.float32)
-    Xte=data["valid_data"].astype(np.float32)
-    Ytr=data["train_label"].astype(np.float32)[:,2:4]
-    Yte=data["valid_label"].astype(np.float32)[:,2:4]
+def train_decoder(Z_train, Y_train, tag):
+    print("\n" + "=" * 90)
+    print("TRAIN DECODER:", tag)
+    print("=" * 90)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = torch.tensor(Z_train, dtype=torch.float32, device=device)
+    y = torch.tensor(Y_train, dtype=torch.float32, device=device)
+    decoder = MonkeyDecoder(
+        input_dim=LATENT_DIM,
+        hidden_dim=DECODER_HIDDEN,
+        output_dim=Y_train.shape[1],
+        dropout=DECODER_DROPOUT,
+        bidirectional=False,
+        layers=DECODER_LAYERS,
+        n_train_steps=DECODER_STEPS
+    ).to(device)
+    print(decoder)
+    decoder.fit(x, y)
+    return decoder
 
-    print("="*100)
-    print("CEBRA TIME + DECODER TEST (CLEAN)")
-    print(Xtr.shape, Xte.shape)
-
-    model=CEBRA(
-        batch_size=BATCH_SIZE,
-        temperature=TEMPERATURE,
-        model_architecture=MODEL_ARCH,
-        time_offsets=TIME_OFFSETS,
-        max_iterations=MAX_ITER,
-        output_dimension=LATENT_DIM,
-        num_hidden_units=NUM_HIDDEN_UNITS,
-        training_mode="clean",
-        device="cuda_if_available",
-        verbose=True,
-    )
-
-    print("Training CEBRA time...")
-    model.fit(Xtr)
-
-    Ztr=np.asarray(model.transform(Xtr),dtype=np.float32)
-    Zte=np.asarray(model.transform(Xte),dtype=np.float32)
-
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    xtr=torch.from_numpy(Ztr).float().to(device)
-    ytr=torch.from_numpy(Ytr).float().to(device)
-    xte=torch.from_numpy(Zte).float().to(device)
-
-    decoder=Decoder().to(device)
-    opt=torch.optim.Adam(decoder.parameters(),lr=1e-3)
-    loss_fn=nn.MSELoss()
-
-    print("Training decoder...")
-    for e in range(DECODER_STEPS):
-        opt.zero_grad()
-        loss=loss_fn(decoder(xtr),ytr)
-        loss.backward()
-        opt.step()
-        if e==0 or (e+1)%2000==0:
-            print("epoch",e+1,"loss",float(loss.detach()))
-
+def evaluate_decoder(decoder, Z_test, Y_test, tag):
+    print("\n" + "=" * 90)
+    print(tag)
+    print("=" * 90)
+    device = next(decoder.parameters()).device
     decoder.eval()
     with torch.no_grad():
-        pred=decoder(xte).cpu().numpy()
+        pred = decoder(torch.tensor(Z_test, dtype=torch.float32, device=device))
+        pred = pred.cpu().numpy()
+    r2s = []
+    for i in range(Y_test.shape[1]):
+        r2 = r2_score(Y_test[:, i], pred[:, i])
+        r2s.append(r2)
+        print("dim", i, "R2:", r2)
+    mean_r2 = float(np.mean(r2s))
+    print("Mean R2:", mean_r2)
+    return mean_r2
 
-    mse=mean_squared_error(Yte,pred)
-    r2x=r2_score(Yte[:,0],pred[:,0])
-    r2y=r2_score(Yte[:,1],pred[:,1])
+def compute_jacobian(model, X, name):
+    print("\n" + "=" * 90)
+    print("JACOBIAN:", name)
+    print("=" * 90)
+    net = model.solver_.model
+    device = next(net.parameters()).device
+    net.eval()
+    n_neurons = X.shape[1]
+    starts = np.linspace(0, len(X) - ATTR_LEN - 1, ATTR_CHUNKS, dtype=int)
+    jf_sum = np.zeros((LATENT_DIM, n_neurons), dtype=np.float64)
+    total = 0
+    for i, start in enumerate(starts):
+        chunk = X[start:start + ATTR_LEN]
+        inp = torch.tensor(chunk, dtype=torch.float32, device=device, requires_grad=True)
+        method = cebra.attribution.init(
+            name="jacobian-based-batched",
+            model=net,
+            input_data=inp,
+            output_dimension=LATENT_DIM
+        )
+        with torch.enable_grad():
+            result = method.compute_attribution_map(batch_size=ATTR_BATCH)
+        jf = result["jf"]
+        jf = np.abs(np.asarray(jf))
+        jf = np.squeeze(jf)
+        if jf.shape != (LATENT_DIM, n_neurons):
+            jf = np.mean(jf, axis=tuple(range(jf.ndim - 2)))
+        jf_sum += jf * len(chunk)
+        total += len(chunk)
+        print("chunk", i + 1, "/", ATTR_CHUNKS)
+    jf = (jf_sum / total).astype(np.float32)
+    print("Final JF:", jf.shape)
+    np.save(os.path.join(OUT, f"{name}_JF.npy"), jf)
+    plt.figure(figsize=(12, 8))
+    plt.imshow(jf, aspect="auto")
+    plt.colorbar()
+    plt.title(f"{name} Forward Jacobian")
+    path = os.path.join(OUT, f"{name}_JF.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print("saved:", path)
+    return jf
 
-    print("\nRESULT")
-    print("MSE:",mse)
-    print("R2 vx:",r2x)
-    print("R2 vy:",r2y)
-    print("Mean R2:",(r2x+r2y)/2)
+def main():
+    print("\n" + "=" * 100)
+    print("PERICH TEACHER SETUP TEST")
+    print("=" * 100)
+    X_train, X_test, Y_train, Y_test = load_perich()
+    clean_model = train_cebra(X_train, adversarial=False)
+    Z_train = clean_model.transform(X_train)
+    Z_test = clean_model.transform(X_test)
+    clean_decoder = train_decoder(Z_train, Y_train, "CLEAN")
+    clean_r2 = evaluate_decoder(clean_decoder, Z_test, Y_test, "CLEAN TEST")
+    compute_jacobian(clean_model, X_train, "CLEAN")
+    torch.save(clean_decoder.state_dict(), os.path.join(OUT, "clean_decoder.pt"))
+    del clean_model, clean_decoder
+    gc.collect()
+    torch.cuda.empty_cache()
+    acorn_model = train_cebra(X_train, adversarial=True)
+    Z_train = acorn_model.transform(X_train)
+    Z_test = acorn_model.transform(X_test)
+    acorn_decoder = train_decoder(Z_train, Y_train, "ACORN")
+    acorn_r2 = evaluate_decoder(acorn_decoder, Z_test, Y_test, "ACORN TEST")
+    compute_jacobian(acorn_model, X_train, "ACORN")
+    torch.save(acorn_decoder.state_dict(), os.path.join(OUT, "acorn_decoder.pt"))
+    print("\n" + "=" * 100)
+    print("FINAL")
+    print("=" * 100)
+    print("CLEAN R2:", clean_r2)
+    print("ACORN R2:", acorn_r2)
+    np.save(os.path.join(OUT, "summary.npy"), np.array([clean_r2, acorn_r2]))
+    print("\nDONE")
+    print("Output:", OUT)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
-
-
-# import os, sys, gc, random
-# import numpy as np
-# import pandas as pd
-# import torch
-# import torch.nn as nn
-# import matplotlib.pyplot as plt
-# from scipy.ndimage import gaussian_filter1d
-# from sklearn.metrics import r2_score
-# from utils.constants import CEBRA_DIR
-
-# for m in list(sys.modules):
-#     if m == "cebra" or m.startswith("cebra."):
-#         del sys.modules[m]
-# sys.path.insert(0, str(CEBRA_DIR))
-
-# import cebra
-# import cebra.attribution
-# from cebra import CEBRA
-
-# PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
-# DATASET_NAME = "C-CO"
-# DAY = 0
-# SESSION_NAME = f"{DATASET_NAME}{DAY}"
-# NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION_NAME}.npz")
-# OUT = f"Perich_{SESSION_NAME}_Preprocess_Check"
-# os.makedirs(OUT, exist_ok=True)
-
-# SEED = 42
-# LATENT_DIM = 64
-# HIDDEN = 512
-# BATCH_SIZE = 512
-# MAX_ITER = 5000
-# TEMPERATURE = 0.4
-# TIME_OFFSETS = 4
-# MODEL_ARCH = "offset36-model-more-dropout"
-# ATTR_CHUNKS = 16
-# ATTR_CHUNK_LEN = 128
-# ATTR_BATCH = 16
-# DECODER_HIDDEN = 128
-# DECODER_EPOCHS = 2500
-
-# def seed_all(seed):
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     if torch.cuda.is_available():
-#         torch.cuda.manual_seed_all(seed)
-
-# def cleanup():
-#     gc.collect()
-#     if torch.cuda.is_available():
-#         torch.cuda.empty_cache()
-
-# class MLP(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(LATENT_DIM, DECODER_HIDDEN),
-#             nn.ReLU(),
-#             nn.Linear(DECODER_HIDDEN, 2)
-#         )
-#     def forward(self, x):
-#         return self.net(x)
-
-# def load_data():
-#     d = np.load(NPZ_PATH, allow_pickle=True)
-#     X_train = d["train_data"].astype(np.float32)
-#     X_test = d["valid_data"].astype(np.float32)
-#     Y_train = d["train_label"].astype(np.float32)[:, 2:4]
-#     Y_test = d["valid_label"].astype(np.float32)[:, 2:4]
-#     return X_train, X_test, Y_train, Y_test
-
-# def create_versions(X_train, X_test):
-#     versions = {}
-#     versions["RAW"] = (X_train.copy(), X_test.copy())
-#     mean = X_train.mean(axis=0)
-#     std = X_train.std(axis=0) + 1e-3
-#     versions["NORMALIZED"] = (
-#         ((X_train - mean) / std).astype(np.float32),
-#         ((X_test - mean) / std).astype(np.float32)
-#     )
-#     versions["SMOOTHED"] = (
-#         gaussian_filter1d(X_train, sigma=2, axis=0).astype(np.float32),
-#         gaussian_filter1d(X_test, sigma=2, axis=0).astype(np.float32)
-#     )
-#     return versions
-
-# def train_cebra(X):
-#     model = CEBRA(
-#         batch_size=BATCH_SIZE,
-#         temperature=TEMPERATURE,
-#         model_architecture=MODEL_ARCH,
-#         time_offsets=TIME_OFFSETS,
-#         max_iterations=MAX_ITER,
-#         output_dimension=LATENT_DIM,
-#         num_hidden_units=HIDDEN,
-#         training_mode="clean",
-#         device="cuda_if_available",
-#         verbose=True,
-#     )
-#     model.fit(X)
-#     return model
-
-# def train_decoder(model, Xtr, Xte, Ytr, Yte, name):
-#     Ztr = np.asarray(model.transform(Xtr), dtype=np.float32)
-#     Zte = np.asarray(model.transform(Xte), dtype=np.float32)
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-#     net = MLP().to(device)
-#     x = torch.tensor(Ztr, dtype=torch.float32, device=device)
-#     y = torch.tensor(Ytr, dtype=torch.float32, device=device)
-#     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
-#     for e in range(DECODER_EPOCHS):
-#         opt.zero_grad()
-#         loss = nn.functional.mse_loss(net(x), y)
-#         loss.backward()
-#         opt.step()
-#         if e == 0 or (e + 1) % 1000 == 0:
-#             print(name, "epoch", e + 1, "loss", float(loss))
-#     net.eval()
-#     with torch.no_grad():
-#         pred = net(torch.tensor(Zte, dtype=torch.float32, device=device)).cpu().numpy()
-#     r2_vx = r2_score(Yte[:, 0], pred[:, 0])
-#     r2_vy = r2_score(Yte[:, 1], pred[:, 1])
-#     mean_r2 = (r2_vx + r2_vy) / 2
-#     print("\nRESULT", name)
-#     print("vx R2:", r2_vx)
-#     print("vy R2:", r2_vy)
-#     print("Mean R2:", mean_r2)
-#     return float(mean_r2)
-
-# def jacobian(model, X, name):
-#     print("\nJacobian:", name)
-#     net = model.solver_.model
-#     net.eval()
-#     device = next(net.parameters()).device
-#     starts = np.linspace(0, len(X) - ATTR_CHUNK_LEN - 1, ATTR_CHUNKS, dtype=int)
-#     all_jf = []
-#     for i, s in enumerate(starts):
-#         chunk = torch.tensor(
-#             X[s:s + ATTR_CHUNK_LEN],
-#             dtype=torch.float32,
-#             device=device,
-#             requires_grad=True
-#         )
-#         method = cebra.attribution.init(
-#             name="jacobian-based-batched",
-#             model=net,
-#             input_data=chunk,
-#             output_dimension=LATENT_DIM
-#         )
-#         result = method.compute_attribution_map(batch_size=ATTR_BATCH)
-#         jf = result["jf"]
-#         if torch.is_tensor(jf):
-#             jf = jf.detach().cpu().numpy()
-#         else:
-#             jf = np.asarray(jf)
-#         jf = np.abs(jf)
-#         while jf.ndim > 2:
-#             jf = jf.mean(axis=0)
-#         if jf.shape[0] != LATENT_DIM:
-#             jf = jf.T
-#         all_jf.append(jf)
-#         print("chunk", i + 1, "/", len(starts))
-#         cleanup()
-#     jf = np.mean(np.stack(all_jf), axis=0)
-#     np.save(os.path.join(OUT, name + "_JF.npy"), jf)
-#     plt.figure(figsize=(12, 6))
-#     plt.imshow(jf, aspect="auto", cmap="viridis")
-#     plt.colorbar(label="|dz/dx|")
-#     plt.title(name + " Forward Jacobian")
-#     plt.xlabel("Neuron")
-#     plt.ylabel("Latent")
-#     path = os.path.join(OUT, name + "_JF.png")
-#     plt.savefig(path, dpi=300, bbox_inches="tight")
-#     plt.close()
-#     print("saved:", path)
-
-# def main():
-#     seed_all(SEED)
-#     X_train, X_test, Y_train, Y_test = load_data()
-#     versions = create_versions(X_train, X_test)
-#     results = []
-#     for name, (Xtr, Xte) in versions.items():
-#         print("\n" + "=" * 100)
-#         print("RUN:", name)
-#         print("=" * 100)
-#         model = train_cebra(Xtr)
-#         r2 = train_decoder(model, Xtr, Xte, Y_train, Y_test, name)
-#         jacobian(model, Xtr, name)
-#         results.append({"condition": name, "mean_r2": r2})
-#         del model
-#         cleanup()
-#     pd.DataFrame(results).to_csv(os.path.join(OUT, "results.csv"), index=False)
-#     print("\nDONE")
-#     print("Output:", OUT)
-
-# if __name__ == "__main__":
-#     main()
-
-
-
-# # import os
-# # import sys
-# # import random
-# # import numpy as np
-# # import torch
-# # import torch.nn as nn
-# # from tqdm import tqdm
-# # from sklearn.metrics import r2_score
-# # from utils.constants import CEBRA_DIR
-
-# # for module_name in list(sys.modules):
-# #     if module_name == "cebra" or module_name.startswith("cebra."):
-# #         del sys.modules[module_name]
-# # sys.path.insert(0, str(CEBRA_DIR))
-# # import cebra
-# # from cebra import CEBRA
-
-# # print("\nUsing CEBRA:")
-# # print(cebra.__file__)
-
-# # DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw"
-# # DATASET = "C-CO"
-# # DAY = 10
-# # NPZ_PATH = os.path.join(DATA_DIR, f"{DATASET}{DAY}.npz")
-# # SEED = 42
-# # LATENT_DIM = 64
-# # HIDDEN = 512
-# # BATCH_SIZE = 1024 * 2
-# # MAX_ITER = 5000
-# # TEMPERATURE = 0.4
-# # TIME_OFFSETS = 4
-# # MODEL_ARCH = "offset36-model-more-dropout"
-# # DEVICE = "cuda_if_available"
-
-# # def seed_all(seed):
-# #     random.seed(seed)
-# #     np.random.seed(seed)
-# #     torch.manual_seed(seed)
-# #     if torch.cuda.is_available():
-# #         torch.cuda.manual_seed_all(seed)
-
-# # seed_all(SEED)
-
-# # def load_data():
-# #     print("\n")
-# #     print("=" * 90)
-# #     print("LOADING PERICH")
-# #     print("=" * 90)
-# #     print(NPZ_PATH)
-# #     data = np.load(NPZ_PATH, allow_pickle=True)
-# #     print(data.files)
-# #     X_train = data["train_data"].astype(np.float32)
-# #     X_test = data["valid_data"].astype(np.float32)
-# #     Y_train = data["train_label"].astype(np.float32)
-# #     Y_test = data["valid_label"].astype(np.float32)
-# #     print("\nOriginal labels")
-# #     print("train:", Y_train.shape)
-# #     print("test :", Y_test.shape)
-# #     Y_train = Y_train[:, 2:4]
-# #     Y_test = Y_test[:, 2:4]
-# #     print("\nFinal")
-# #     print("X train:", X_train.shape)
-# #     print("X test :", X_test.shape)
-# #     print("Y train:", Y_train.shape)
-# #     print("Y test :", Y_test.shape)
-# #     return X_train, X_test, Y_train, Y_test
-
-# # def diagnostic(X_train, X_test, Y_train, Y_test):
-# #     print("\n")
-# #     print("=" * 90)
-# #     print("DATA DIAGNOSTIC")
-# #     print("=" * 90)
-# #     for name, x in [("X_train", X_train), ("X_test", X_test), ("Y_train", Y_train), ("Y_test", Y_test)]:
-# #         print("\n", name)
-# #         print("shape:", x.shape)
-# #         print("mean :", float(x.mean()))
-# #         print("std  :", float(x.std()))
-# #         print("min  :", float(x.min()))
-# #         print("max  :", float(x.max()))
-# #         print("nan :", np.isnan(x).sum())
-
-# # def train_cebra(X_train, Y_train):
-# #     print("\n")
-# #     print("=" * 90)
-# #     print("TRAINING CLEAN CEBRA (SUPERVISED)")
-# #     print("=" * 90)
-# #     model = CEBRA(
-# #         batch_size=BATCH_SIZE,
-# #         temperature=TEMPERATURE,
-# #         model_architecture=MODEL_ARCH,
-# #         time_offsets=TIME_OFFSETS,
-# #         max_iterations=MAX_ITER,
-# #         output_dimension=LATENT_DIM,
-# #         num_hidden_units=HIDDEN,
-# #         training_mode="clean",
-# #         conditional="time_delta",
-# #         device=DEVICE,
-# #         verbose=True
-# #     )
-# #     model.fit(X_train, Y_train)
-# #     return model
-
-# # def embedding_check(Z_train, Z_test):
-# #     print("\n")
-# #     print("=" * 90)
-# #     print("EMBEDDING")
-# #     print("=" * 90)
-# #     for n, z in [("Z_train", Z_train), ("Z_test", Z_test)]:
-# #         print("\n", n)
-# #         print(z.shape)
-# #         print("mean:", z.mean())
-# #         print("std :", z.std())
-
-# # class SimpleGRUDecoder(nn.Module):
-# #     def __init__(self, input_dim, hidden_dim=128, output_dim=2):
-# #         super().__init__()
-# #         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
-# #         self.fc = nn.Linear(hidden_dim, output_dim)
-# #     def forward(self, x):
-# #         if x.ndim == 2:
-# #             x = x.unsqueeze(1)
-# #         out, _ = self.gru(x)
-# #         out = out[:, -1, :]
-# #         return self.fc(out)
-
-# # def train_decoder(model, X, Y, epochs=2000):
-# #     model.train()
-# #     X = torch.tensor(X, dtype=torch.float32, device="cuda")
-# #     Y = torch.tensor(Y, dtype=torch.float32, device="cuda")
-# #     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-# #     loss_fn = nn.MSELoss()
-# #     for e in tqdm(range(epochs)):
-# #         optimizer.zero_grad()
-# #         pred = model(X)
-# #         loss = loss_fn(pred, Y)
-# #         loss.backward()
-# #         optimizer.step()
-# #         if e % 200 == 0:
-# #             print("epoch", e, "loss", float(loss.detach()))
-
-# # def evaluate(model, X, Y, name):
-# #     model.eval()
-# #     with torch.no_grad():
-# #         X = torch.tensor(X, dtype=torch.float32, device="cuda")
-# #         pred = model(X).cpu().numpy()
-# #     print("\n")
-# #     print("=" * 80)
-# #     print(name)
-# #     print("=" * 80)
-# #     scores = []
-# #     for i, n in enumerate(["vx", "vy"]):
-# #         r2 = r2_score(Y[:, i], pred[:, i])
-# #         scores.append(r2)
-# #         print(n, "R2:", r2)
-# #     print("Mean R2:", np.mean(scores))
-# #     print("\nExamples")
-# #     for i in range(5):
-# #         print("true:", Y[i], "pred:", pred[i])
-
-# # def main():
-# #     print("\n")
-# #     print("=" * 90)
-# #     print("PERICH SUPERVISED CEBRA + GRU")
-# #     print("=" * 90)
-# #     X_train, X_test, Y_train, Y_test = load_data()
-# #     diagnostic(X_train, X_test, Y_train, Y_test)
-# #     model = train_cebra(X_train, Y_train)
-# #     Z_train = model.transform(X_train)
-# #     Z_test = model.transform(X_test)
-# #     embedding_check(Z_train, Z_test)
-# #     decoder = SimpleGRUDecoder(LATENT_DIM, 128, 2).cuda()
-# #     print("\nTRAINING DECODER")
-# #     train_decoder(decoder, Z_train, Y_train, epochs=2000)
-# #     evaluate(decoder, Z_train, Y_train, "TRAIN")
-# #     evaluate(decoder, Z_test, Y_test, "TEST")
-# #     print("\nDONE")
-
-# # if __name__ == "__main__":
-# #     main()
