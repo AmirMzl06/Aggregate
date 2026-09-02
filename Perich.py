@@ -49,7 +49,7 @@ ATTR_CHUNK_LEN = 128
 ATTR_BATCH_SIZE = 16
 
 DECODER_HIDDEN = 128
-DECODER_STEPS = 10000
+DECODER_STEPS = 2500
 
 def seed_all(seed):
     random.seed(seed)
