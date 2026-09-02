@@ -169,48 +169,6 @@ def evaluate_decoder(decoder, Z_test, Y_test, tag):
     mean_r2 = float(np.mean(r2s))
     print("Mean R2:", mean_r2)
     return mean_r2
-import os, sys, gc, random
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from sklearn.metrics import r2_score
-from utils.constants import CEBRA_DIR
-from utils.gru_decoder_monkey import MonkeyDecoder
-
-sys.path.insert(0, str(CEBRA_DIR))
-import cebra
-from cebra import CEBRA
-import cebra.attribution
-
-print("\nUsing CEBRA:")
-print(cebra.__file__)
-
-PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
-DATASET_NAME = "C-CO"
-DAY = 0
-SESSION = f"{DATASET_NAME}{DAY}"
-NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION}.npz")
-OUT = f"Teacher_test_{SESSION}"
-os.makedirs(OUT, exist_ok=True)
-
-SEED = 42
-LATENT_DIM = 64
-HIDDEN = 64
-BATCH_SIZE = 2048
-MAX_ITER = 5000
-TEMPERATURE = 0.4
-OFFSET = 1
-MODEL_ARCH = "offset36-model-more-dropout"
-ADV_EPS = 0.5
-ADV_STEPS = 10
-ATTACK_NORM = "l2"
-DECODER_HIDDEN = 512
-DECODER_LAYERS = 2
-DECODER_DROPOUT = 0.4
-DECODER_STEPS = 2500
-ATTR_CHUNKS = 16
-ATTR_LEN = 128
-ATTR_BATCH = 16
 
 def seed_all(seed):
     random.seed(seed)
