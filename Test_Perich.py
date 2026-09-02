@@ -44,7 +44,7 @@ TEMPERATURE = 0.4
 OFFSET = 1
 MODEL_ARCH = "offset36-model-more-dropout"
 
-ADV_EPS = 0.5
+ADV_EPS = 5
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
 
