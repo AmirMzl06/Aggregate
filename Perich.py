@@ -1761,15 +1761,6 @@ def main():
     print("\nSaved:")
     print(os.path.join(OUT, "JF_CLEAN_vs_ACORN.png"))
     print(os.path.join(OUT, "JFINV_CLEAN_vs_ACORN.png"))
-    print("\nJF definition:")
-    print("dz/dx")
-    print("JF rows    = 128 latent dimensions")
-    print("JF columns = neurons")
-    print("JFINV rows = neurons")
-    print("JFINV cols = 128 latent dimensions")
-    print("\nNo decoder was trained.")
-    print("No normalization was applied.")
-    print("No Jacobian regularization was applied.")
 
 if __name__ == "__main__":
     main()
