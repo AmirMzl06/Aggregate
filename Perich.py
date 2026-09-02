@@ -205,6 +205,8 @@ def train_decoder(model, X_train, X_test, Y_train, Y_test, condition_name):
     yte = torch.from_numpy(y_test).float()
     seed_all(SEED)
     decoder, device = build_decoder()
+    xte = xte.to(device)
+    yte = yte.to(device)
     print("\nDecoder config")
     print("hidden:", DECODER_HIDDEN)
     print("layers:", DECODER_LAYERS)
