@@ -150,7 +150,10 @@ def jacobian(model, X, name):
         )
         result = method.compute_attribution_map(batch_size=ATTR_BATCH)
         jf = result["jf"]
-        jf = jf.detach().cpu().numpy()
+        if torch.is_tensor(jf):
+            jf = jf.detach().cpu().numpy()
+        else:
+            jf = np.asarray(jf)
         jf = np.abs(jf)
         while jf.ndim > 2:
             jf = jf.mean(axis=0)
