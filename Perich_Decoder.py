@@ -348,6 +348,7 @@ def compute_jacobian(model, X, name):
     return jf
 
 def main():
+    global ADV_EPS
     print("\n" + "=" * 100)
     print("PERICH TEACHER SETUP TEST")
     print("=" * 100)
