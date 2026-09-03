@@ -7,6 +7,8 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
+from utils.min_distance import min_l2_distance
+
 from gru_decoder_monkey import MonkeyDecoder
 
 sys.path.insert(0, str(CEBRA_DIR))
@@ -44,7 +46,7 @@ TEMPERATURE = 0.4
 OFFSET = 1
 MODEL_ARCH = "offset36-model-more-dropout"
 
-ADV_EPS = 5
+# ADV_EPS = 5
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
 
@@ -90,6 +92,20 @@ def load_perich():
         Y_test.astype(np.float32)
     )
 
+def compute_adv_epsilon(X):
+    print("\n" + "=" * 90)
+    print("COMPUTING ADV EPSILON")
+    print("=" * 90)
+    x_tensor = torch.from_numpy(X).float()
+    min_dist = float(min_l2_distance(x_tensor))
+    adv_eps = min_dist / 2.0
+    adv_eps = max(adv_eps, 1e-6)
+    adv_alpha = adv_eps / 5.0
+    print("min L2 distance:", min_dist)
+    print("epsilon:", adv_eps)
+    print("alpha:", adv_alpha)
+    return adv_eps
+    
 def build_cebra(adversarial=False):
     print("\nBuilding CEBRA")
     print("mode:", "ACORN" if adversarial else "CLEAN")
@@ -335,6 +351,7 @@ def main():
     print("PERICH TEACHER SETUP TEST")
     print("=" * 100)
     X_train, X_test, Y_train, Y_test = load_perich()
+    ADV_EPS = compute_adv_epsilon(X_train)
     clean_model = train_cebra(X_train, adversarial=False)
     Z_train = clean_model.transform(X_train)
     Z_test = clean_model.transform(X_test)
