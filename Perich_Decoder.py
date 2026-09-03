@@ -46,7 +46,7 @@ TEMPERATURE = 0.4
 OFFSET = 1
 MODEL_ARCH = "offset36-model-more-dropout"
 
-# ADV_EPS = 5
+ADV_EPS = None
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
 
@@ -107,6 +107,7 @@ def compute_adv_epsilon(X):
     return adv_eps
     
 def build_cebra(adversarial=False):
+    global ADV_EPS
     print("\nBuilding CEBRA")
     print("mode:", "ACORN" if adversarial else "CLEAN")
     if adversarial:
