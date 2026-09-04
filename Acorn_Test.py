@@ -81,18 +81,18 @@ def load_perich():
     print("X test :", X_test.shape)
     print("Y train:", Y_train.shape)
     print("Y test :", Y_test.shape)
-    # ===============================
-    # Z-score normalization
-    # train statistics only
-    # ===============================
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0) + 1e-3
-    X_train = (X_train - mean) / std
-    X_test = (X_test - mean) / std
+    # # ===============================
+    # # Z-score normalization
+    # # train statistics only
+    # # ===============================
+    # mean = X_train.mean(axis=0)
+    # std = X_train.std(axis=0) + 1e-3
+    # X_train = (X_train - mean) / std
+    # X_test = (X_test - mean) / std
 
-    print("\nAfter normalization")
-    print("Train mean:", float(X_train.mean()), "std:", float(X_train.std()))
-    print("Test mean:", float(X_test.mean()), "std:", float(X_test.std()))
+    # print("\nAfter normalization")
+    # print("Train mean:", float(X_train.mean()), "std:", float(X_train.std()))
+    # print("Test mean:", float(X_test.mean()), "std:", float(X_test.std()))
 
     return (X_train.astype(np.float32),X_test.astype(np.float32),Y_train.astype(np.float32),Y_test.astype(np.float32))
 
