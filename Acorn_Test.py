@@ -35,7 +35,8 @@ BATCH_SIZE = 2048
 MAX_ITER = 5000
 TEMPERATURE = 0.4
 OFFSET = 1
-MODEL_ARCH = "offset36-model-more-dropout"
+# MODEL_ARCH = "offset36-model-more-dropout"
+MODEL_ARCH = "offset36-model"
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
 DECODER_HIDDEN = 512
@@ -57,6 +58,18 @@ def seed_all(seed):
 
 seed_all(SEED)
 
+# def load_perich():
+#     print("\nLoading data")
+#     data = np.load(NPZ_PATH, allow_pickle=True)
+#     X_train = data["train_data"].astype(np.float32)
+#     X_test = data["valid_data"].astype(np.float32)
+#     Y_train = data["train_label"].astype(np.float32)
+#     Y_test = data["valid_label"].astype(np.float32)
+#     print("X train:", X_train.shape)
+#     print("X test :", X_test.shape)
+#     print("Y train:", Y_train.shape)
+#     print("Y test :", Y_test.shape)
+#     return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
 def load_perich():
     print("\nLoading data")
     data = np.load(NPZ_PATH, allow_pickle=True)
@@ -68,7 +81,21 @@ def load_perich():
     print("X test :", X_test.shape)
     print("Y train:", Y_train.shape)
     print("Y test :", Y_test.shape)
-    return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
+    # ===============================
+    # Z-score normalization
+    # train statistics only
+    # ===============================
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0) + 1e-3
+    X_train = (X_train - mean) / std
+    X_test = (X_test - mean) / std
+
+    print("\nAfter normalization")
+    print("Train mean:", float(X_train.mean()), "std:", float(X_train.std()))
+    print("Test mean:", float(X_test.mean()), "std:", float(X_test.std()))
+
+    return (X_train.astype(np.float32),X_test.astype(np.float32),Y_train.astype(np.float32),Y_test.astype(np.float32))
+
 
 def compute_adv_epsilon(X):
     print("\nComputing epsilon")
