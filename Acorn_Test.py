@@ -10,6 +10,7 @@ from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
 from utils.min_distance import min_l2_distance
 from gru_decoder_monkey import MonkeyDecoder
+from scipy.ndimage import gaussian_filter1d
 
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
@@ -44,6 +45,9 @@ DECODER_STEPS = 2500
 ATTR_CHUNKS = 16
 ATTR_LEN = 128
 ATTR_BATCH = 16
+
+SMOOTH_MS = 100
+
 DEVICE = "cuda_if_available"
 
 def seed_all(seed):
@@ -55,24 +59,161 @@ def seed_all(seed):
 
 seed_all(SEED)
 
+def find_sampling_rate(data):
+
+    possible_keys = [
+        "sampling_rate",
+        "sample_rate",
+        "hz",
+        "fps",
+        "bin_size",
+        "dt",
+        "time_step"
+    ]
+
+    print("\nSearching sampling rate...")
+
+    print("Available npz keys:")
+    print(list(data.keys()))
+
+    for key in possible_keys:
+
+        if key in data:
+
+            value = data[key]
+
+            if np.ndim(value) == 0:
+                value = float(value)
+
+            else:
+                value = float(value[0])
+
+
+            print(
+                "Found:",
+                key,
+                "=",
+                value
+            )
+
+            if key in ["bin_size", "dt", "time_step"]:
+
+                # milliseconds
+                if value > 0:
+                    hz = 1000.0 / value
+
+                return hz
+
+            else:
+                return value
+
+
+    raise RuntimeError(
+        """
+Sampling rate was not found in npz file.
+Available keys were printed above.
+Need to know bin size / Hz.
+"""
+    )
+
+
 def load_perich():
+
     print("\nLoading data")
-    data = np.load(NPZ_PATH, allow_pickle=True)
+
+    data = np.load(
+        NPZ_PATH,
+        allow_pickle=True
+    )
+
+
+    hz = find_sampling_rate(data)
+
+
+    print(
+        "Detected sampling rate:",
+        hz,
+        "Hz"
+    )
+
+
     X_train = data["train_data"].astype(np.float32)
     X_test = data["valid_data"].astype(np.float32)
+
     Y_train = data["train_label"].astype(np.float32)
     Y_test = data["valid_label"].astype(np.float32)
+
+
     print("X train:", X_train.shape)
     print("X test :", X_test.shape)
-    print("Y train:", Y_train.shape)
-    print("Y test :", Y_test.shape)
-    # mean = X_train.mean(0)
-    # std = X_train.std(0) + 1e-3
-    # X_train = (X_train - mean) / std
-    # test_mean = X_test.mean(0)
-    # test_std = X_test.std(0) + 1e-3
-    # X_test = (X_test - test_mean) / test_std
-    return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
+
+
+    # ==================================================
+    # SMOOTH 100 ms
+    # ==================================================
+
+    sigma_samples = (
+        SMOOTH_MS / 1000.0
+    ) * hz
+
+
+    print(
+        "Gaussian smoothing:",
+        SMOOTH_MS,
+        "ms"
+    )
+
+    print(
+        "sigma samples:",
+        sigma_samples
+    )
+
+
+    X_train = gaussian_filter1d(
+        X_train,
+        sigma=sigma_samples,
+        axis=0
+    )
+
+
+    X_test = gaussian_filter1d(
+        X_test,
+        sigma=sigma_samples,
+        axis=0
+    )
+
+
+    print(
+        "After smoothing:",
+        X_train.shape
+    )
+
+
+    return (
+        X_train.astype(np.float32),
+        X_test.astype(np.float32),
+        Y_train.astype(np.float32),
+        Y_test.astype(np.float32)
+    )
+
+# def load_perich():
+#     print("\nLoading data")
+#     data = np.load(NPZ_PATH, allow_pickle=True)
+#     X_train = data["train_data"].astype(np.float32)
+#     X_test = data["valid_data"].astype(np.float32)
+#     Y_train = data["train_label"].astype(np.float32)
+#     Y_test = data["valid_label"].astype(np.float32)
+#     print("X train:", X_train.shape)
+#     print("X test :", X_test.shape)
+#     print("Y train:", Y_train.shape)
+#     print("Y test :", Y_test.shape)
+#     # mean = X_train.mean(0)
+#     # std = X_train.std(0) + 1e-3
+#     # X_train = (X_train - mean) / std
+#     # test_mean = X_test.mean(0)
+#     # test_std = X_test.std(0) + 1e-3
+#     # X_test = (X_test - test_mean) / test_std
+#     return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
 
 def compute_adv_epsilon(X):
     print("\nComputing epsilon")
