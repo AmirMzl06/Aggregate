@@ -79,12 +79,12 @@ def load_perich():
     print("X test :", valid_data.shape)
     print("Y train:", Y_train.shape)
     print("Y test :", Y_test.shape)
-    mean = train_data.mean(0)
-    std = train_data.std(0) + 1e-3
-    train_data = (train_data - mean) / std
-    test_mean = valid_data.mean(0)
-    test_std = valid_data.std(0) + 1e-3
-    valid_data = (valid_data - test_mean) / test_std
+    # mean = train_data.mean(0)
+    # std = train_data.std(0) + 1e-3
+    # train_data = (train_data - mean) / std
+    # test_mean = valid_data.mean(0)
+    # test_std = valid_data.std(0) + 1e-3
+    # valid_data = (valid_data - test_mean) / test_std
     print("\nAFTER NORMALIZATION")
     print("train mean:", float(train_data.mean()), "std:", float(train_data.std()))
     print("test mean :", float(valid_data.mean()), "std:", float(valid_data.std()))
