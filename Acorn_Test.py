@@ -46,6 +46,7 @@ ATTR_CHUNKS = 16
 ATTR_LEN = 128
 ATTR_BATCH = 16
 
+BIN_MS = 10
 SMOOTH_MS = 100
 
 DEVICE = "cuda_if_available"
@@ -59,64 +60,6 @@ def seed_all(seed):
 
 seed_all(SEED)
 
-def find_sampling_rate(data):
-
-    possible_keys = [
-        "sampling_rate",
-        "sample_rate",
-        "hz",
-        "fps",
-        "bin_size",
-        "dt",
-        "time_step"
-    ]
-
-    print("\nSearching sampling rate...")
-
-    print("Available npz keys:")
-    print(list(data.keys()))
-
-    for key in possible_keys:
-
-        if key in data:
-
-            value = data[key]
-
-            if np.ndim(value) == 0:
-                value = float(value)
-
-            else:
-                value = float(value[0])
-
-
-            print(
-                "Found:",
-                key,
-                "=",
-                value
-            )
-
-            if key in ["bin_size", "dt", "time_step"]:
-
-                # milliseconds
-                if value > 0:
-                    hz = 1000.0 / value
-
-                return hz
-
-            else:
-                return value
-
-
-    raise RuntimeError(
-        """
-Sampling rate was not found in npz file.
-Available keys were printed above.
-Need to know bin size / Hz.
-"""
-    )
-
-
 def load_perich():
 
     print("\nLoading data")
@@ -125,17 +68,6 @@ def load_perich():
         NPZ_PATH,
         allow_pickle=True
     )
-
-
-    hz = find_sampling_rate(data)
-
-
-    print(
-        "Detected sampling rate:",
-        hz,
-        "Hz"
-    )
-
 
     X_train = data["train_data"].astype(np.float32)
     X_test = data["valid_data"].astype(np.float32)
@@ -146,26 +78,34 @@ def load_perich():
 
     print("X train:", X_train.shape)
     print("X test :", X_test.shape)
+    print("Y train:", Y_train.shape)
+    print("Y test :", Y_test.shape)
 
 
-    # ==================================================
-    # SMOOTH 100 ms
-    # ==================================================
 
-    sigma_samples = (
-        SMOOTH_MS / 1000.0
-    ) * hz
+    # =====================================================
+    # Gaussian smoothing 100 ms
+    # Bin size = 10 ms
+    # sigma = 100/10 = 10 samples
+    # =====================================================
+
+    sigma_samples = SMOOTH_MS / BIN_MS
 
 
     print(
-        "Gaussian smoothing:",
-        SMOOTH_MS,
+        "Applying Gaussian smoothing"
+    )
+
+    print(
+        "bin size:",
+        BIN_MS,
         "ms"
     )
 
     print(
-        "sigma samples:",
-        sigma_samples
+        "sigma:",
+        sigma_samples,
+        "samples"
     )
 
 
@@ -184,8 +124,14 @@ def load_perich():
 
 
     print(
-        "After smoothing:",
-        X_train.shape
+        "After smoothing:"
+    )
+
+    print(
+        "train mean:",
+        X_train.mean(),
+        "std:",
+        X_train.std()
     )
 
 
@@ -195,6 +141,7 @@ def load_perich():
         Y_train.astype(np.float32),
         Y_test.astype(np.float32)
     )
+
 
 # def load_perich():
 #     print("\nLoading data")
