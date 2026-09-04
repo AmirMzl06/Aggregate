@@ -101,7 +101,7 @@ def compute_adv_epsilon(X):
     print("\nComputing epsilon")
     dist = float(min_l2_distance(torch.from_numpy(X).float()))
     eps = max(dist / 2.0, 1e-6)
-    eps = 0.1
+    # eps = 0.1
     print("min L2 distance:", dist)
     print("epsilon:", eps)
     return eps
