@@ -60,92 +60,12 @@ def seed_all(seed):
 
 seed_all(SEED)
 
-def load_perich():
-
-    print("\nLoading data")
-
-    data = np.load(
-        NPZ_PATH,
-        allow_pickle=True
-    )
-
-    X_train = data["train_data"].astype(np.float32)
-    X_test = data["valid_data"].astype(np.float32)
-
-    Y_train = data["train_label"].astype(np.float32)
-    Y_test = data["valid_label"].astype(np.float32)
-
-
-    print("X train:", X_train.shape)
-    print("X test :", X_test.shape)
-    print("Y train:", Y_train.shape)
-    print("Y test :", Y_test.shape)
-
-
-
-    # =====================================================
-    # Gaussian smoothing 100 ms
-    # Bin size = 10 ms
-    # sigma = 100/10 = 10 samples
-    # =====================================================
-
-    sigma_samples = SMOOTH_MS / BIN_MS
-
-
-    print(
-        "Applying Gaussian smoothing"
-    )
-
-    print(
-        "bin size:",
-        BIN_MS,
-        "ms"
-    )
-
-    print(
-        "sigma:",
-        sigma_samples,
-        "samples"
-    )
-
-
-    X_train = gaussian_filter1d(
-        X_train,
-        sigma=sigma_samples,
-        axis=0
-    )
-
-
-    X_test = gaussian_filter1d(
-        X_test,
-        sigma=sigma_samples,
-        axis=0
-    )
-
-
-    print(
-        "After smoothing:"
-    )
-
-    print(
-        "train mean:",
-        X_train.mean(),
-        "std:",
-        X_train.std()
-    )
-
-
-    return (
-        X_train.astype(np.float32),
-        X_test.astype(np.float32),
-        Y_train.astype(np.float32),
-        Y_test.astype(np.float32)
-    )
-
-
 # def load_perich():
 #     print("\nLoading data")
-#     data = np.load(NPZ_PATH, allow_pickle=True)
+#     data = np.load(
+#         NPZ_PATH,
+#         allow_pickle=True
+#     )
 #     X_train = data["train_data"].astype(np.float32)
 #     X_test = data["valid_data"].astype(np.float32)
 #     Y_train = data["train_label"].astype(np.float32)
@@ -154,18 +74,76 @@ def load_perich():
 #     print("X test :", X_test.shape)
 #     print("Y train:", Y_train.shape)
 #     print("Y test :", Y_test.shape)
-#     # mean = X_train.mean(0)
-#     # std = X_train.std(0) + 1e-3
-#     # X_train = (X_train - mean) / std
-#     # test_mean = X_test.mean(0)
-#     # test_std = X_test.std(0) + 1e-3
-#     # X_test = (X_test - test_mean) / test_std
-#     return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
+#     # =====================================================
+#     # Gaussian smoothing 100 ms
+#     # Bin size = 10 ms
+#     # sigma = 100/10 = 10 samples
+#     # =====================================================
+#     sigma_samples = SMOOTH_MS / BIN_MS
+#     print(
+#         "Applying Gaussian smoothing"
+#     )
+#     print(
+#         "bin size:",
+#         BIN_MS,
+#         "ms"
+#     )
+#     print(
+#         "sigma:",
+#         sigma_samples,
+#         "samples"
+#     )
+#     X_train = gaussian_filter1d(
+#         X_train,
+#         sigma=sigma_samples,
+#         axis=0
+#     )
+#     X_test = gaussian_filter1d(
+#         X_test,
+#         sigma=sigma_samples,
+#         axis=0
+#     )
+#     print(
+#         "After smoothing:"
+#     )
+#     print(
+#         "train mean:",
+#         X_train.mean(),
+#         "std:",
+#         X_train.std()
+#     )
+#     return (
+#         X_train.astype(np.float32),
+#         X_test.astype(np.float32),
+#         Y_train.astype(np.float32),
+#         Y_test.astype(np.float32)
+#     )
+
+
+def load_perich():
+    print("\nLoading data")
+    data = np.load(NPZ_PATH, allow_pickle=True)
+    X_train = data["train_data"].astype(np.float32)
+    X_test = data["valid_data"].astype(np.float32)
+    Y_train = data["train_label"].astype(np.float32)
+    Y_test = data["valid_label"].astype(np.float32)
+    print("X train:", X_train.shape)
+    print("X test :", X_test.shape)
+    print("Y train:", Y_train.shape)
+    print("Y test :", Y_test.shape)
+    # mean = X_train.mean(0)
+    # std = X_train.std(0) + 1e-3
+    # X_train = (X_train - mean) / std
+    # test_mean = X_test.mean(0)
+    # test_std = X_test.std(0) + 1e-3
+    # X_test = (X_test - test_mean) / test_std
+    return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
 
 def compute_adv_epsilon(X):
     print("\nComputing epsilon")
     dist = float(min_l2_distance(torch.from_numpy(X).float()))
     eps = max(dist / 2.0, 1e-6)
+    eps = 0.5
     print("min L2 distance:", dist)
     print("epsilon:", eps)
     return eps
