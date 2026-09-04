@@ -66,12 +66,12 @@ def load_perich():
     print("X test :", X_test.shape)
     print("Y train:", Y_train.shape)
     print("Y test :", Y_test.shape)
-    mean = X_train.mean(0)
-    std = X_train.std(0) + 1e-3
-    X_train = (X_train - mean) / std
-    test_mean = X_test.mean(0)
-    test_std = X_test.std(0) + 1e-3
-    X_test = (X_test - test_mean) / test_std
+    # mean = X_train.mean(0)
+    # std = X_train.std(0) + 1e-3
+    # X_train = (X_train - mean) / std
+    # test_mean = X_test.mean(0)
+    # test_std = X_test.std(0) + 1e-3
+    # X_test = (X_test - test_mean) / test_std
     return (X_train.astype(np.float32), X_test.astype(np.float32), Y_train.astype(np.float32), Y_test.astype(np.float32))
 
 def compute_adv_epsilon(X):
