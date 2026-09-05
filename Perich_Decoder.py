@@ -21,7 +21,7 @@ print(cebra.__file__)
 
 PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 DATASET_NAME = "C-CO"
-DAY = 0
+DAY = 6
 SESSION = f"{DATASET_NAME}{DAY}"
 NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION}.npz")
 OUT = f"ACORN_CLEAN_LABEL_{SESSION}"
@@ -40,7 +40,7 @@ ATTACK_NORM = "linf"
 DECODER_HIDDEN = 512
 DECODER_LAYERS = 2
 DECODER_DROPOUT = 0.4
-DECODER_STEPS = 25000
+DECODER_STEPS = 2500
 ATTR_CHUNKS = 16
 ATTR_LEN = 128
 ATTR_BATCH = 16
