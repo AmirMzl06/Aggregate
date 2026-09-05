@@ -28,11 +28,11 @@ os.makedirs(OUT, exist_ok=True)
 
 SEED = 42
 LATENT_DIM = 64
-HIDDEN = 512 #64
+HIDDEN = 64
 BATCH_SIZE = 2048
 MAX_ITER = 3000
 TEMPERATURE = 0.4
-OFFSET = 4 #1
+OFFSET = 1
 MODEL_ARCH = "offset36-model-more-dropout"
 ADV_STEPS = 10
 ATTACK_NORM = "linf"
