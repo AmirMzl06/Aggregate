@@ -28,8 +28,8 @@ OUT = f"ACORN_CLEAN_LABEL_{SESSION}"
 os.makedirs(OUT, exist_ok=True)
 
 SEED = 42
-LATENT_DIM = 128
-HIDDEN = 512
+LATENT_DIM = 64
+HIDDEN = 64
 BATCH_SIZE = 2048
 MAX_ITER = 3000
 TEMPERATURE = 0.4
@@ -93,7 +93,7 @@ def compute_adv_epsilon(X):
     print("=" * 90)
     dist = float(min_l2_distance(torch.from_numpy(X).float()))
     eps = max(dist / 2.0, 1e-6)
-    # eps = 0.5
+    eps = 0.2
     print("min L2 distance:", dist)
     print("epsilon        :", eps)
     return eps
@@ -148,76 +148,55 @@ def train_clean_label(X_train, Y_train):
     model.fit(X_train, Y_train)
     return model
 
-# class TwoLayerMLP(nn.Module):
-#     def __init__(self, input_dim=64, hidden_dim=64, output_dim=6, dropout_rate=0.4):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim),
-#             nn.LayerNorm(hidden_dim),
-#             nn.ReLU(),
-#             nn.Dropout(dropout_rate),
-#             nn.Linear(hidden_dim, output_dim),
-#         )
-#         self._initialize_weights()
-#     def _initialize_weights(self):
-#         for layer in self.net:
-#             if isinstance(layer, nn.Linear):
-#                 nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
-#                 if layer.bias is not None:
-#                     nn.init.constant_(layer.bias, 0)
-#     def forward(self, x):
-#         return self.net(x)
-
-class SimpleGRUDecoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, layers, output_dim):
+class TwoLayerMLP(nn.Module):
+    def __init__(self, input_dim=64, hidden_dim=64, output_dim=6, dropout_rate=0.4):
         super().__init__()
-        self.gru = nn.GRU(
-            input_dim,
-            hidden_dim,
-            layers,
-            batch_first=True
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
         )
-        self.fc = nn.Linear(hidden_dim,output_dim)
+        self._initialize_weights()
+    def _initialize_weights(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
     def forward(self, x):
-        # x: (batch, latent_dim)
-        x = x.unsqueeze(1)
-        out, _ = self.gru(x)
-        out = out[:, -1, :]
-        return self.fc(out)
+        return self.net(x)
 
-# def train_decoder(Z, Y, tag):
-#     print("\n" + "=" * 90)
-#     print("TRAIN DECODER (TwoLayerMLP):", tag)
-#     print("=" * 90)
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     decoder = TwoLayerMLP(
-#         input_dim=LATENT_DIM,
-#         hidden_dim=DECODER_HIDDEN,
-#         output_dim=Y.shape[1],
-#         dropout_rate=DECODER_DROPOUT
-#     ).to(device)
-#     print(decoder)
-#     Z_tensor = torch.tensor(Z, dtype=torch.float32, device=device)
-#     Y_tensor = torch.tensor(Y, dtype=torch.float32, device=device)
-#     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3)
-#     loss_fn = nn.MSELoss()
-#     decoder.train()
-#     for step in range(DECODER_STEPS):
-#         optimizer.zero_grad()
-#         pred = decoder(Z_tensor)
-#         loss = loss_fn(pred, Y_tensor)
-#         loss.backward()
-#         optimizer.step()
-#         if (step + 1) % 500 == 0:
-#             print(f"step {step+1}/{DECODER_STEPS} loss={loss.item():.8f}")
-#     return decoder
+# class SimpleGRUDecoder(nn.Module):
+#     def __init__(self, input_dim, hidden_dim, layers, output_dim):
+#         super().__init__()
+#         self.gru = nn.GRU(
+#             input_dim,
+#             hidden_dim,
+#             layers,
+#             batch_first=True
+#         )
+#         self.fc = nn.Linear(hidden_dim,output_dim)
+#     def forward(self, x):
+#         # x: (batch, latent_dim)
+#         x = x.unsqueeze(1)
+#         out, _ = self.gru(x)
+#         out = out[:, -1, :]
+#         return self.fc(out)
 
 def train_decoder(Z, Y, tag):
     print("\n" + "=" * 90)
-    print("TRAIN DECODER (SimpleGRU):", tag)
+    print("TRAIN DECODER (TwoLayerMLP):", tag)
     print("=" * 90)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    decoder = SimpleGRUDecoder(input_dim=LATENT_DIM, hidden_dim=128, layers=2, output_dim=Y.shape[1]).to(device)
+    decoder = TwoLayerMLP(
+        input_dim=LATENT_DIM,
+        hidden_dim=DECODER_HIDDEN,
+        output_dim=Y.shape[1],
+        dropout_rate=DECODER_DROPOUT
+    ).to(device)
+    print(decoder)
     Z_tensor = torch.tensor(Z, dtype=torch.float32, device=device)
     Y_tensor = torch.tensor(Y, dtype=torch.float32, device=device)
     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3)
@@ -232,6 +211,27 @@ def train_decoder(Z, Y, tag):
         if (step + 1) % 500 == 0:
             print(f"step {step+1}/{DECODER_STEPS} loss={loss.item():.8f}")
     return decoder
+
+# def train_decoder(Z, Y, tag):
+#     print("\n" + "=" * 90)
+#     print("TRAIN DECODER (SimpleGRU):", tag)
+#     print("=" * 90)
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     decoder = SimpleGRUDecoder(input_dim=LATENT_DIM, hidden_dim=128, layers=2, output_dim=Y.shape[1]).to(device)
+#     Z_tensor = torch.tensor(Z, dtype=torch.float32, device=device)
+#     Y_tensor = torch.tensor(Y, dtype=torch.float32, device=device)
+#     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+#     loss_fn = nn.MSELoss()
+#     decoder.train()
+#     for step in range(DECODER_STEPS):
+#         optimizer.zero_grad()
+#         pred = decoder(Z_tensor)
+#         loss = loss_fn(pred, Y_tensor)
+#         loss.backward()
+#         optimizer.step()
+#         if (step + 1) % 500 == 0:
+#             print(f"step {step+1}/{DECODER_STEPS} loss={loss.item():.8f}")
+#     return decoder
 
 def evaluate(decoder, Z, Y, name):
     print("\n" + "=" * 90)
