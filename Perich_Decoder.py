@@ -35,7 +35,7 @@ TEMPERATURE = 0.4
 OFFSET = 4 #1
 MODEL_ARCH = "offset36-model-more-dropout"
 ADV_STEPS = 10
-ATTACK_NORM = "linf"
+ATTACK_NORM = "l2"
 DECODER_HIDDEN = 512
 DECODER_LAYERS = 2
 DECODER_DROPOUT = 0.4
@@ -92,7 +92,7 @@ def compute_adv_epsilon(X):
     print("=" * 90)
     dist = float(min_l2_distance(torch.from_numpy(X).float()))
     eps = max(dist / 2.0, 1e-6)
-    # eps = 0.1
+    eps = 0.5
     print("min L2 distance:", dist)
     print("epsilon        :", eps)
     return eps
