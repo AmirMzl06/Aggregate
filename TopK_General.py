@@ -21,7 +21,7 @@ print(cebra.__file__)
  
 PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 DATASET_NAME = "C-CO"
-DAY = 8
+DAY = 6
 SESSION = f"{DATASET_NAME}{DAY}"
 NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION}.npz")
 OUT = f"TopK_Percentage_{SESSION}"
