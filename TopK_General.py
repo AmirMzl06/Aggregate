@@ -27,11 +27,11 @@ PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 PERICH_DAYS = {
     # "C-CO": range(53)
     # "C-RT": range(15),
-    "J-CO": range(3),
-    "T-CO": range(6),
-    "T-RT": range(6),
-    # "M-CO": range(22),
-    "M-RT": range(6),
+    # "J-CO": range(3),
+    # "T-CO": range(6),
+    # "T-RT": range(6),
+    "M-CO": range(22),
+    # "M-RT": range(6),
 }
 
 DATASET_NAME = None
