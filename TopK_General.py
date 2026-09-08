@@ -28,10 +28,10 @@ PERICH_DAYS = {
     # "C-CO": range(53)
     # "C-RT": range(15),
     # "J-CO": range(3), #Done
-    "T-CO": range(6),
-    "T-RT": range(6),
-    # "M-CO": range(22),
-    "M-RT": range(6),
+    # "T-CO": range(6), #Done
+    # "T-RT": range(6), #Done
+    "M-CO": range(22),
+    # "M-RT": range(6), #Done
 }
 
 DATASET_NAME = None
