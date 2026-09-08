@@ -25,8 +25,8 @@ PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 # NEW: every monkey+task, and how many session-days each has. All files
 # live in the same PERICH_DATA_DIR as before, named f"{key}{day}.npz".
 PERICH_DAYS = {
-    "C-CO": range(53)
-    # "C-RT": range(15),
+    # "C-CO": range(53)
+    "C-RT": range(15),
     # "J-CO": range(3), #Done
     # "T-CO": range(6), #Done
     # "T-RT": range(6), #Done
