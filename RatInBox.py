@@ -247,10 +247,19 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
 
     # positives / negatives do not depend on delta -> embed them once
     with torch.no_grad():
-        z_pos = [_forward_full(model, b.positive.detach()) for b in batches]
-        z_neg = [_forward_full(model, b.negative.detach()) for b in batches]
-        if objective == "vat":
-            z_ref0 = [_forward_full(model, r) for r in refs]
+        z_pos = [
+            [_forward_full(model, x.detach()) for x in b.positive]
+            if isinstance(b.positive, (list, tuple))
+            else _forward_full(model, b.positive.detach())
+            for b in batches
+        ]
+    
+        z_neg = [
+            [_forward_full(model, x.detach()) for x in b.negative]
+            if isinstance(b.negative, (list, tuple))
+            else _forward_full(model, b.negative.detach())
+            for b in batches
+        ]
 
     for _ in range(steps):
         loss = 0.0
