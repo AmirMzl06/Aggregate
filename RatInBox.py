@@ -215,98 +215,375 @@ def _forward_full(model, x):
         model.split_outputs = prev
     return z
 
-def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
-                      blocks, per_obj, ranges, mode="pgd", objective=ATTACK_OBJ,
-                      norm=ADV_NORM):
-    """PGD on the reference stream only -- mirrors the fork, where the adversarial
-    example replaces x_ref and (x_pos, x_neg) stay clean."""
-    batches, was_single = as_batch_list(batch)
-    refs = [b.reference.detach() for b in batches]
+# def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
+#                       blocks, per_obj, ranges, mode="pgd", objective=ATTACK_OBJ,
+#                       norm=ADV_NORM):
+#     """PGD on the reference stream only -- mirrors the fork, where the adversarial
+#     example replaces x_ref and (x_pos, x_neg) stay clean."""
+#     batches, was_single = as_batch_list(batch)
+#     refs = [b.reference.detach() for b in batches]
 
-    shared = all(torch.equal(refs[0], r) for r in refs[1:]) if len(refs) > 1 else True
+#     shared = all(torch.equal(refs[0], r) for r in refs[1:]) if len(refs) > 1 else True
+#     n_delta = 1 if shared else len(refs)
+
+#     def _init():
+#         if norm == "linf":
+#             return [torch.empty_like(refs[i if not shared else 0]).uniform_(-eps, eps)
+#                     for i in range(n_delta)]
+#         d = []
+#         for i in range(n_delta):
+#             v = torch.randn_like(refs[i if not shared else 0])
+#             v = v / (v.flatten(1).norm(dim=1).view(-1, *([1] * (v.dim() - 1))) + 1e-12)
+#             d.append(v * eps)
+#         return d
+
+#     deltas = [d.requires_grad_(True) for d in _init()]
+
+#     if mode == "noise" or steps == 0:
+#         with torch.no_grad():
+#             new_refs = [torch.clamp(refs[i] + deltas[0 if shared else i], lo, hi).detach()
+#                         for i in range(len(refs))]
+#         return rebuild_batch(batch, new_refs, was_single)
+
+#     # positives / negatives do not depend on delta -> embed them once
+#     with torch.no_grad():
+#         z_pos = [
+#             [_forward_full(model, x.detach()) for x in b.positive]
+#             if isinstance(b.positive, (list, tuple))
+#             else _forward_full(model, b.positive.detach())
+#             for b in batches
+#         ]
+    
+#         z_neg = [
+#             [_forward_full(model, x.detach()) for x in b.negative]
+#             if isinstance(b.negative, (list, tuple))
+#             else _forward_full(model, b.negative.detach())
+#             for b in batches
+#         ]
+
+#     for _ in range(steps):
+#         loss = 0.0
+#         for i, b in enumerate(batches):
+#             d = deltas[0 if shared else i]
+#             x = torch.clamp(refs[i] + d, lo, hi) if CLAMP_TO_DATA else refs[i] + d
+#             z = _forward_full(model, x)
+#             if objective == "vat":
+#                 loss = loss + ((z - z_ref0[i]) ** 2).sum(1).mean()
+#             else:
+#                 adv_batch = cebra.data.Batch(
+#                     reference=x,
+#                     positive=b.positive,
+#                     negative=b.negative
+#                 )
+                
+#                 adv_output = self._inference(adv_batch)
+                
+#                 loss_i, _, _ = self.criterion(
+#                     adv_output.reference,
+#                     adv_output.positive,
+#                     adv_output.negative
+#                 )
+                
+#                 loss = loss + loss_i
+#                 # loss = loss + cosine_infonce(
+#                 #     embed_objective(z,        i, blocks, per_obj, ranges),
+#                 #     embed_objective(z_pos[i], i, blocks, per_obj, ranges),
+#                 #     embed_objective(z_neg[i], i, blocks, per_obj, ranges))
+#         grads = torch.autograd.grad(loss, deltas)
+#         with torch.no_grad():
+#             for d, g in zip(deltas, grads):
+#                 if norm == "linf":
+#                     d.add_(alpha * g.sign())
+#                     d.clamp_(-eps, eps)
+#                 else:
+#                     gn = g.flatten(1).norm(dim=1).view(-1, *([1] * (g.dim() - 1))) + 1e-12
+#                     d.add_(alpha * g / gn)
+#                     dn = d.flatten(1).norm(dim=1).view(-1, *([1] * (d.dim() - 1))) + 1e-12
+#                     d.mul_(torch.clamp(eps / dn, max=1.0))
+
+#     with torch.no_grad():
+#         new_refs = [torch.clamp(refs[i] + deltas[0 if shared else i], lo, hi).detach()
+#                     if CLAMP_TO_DATA else (refs[i] + deltas[0 if shared else i]).detach()
+#                     for i in range(len(refs))]
+#     return rebuild_batch(batch, new_refs, was_single)
+
+def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
+                      blocks, per_obj, ranges,
+                      mode="pgd",
+                      objective=ATTACK_OBJ,
+                      norm=ADV_NORM):
+
+    batches, was_single = as_batch_list(batch)
+
+    refs = [
+        b.reference.detach()
+        for b in batches
+    ]
+
+    shared = (
+        all(torch.equal(refs[0], r) for r in refs[1:])
+        if len(refs) > 1 else True
+    )
+
     n_delta = 1 if shared else len(refs)
 
-    def _init():
-        if norm == "linf":
-            return [torch.empty_like(refs[i if not shared else 0]).uniform_(-eps, eps)
-                    for i in range(n_delta)]
-        d = []
-        for i in range(n_delta):
-            v = torch.randn_like(refs[i if not shared else 0])
-            v = v / (v.flatten(1).norm(dim=1).view(-1, *([1] * (v.dim() - 1))) + 1e-12)
-            d.append(v * eps)
-        return d
 
-    deltas = [d.requires_grad_(True) for d in _init()]
+    # initialize perturbation
+    if norm == "linf":
+
+        deltas = [
+            torch.empty_like(
+                refs[i if not shared else 0]
+            ).uniform_(-eps, eps)
+            for i in range(n_delta)
+        ]
+
+    else:
+
+        deltas = []
+
+        for i in range(n_delta):
+
+            d = torch.randn_like(
+                refs[i if not shared else 0]
+            )
+
+            d = d / (
+                d.flatten(1).norm(dim=1)
+                .view(-1,*([1]*(d.dim()-1)))
+                + 1e-12
+            )
+
+            deltas.append(d * eps)
+
+
+    deltas = [
+        d.requires_grad_(True)
+        for d in deltas
+    ]
+
 
     if mode == "noise" or steps == 0:
-        with torch.no_grad():
-            new_refs = [torch.clamp(refs[i] + deltas[0 if shared else i], lo, hi).detach()
-                        for i in range(len(refs))]
-        return rebuild_batch(batch, new_refs, was_single)
 
-    # positives / negatives do not depend on delta -> embed them once
+        with torch.no_grad():
+
+            new_refs = [
+                (
+                    torch.clamp(
+                        refs[i] + deltas[0 if shared else i],
+                        lo,
+                        hi
+                    )
+                    if CLAMP_TO_DATA
+                    else refs[i] + deltas[0 if shared else i]
+                ).detach()
+
+                for i in range(len(refs))
+            ]
+
+        return rebuild_batch(
+            batch,
+            new_refs,
+            was_single
+        )
+
+
+    # keep positive / negative clean
     with torch.no_grad():
-        z_pos = [
-            [_forward_full(model, x.detach()) for x in b.positive]
-            if isinstance(b.positive, (list, tuple))
-            else _forward_full(model, b.positive.detach())
-            for b in batches
-        ]
-    
-        z_neg = [
-            [_forward_full(model, x.detach()) for x in b.negative]
-            if isinstance(b.negative, (list, tuple))
-            else _forward_full(model, b.negative.detach())
-            for b in batches
-        ]
+
+        z_pos = []
+
+        z_neg = []
+
+
+        for b in batches:
+
+
+            if isinstance(b.positive,(list,tuple)):
+
+                z_pos.append(
+                    [
+                        _forward_full(
+                            model,
+                            x.detach()
+                        )
+                        for x in b.positive
+                    ]
+                )
+
+                z_neg.append(
+                    [
+                        _forward_full(
+                            model,
+                            x.detach()
+                        )
+                        for x in b.negative
+                    ]
+                )
+
+            else:
+
+                z_pos.append(
+                    _forward_full(
+                        model,
+                        b.positive.detach()
+                    )
+                )
+
+                z_neg.append(
+                    _forward_full(
+                        model,
+                        b.negative.detach()
+                    )
+                )
+
 
     for _ in range(steps):
+
         loss = 0.0
-        for i, b in enumerate(batches):
+
+
+        for i,b in enumerate(batches):
+
             d = deltas[0 if shared else i]
-            x = torch.clamp(refs[i] + d, lo, hi) if CLAMP_TO_DATA else refs[i] + d
-            z = _forward_full(model, x)
-            if objective == "vat":
-                loss = loss + ((z - z_ref0[i]) ** 2).sum(1).mean()
+
+
+            x = (
+                torch.clamp(
+                    refs[i]+d,
+                    lo,
+                    hi
+                )
+                if CLAMP_TO_DATA
+                else refs[i]+d
+            )
+
+
+            z = _forward_full(
+                model,
+                x
+            )
+
+
+            # Multi objective case
+            if isinstance(z_pos[i], list):
+
+                for obj_idx in range(len(z_pos[i])):
+
+                    loss += cosine_infonce(
+                        embed_objective(
+                            z,
+                            obj_idx,
+                            blocks,
+                            per_obj,
+                            ranges
+                        ),
+
+                        embed_objective(
+                            z_pos[i][obj_idx],
+                            obj_idx,
+                            blocks,
+                            per_obj,
+                            ranges
+                        ),
+
+                        embed_objective(
+                            z_neg[i][obj_idx],
+                            obj_idx,
+                            blocks,
+                            per_obj,
+                            ranges
+                        )
+                    )
+
+
+            # normal CEBRA case
             else:
-                adv_batch = cebra.data.Batch(
-                    reference=x,
-                    positive=b.positive,
-                    negative=b.negative
+
+                loss += cosine_infonce(
+                    z,
+                    z_pos[i],
+                    z_neg[i]
                 )
-                
-                adv_output = self._inference(adv_batch)
-                
-                loss_i, _, _ = self.criterion(
-                    adv_output.reference,
-                    adv_output.positive,
-                    adv_output.negative
-                )
-                
-                loss = loss + loss_i
-                # loss = loss + cosine_infonce(
-                #     embed_objective(z,        i, blocks, per_obj, ranges),
-                #     embed_objective(z_pos[i], i, blocks, per_obj, ranges),
-                #     embed_objective(z_neg[i], i, blocks, per_obj, ranges))
-        grads = torch.autograd.grad(loss, deltas)
+
+
+        grads = torch.autograd.grad(
+            loss,
+            deltas
+        )
+
+
         with torch.no_grad():
-            for d, g in zip(deltas, grads):
-                if norm == "linf":
-                    d.add_(alpha * g.sign())
-                    d.clamp_(-eps, eps)
+
+            for d,g in zip(deltas,grads):
+
+                if norm=="linf":
+
+                    d.add_(
+                        alpha*g.sign()
+                    )
+
+                    d.clamp_(
+                        -eps,
+                        eps
+                    )
+
+
                 else:
-                    gn = g.flatten(1).norm(dim=1).view(-1, *([1] * (g.dim() - 1))) + 1e-12
-                    d.add_(alpha * g / gn)
-                    dn = d.flatten(1).norm(dim=1).view(-1, *([1] * (d.dim() - 1))) + 1e-12
-                    d.mul_(torch.clamp(eps / dn, max=1.0))
+
+                    gn = (
+                        g.flatten(1)
+                        .norm(dim=1)
+                        .view(-1,*([1]*(g.dim()-1)))
+                        +1e-12
+                    )
+
+                    d.add_(
+                        alpha*g/gn
+                    )
+
+
+                    dn = (
+                        d.flatten(1)
+                        .norm(dim=1)
+                        .view(-1,*([1]*(d.dim()-1)))
+                        +1e-12
+                    )
+
+
+                    d.mul_(
+                        torch.clamp(
+                            eps/dn,
+                            max=1.0
+                        )
+                    )
+
 
     with torch.no_grad():
-        new_refs = [torch.clamp(refs[i] + deltas[0 if shared else i], lo, hi).detach()
-                    if CLAMP_TO_DATA else (refs[i] + deltas[0 if shared else i]).detach()
-                    for i in range(len(refs))]
-    return rebuild_batch(batch, new_refs, was_single)
 
+        new_refs = [
+
+            (
+                torch.clamp(
+                    refs[i]+deltas[0 if shared else i],
+                    lo,
+                    hi
+                )
+                if CLAMP_TO_DATA
+
+                else refs[i]+deltas[0 if shared else i]
+
+            ).detach()
+
+            for i in range(len(refs))
+        ]
+
+
+    return rebuild_batch(
+        batch,
+        new_refs,
+        was_single
+    )
 
 # ----------------------------------------------------------------------------- SOLVER PATCH
 def make_adversarial_solver(solver, cfg, attack_kwargs):
