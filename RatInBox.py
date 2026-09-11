@@ -32,7 +32,7 @@ DATA_URL    = ("https://zenodo.org/records/15267195/files/"
 OUT_DIR     = "xcebra_ratinabox_acorn"
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
-NUM_STEPS   = 1000
+NUM_STEPS   = 10
 BATCH_SIZE  = 2500
 N_LATENTS   = 14
 NUM_UNITS   = 256
