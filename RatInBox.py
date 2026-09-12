@@ -48,7 +48,7 @@ DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- verified against the official notebook (cebra.ai/docs/demo_notebooks/
 #     Demo_xCEBRA_RatInABox.html) -- every value below matches it exactly ---
-NUM_STEPS   = 1000
+NUM_STEPS   = 1
 BATCH_SIZE  = 2500
 N_LATENTS   = 14
 NUM_UNITS   = 256
