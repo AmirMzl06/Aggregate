@@ -90,7 +90,7 @@ CLAMP_TO_DATA = False
 CLAMP_RANGE   = None                    # e.g. (0.0, 1.0) for exact professor parity
 
 SEEDS         = [0]                     # add 1,2,... once the runtime is acceptable
-ARMS_TO_RUN   = ["cebra", "cebra_2x", "xcebra", "acorn"]
+ARMS_TO_RUN   = ["acorn"] #"cebra", "cebra_2x", "xcebra",
 # full menu: cebra | cebra_2x | xcebra | xcebra_2x | noise_2x | acorn | acorn_xreg
 
 ARMS = {
@@ -285,13 +285,26 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
             ]
         return rebuild_batch(batch, new_refs, was_single)
 
+    # # positives / negatives do not depend on delta -> embed them once
+    # with torch.no_grad():
+    #     z_pos = [_forward_full(model, b.positive.detach()) for b in batches]
+    #     z_neg = [_forward_full(model, b.negative.detach()) for b in batches]
+    #     if objective == "vat":
+    #         z_ref0 = [_forward_full(model, r) for r in refs]
     # positives / negatives do not depend on delta -> embed them once
     with torch.no_grad():
-        z_pos = [_forward_full(model, b.positive.detach()) for b in batches]
-        z_neg = [_forward_full(model, b.negative.detach()) for b in batches]
+        z_pos = []
+        z_neg = []
+        for b in batches:
+            if isinstance(b.positive, (list, tuple)):
+                z_pos.append([_forward_full(model, x.detach()) for x in b.positive])
+                z_neg.append([_forward_full(model, x.detach()) for x in b.negative])
+            else:
+                z_pos.append(_forward_full(model, b.positive.detach()))
+                z_neg.append(_forward_full(model, b.negative.detach()))
         if objective == "vat":
             z_ref0 = [_forward_full(model, r) for r in refs]
-
+    
     for _ in range(steps):
         loss = 0.0
         for i, b in enumerate(batches):
