@@ -1,3 +1,25 @@
+
+#  xCEBRA / RatInABox  —  CLEAN vs ACORN (manual PGD adversarial training)
+#  Built on the OFFICIAL cebra 0.6.0a1 multiobjective API (no fork required).
+#
+#  pip install --pre "cebra[integrations]==0.6.0a1"
+#  pip install --upgrade numpy==1.26 ratinabox
+#
+#  Fixes applied vs. the previous version (see inline "FIX" comments):
+#   1) CRITICAL: build_adversarial's infonce branch referenced `self._inference`/
+#      `self.criterion`, but build_adversarial is a free function (no `self`
+#      exists) -> NameError on every PGD/infonce attack. Reverted to the
+#      already-correct, already-written cosine_infonce(...) path.
+#   2) L2 attack ball now matches the professor's Solver: the L2 norm is
+#      computed PER TIME-STEP (across channels only), not globally over the
+#      whole flattened (channel x time) sample.
+#   3) CLAMP_TO_DATA now applies consistently to both "pgd" and "noise"
+#      attack modes (previously "noise" always clamped, "pgd" only clamped
+#      conditionally). Added CLAMP_RANGE so you can reproduce the professor's
+#      hard-coded clamp(0,1) exactly if you want bit-for-bit parity, or leave
+#      it at None to clamp to this dataset's own [min,max] instead.
+# =============================================================================
+
 import os, sys, copy, json, time, pickle, itertools, warnings
 import numpy as np
 import torch
@@ -56,7 +78,8 @@ ADV_NORM      = "linf"                  # "linf" | "l2"
 EPS_REL       = 0.05                    # eps = EPS_REL * std(neural).  -> printed at runtime
 ADV_STEPS     = 10
 ALPHA_RULE    = 0.2                     # alpha = ALPHA_RULE * eps  (saturates the ball)
-ATTACK_OBJ    = "infonce"               # "infonce" (ascend the training loss) | "vat"
+ATTACK_OBJ    = "infonce"
+DEBUG_ATTACK_SHAPES = True               # "infonce" (ascend the training loss) | "vat"
 
 # FIX 3: CLAMP_TO_DATA now gates BOTH the "pgd" and "noise" attack modes
 # consistently. CLAMP_RANGE=None -> clamp to [neural.min(), neural.max()];
@@ -284,40 +307,48 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
     with torch.no_grad():
         z_pos = []
         z_neg = []
-        for b in batches:
-            # if isinstance(b.positive, (list, tuple)):
-            #     # z_pos.append([_forward_split(model, x.detach()) for x in b.positive])
-            #     # z_neg.append([_forward_split(model, x.detach()) for x in b.negative])
-            #     z_pos.append([_forward_full(model, x.detach()) for x in b.positive])
-            #     z_neg.append([_forward_full(model, x.detach()) for x in b.negative])
-            # else:
-            #     z_pos.append(_forward_full(model, b.positive.detach()))
-            #     z_neg.append(_forward_full(model, b.negative.detach()))
+
+        for bi, b in enumerate(batches):
+
+            print("DEBUG BATCH", bi)
+            print("  positive type:", type(b.positive))
+            print("  negative type:", type(b.negative))
+
             if isinstance(b.positive, (list, tuple)):
-            
+                print("  positive items:",
+                      [tuple(x.shape) for x in b.positive])
+                print("  negative items:",
+                      [tuple(x.shape) for x in b.negative])
+
                 z_pos.append(
-                    [
-                        _forward_full(model, b.positive[obj].detach())
-                        for obj in range(len(b.positive))
-                    ]
+                    [_forward_full(model, x.detach()) for x in b.positive]
                 )
-            
+
                 z_neg.append(
-                    [
-                        _forward_full(model, b.negative[obj].detach())
-                        for obj in range(len(b.negative))
-                    ]
+                    [_forward_full(model, x.detach()) for x in b.negative]
                 )
-            
+
             else:
-            
+                print("  positive shape:", tuple(b.positive.shape))
+                print("  negative shape:", tuple(b.negative.shape))
+
                 z_pos.append(
                     _forward_full(model, b.positive.detach())
                 )
-            
+
                 z_neg.append(
                     _forward_full(model, b.negative.detach())
                 )
+
+            if isinstance(z_pos[-1], (list, tuple)):
+                print("DEBUG EMB POS:",
+                      [tuple(x.shape) for x in z_pos[-1]])
+                print("DEBUG EMB NEG:",
+                      [tuple(x.shape) for x in z_neg[-1]])
+            else:
+                print("DEBUG EMB POS:", tuple(z_pos[-1].shape))
+                print("DEBUG EMB NEG:", tuple(z_neg[-1].shape))
+
         if objective == "vat":
             z_ref0 = [_forward_full(model, r) for r in refs]
     
@@ -351,12 +382,7 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
                     z_obj = z[obj_idx] if isinstance(z, (list, tuple)) else z
                     pos_obj = pos[obj_idx] if isinstance(pos, (list, tuple)) else pos
                     neg_obj = neg[obj_idx] if isinstance(neg, (list, tuple)) else neg
-                    print(
-                        "DEBUG LOSS SHAPES:",
-                        z_obj.shape,
-                        pos_obj.shape,
-                        neg_obj.shape
-                    )
+
                     loss = loss + cosine_infonce(
                         z_obj,
                         pos_obj,
@@ -659,11 +685,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 
 
