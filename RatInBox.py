@@ -62,11 +62,11 @@ DATA_URL    = ("https://zenodo.org/records/15267195/files/"
                "cynthi_neurons90_gridbase0.5_gridmodules3_grid_head_direction_place_speed"
                "_duration2000_noise0.25_bs100_seed231209234.p?download=1")
 
-OUT_DIR     = "xcebra_ratinabox_acorn"
+OUT_DIR     = "xcebra_ratinabox_acorn_REAL"
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- model / training (matches the official demo notebook) --------------------
-NUM_STEPS   = 25000
+NUM_STEPS   = 20
 BATCH_SIZE  = 2500
 N_LATENTS   = 14
 NUM_UNITS   = 256
