@@ -326,7 +326,12 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
                     z_obj = z[obj_idx] if isinstance(z, (list, tuple)) else z
                     pos_obj = pos[obj_idx] if isinstance(pos, (list, tuple)) else pos
                     neg_obj = neg[obj_idx] if isinstance(neg, (list, tuple)) else neg
-
+                    print(
+                        "DEBUG LOSS SHAPES:",
+                        z_obj.shape,
+                        pos_obj.shape,
+                        neg_obj.shape
+                    )
                     loss = loss + cosine_infonce(
                         z_obj,
                         pos_obj,
