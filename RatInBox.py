@@ -66,7 +66,7 @@ OUT_DIR     = "xcebra_ratinabox_acorn_REAL"
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- model / training (matches the official demo notebook) --------------------
-NUM_STEPS   = 20
+NUM_STEPS   = 25000
 BATCH_SIZE  = 2500
 N_LATENTS   = 14
 NUM_UNITS   = 256
@@ -105,7 +105,7 @@ JREG_AT       = "clean"
 
 ATTACK_LOG_EVERY = 250            # every N solver steps, record clean vs adv loss
 
-SEEDS         = [0]
+SEEDS         = [0,3]
 ARMS_TO_RUN = ["cebra", "cebra_2x", "xcebra", "xcebra_2x",
                "noise_2x", "acorn", "acorn_xreg"]
 ARMS = {
