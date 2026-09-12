@@ -1,25 +1,3 @@
-# =============================================================================
-#  xCEBRA / RatInABox  —  CLEAN vs ACORN (manual PGD adversarial training)
-#  Built on the OFFICIAL cebra 0.6.0a1 multiobjective API (no fork required).
-#
-#  pip install --pre "cebra[integrations]==0.6.0a1"
-#  pip install --upgrade numpy==1.26 ratinabox
-#
-#  Fixes applied vs. the previous version (see inline "FIX" comments):
-#   1) CRITICAL: build_adversarial's infonce branch referenced `self._inference`/
-#      `self.criterion`, but build_adversarial is a free function (no `self`
-#      exists) -> NameError on every PGD/infonce attack. Reverted to the
-#      already-correct, already-written cosine_infonce(...) path.
-#   2) L2 attack ball now matches the professor's Solver: the L2 norm is
-#      computed PER TIME-STEP (across channels only), not globally over the
-#      whole flattened (channel x time) sample.
-#   3) CLAMP_TO_DATA now applies consistently to both "pgd" and "noise"
-#      attack modes (previously "noise" always clamped, "pgd" only clamped
-#      conditionally). Added CLAMP_RANGE so you can reproduce the professor's
-#      hard-coded clamp(0,1) exactly if you want bit-for-bit parity, or leave
-#      it at None to clamp to this dataset's own [min,max] instead.
-# =============================================================================
-
 import os, sys, copy, json, time, pickle, itertools, warnings
 import numpy as np
 import torch
@@ -308,8 +286,10 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
         z_neg = []
         for b in batches:
             if isinstance(b.positive, (list, tuple)):
-                z_pos.append([_forward_split(model, x.detach()) for x in b.positive])
-                z_neg.append([_forward_split(model, x.detach()) for x in b.negative])
+                # z_pos.append([_forward_split(model, x.detach()) for x in b.positive])
+                # z_neg.append([_forward_split(model, x.detach()) for x in b.negative])
+                z_pos.append([_forward_full(model, x.detach()) for x in b.positive])
+                z_neg.append([_forward_full(model, x.detach()) for x in b.negative])
             else:
                 z_pos.append(_forward_full(model, b.positive.detach()))
                 z_neg.append(_forward_full(model, b.negative.detach()))
@@ -321,7 +301,8 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
         for i, b in enumerate(batches):
             d = deltas[0 if shared else i]
             x = torch.clamp(refs[i] + d, lo, hi) if clamp_to_data else refs[i] + d
-            z = _forward_split(model, x)
+            # z = _forward_split(model, x)
+            z = _forward_full(model, x)
             if objective == "vat":
                 loss = loss + ((z - z_ref0[i]) ** 2).sum(1).mean()
             else:
@@ -346,6 +327,23 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
                     pos_obj = pos[obj_idx] if isinstance(pos, (list, tuple)) else pos
                     neg_obj = neg[obj_idx] if isinstance(neg, (list, tuple)) else neg
 
+                    loss = loss + cosine_infonce(
+                        z_obj,
+                        pos_obj,
+                        neg_obj
+                    )
+                for obj_idx in range(len(ranges)):
+                    if isinstance(z_pos[i], (list, tuple)):
+                        pos = z_pos[i][obj_idx]
+                        neg = z_neg[i][obj_idx]
+                    else:
+                        pos = z_pos[i]
+                        neg = z_neg[i]
+                
+                    z_obj = z[obj_idx] if isinstance(z, (list, tuple)) else z
+                    pos_obj = pos[obj_idx] if isinstance(pos, (list, tuple)) else pos
+                    neg_obj = neg[obj_idx] if isinstance(neg, (list, tuple)) else neg
+                
                     loss = loss + cosine_infonce(
                         z_obj,
                         pos_obj,
@@ -450,8 +448,8 @@ def train_arm(arm_name, seed, neural, position):
 
     # lambda = 0 arms: same scheduler object, both weights zero -> penalty never fires.
     sched = LinearRampUp(n_splits=2,
-                         step_to_switch_on_reg=NUM_STEPS // 4,
-                         step_to_switch_off_reg=NUM_STEPS // 2,
+                         step_to_switch_on_reg=max(1, NUM_STEPS // 4),
+                         step_to_switch_off_reg=max(2, NUM_STEPS // 2),
                          start_weight=0.0,
                          end_weight=cfg["lam"])
 
