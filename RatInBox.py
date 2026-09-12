@@ -31,6 +31,16 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import TimeSeriesSplit
+import sys
+from pathlib import Path
+
+CEBRA_DIR = Path(__file__).resolve().parent / "CEBRA-original"
+
+for module_name in list(sys.modules):
+    if module_name == "cebra" or module_name.startswith("cebra."):
+        del sys.modules[module_name]
+
+sys.path.insert(0, str(CEBRA_DIR))
 
 import cebra
 from cebra.data import DatasetxCEBRA, ContrastiveMultiObjectiveLoader, TensorDataset
