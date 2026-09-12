@@ -285,14 +285,39 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
         z_pos = []
         z_neg = []
         for b in batches:
+            # if isinstance(b.positive, (list, tuple)):
+            #     # z_pos.append([_forward_split(model, x.detach()) for x in b.positive])
+            #     # z_neg.append([_forward_split(model, x.detach()) for x in b.negative])
+            #     z_pos.append([_forward_full(model, x.detach()) for x in b.positive])
+            #     z_neg.append([_forward_full(model, x.detach()) for x in b.negative])
+            # else:
+            #     z_pos.append(_forward_full(model, b.positive.detach()))
+            #     z_neg.append(_forward_full(model, b.negative.detach()))
             if isinstance(b.positive, (list, tuple)):
-                # z_pos.append([_forward_split(model, x.detach()) for x in b.positive])
-                # z_neg.append([_forward_split(model, x.detach()) for x in b.negative])
-                z_pos.append([_forward_full(model, x.detach()) for x in b.positive])
-                z_neg.append([_forward_full(model, x.detach()) for x in b.negative])
+            
+                z_pos.append(
+                    [
+                        _forward_full(model, b.positive[obj].detach())
+                        for obj in range(len(b.positive))
+                    ]
+                )
+            
+                z_neg.append(
+                    [
+                        _forward_full(model, b.negative[obj].detach())
+                        for obj in range(len(b.negative))
+                    ]
+                )
+            
             else:
-                z_pos.append(_forward_full(model, b.positive.detach()))
-                z_neg.append(_forward_full(model, b.negative.detach()))
+            
+                z_pos.append(
+                    _forward_full(model, b.positive.detach())
+                )
+            
+                z_neg.append(
+                    _forward_full(model, b.negative.detach())
+                )
         if objective == "vat":
             z_ref0 = [_forward_full(model, r) for r in refs]
     
