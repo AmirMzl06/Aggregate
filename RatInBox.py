@@ -320,10 +320,22 @@ def build_adversarial(model, batch, eps, alpha, steps, lo, hi,
                 # NameError on every call. cosine_infonce + embed_objective
                 # is the correct free-function equivalent (same math as the
                 # solver's own criterion, applied to this objective's slice).
+                # loss = loss + cosine_infonce(
+                #     embed_objective(z,        i, blocks, per_obj, ranges),
+                #     embed_objective(z_pos[i], i, blocks, per_obj, ranges),
+                #     embed_objective(z_neg[i], i, blocks, per_obj, ranges))
+                for obj_idx in range(len(ranges)):
+                if isinstance(z_pos[i], (list, tuple)):
+                    pos = z_pos[i][obj_idx]
+                    neg = z_neg[i][obj_idx]
+                else:
+                    pos = z_pos[i]
+                    neg = z_neg[i]
                 loss = loss + cosine_infonce(
-                    embed_objective(z,        i, blocks, per_obj, ranges),
-                    embed_objective(z_pos[i], i, blocks, per_obj, ranges),
-                    embed_objective(z_neg[i], i, blocks, per_obj, ranges))
+                    embed_objective(z, obj_idx, blocks, per_obj, ranges),
+                    embed_objective(pos, obj_idx, blocks, per_obj, ranges),
+                    embed_objective(neg, obj_idx, blocks, per_obj, ranges)
+                )
         grads = torch.autograd.grad(loss, deltas)
         with torch.no_grad():
             for d, g in zip(deltas, grads):
