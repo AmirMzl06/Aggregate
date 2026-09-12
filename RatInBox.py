@@ -91,7 +91,7 @@ CLAMP_TO_DATA = False
 CLAMP_RANGE   = None                    # e.g. (0.0, 1.0) for exact professor parity
 
 SEEDS         = [0]                     # add 1,2,... once the runtime is acceptable
-ARMS_TO_RUN   = ["cebra", "cebra_2x", "xcebra", "acorn"]
+ARMS_TO_RUN   = ["acorn"] #"cebra", "cebra_2x", "xcebra",
 # full menu: cebra | cebra_2x | xcebra | xcebra_2x | noise_2x | acorn | acorn_xreg
 
 ARMS = {
