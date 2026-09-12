@@ -25,7 +25,7 @@ DATASET_NAME = "C-CO"
 DAY = 12
 SESSION = f"{DATASET_NAME}{DAY}"
 NPZ_PATH = os.path.join(PERICH_DATA_DIR, f"{SESSION}.npz")
-OUT = f"TopK_Percentage_{SESSION}"
+OUT = f"TopK_Percentage_{SESSION}_L2"
 os.makedirs(OUT, exist_ok=True)
 
 SEED = 42
@@ -37,7 +37,7 @@ TEMPERATURE = 0.4
 OFFSET = 1
 MODEL_ARCH = "offset36-model-more-dropout"
 ADV_STEPS = 10
-ATTACK_NORM = "linf"
+ATTACK_NORM = "l2"
 ATTR_CHUNKS = 16
 ATTR_LEN = 128
 ATTR_BATCH = 16
