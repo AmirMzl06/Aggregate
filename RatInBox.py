@@ -106,8 +106,8 @@ JREG_AT       = "clean"
 ATTACK_LOG_EVERY = 250            # every N solver steps, record clean vs adv loss
 
 SEEDS         = [0]
-ARMS_TO_RUN   = ["cebra", "cebra_2x", "xcebra", "noise_2x", "acorn", "acorn_xreg"]
-
+ARMS_TO_RUN = ["cebra", "cebra_2x", "xcebra", "xcebra_2x",
+               "noise_2x", "acorn", "acorn_xreg"]
 ARMS = {
     "cebra":      dict(lam=0.0,        adv=None,    double=False),
     "cebra_2x":   dict(lam=0.0,        adv=None,    double=True ),  # doubled-step control
