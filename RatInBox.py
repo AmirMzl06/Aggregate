@@ -576,7 +576,8 @@ def calibrate(neural, position, lo, hi, ts_norm):
                                eps_rel=er)
             solver._adv_log = []
             probe, _ = build(999, neural, position, CAL_BATCHES)  # fresh batches
-            for batch in probe[1] if False else _iter_loader(probe, CAL_BATCHES):
+            # for batch in probe[1] if False else _iter_loader(probe, CAL_BATCHES):
+            for batch in _iter_loader(probe, CAL_BATCHES):
                 solver._make_adv_batch(batch, record=True)
             cl = np.array([x[0] for x in solver._adv_log])
             ad = np.array([x[1] for x in solver._adv_log])
