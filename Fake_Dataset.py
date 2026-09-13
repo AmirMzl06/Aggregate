@@ -385,7 +385,8 @@ class Mixer:
         J[:, n1:, :]        = s2[:, :, None] * (self.gain2 * self.W2)[None]
         return J
 
-  def lorenz_latents(T: int, d: int, sigma: float, rng,
+
+def lorenz_latents(T: int, d: int, sigma: float, rng,
                    dt: float = 0.01, burn_in: int = 2000,
                    lorenz_sigma: float = 10.0, lorenz_rho: float = 28.0,
                    lorenz_beta: float = 8.0 / 3.0) -> np.ndarray:
