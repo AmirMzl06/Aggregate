@@ -42,7 +42,7 @@ SEED = 42
 
 MODELS_DIR = "models"
 
-PLOTS_DIR = "plots"
+PLOTS_DIR = "plots_Cross"
 
 
 
