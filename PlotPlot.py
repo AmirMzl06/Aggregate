@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-
+import sys
 from sklearn.decomposition import PCA
 from mpl_toolkits.mplot3d import Axes3D
 from utils.constants import CEBRA_DIR
