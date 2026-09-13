@@ -2,17 +2,25 @@
 #  xCEBRA / RatInABox  —  CLEAN vs ACORN, eps x norm SWEEP
 #  Official cebra 0.6.0a1 multiobjective API (no fork).
 #
-#  MODE="calibrate"  ~6 min. Trains ONE clean model for CAL_STEPS, then measures
-#                    for every (norm, eps) what fraction of the model's LEARNED
-#                    MARGIN the attack destroys, on a FIXED set of batches.
+#  MODE="calibrate"  Probe a cheap clean model to pick the eps grid. DONE:
+#                    linf 0.02 -> 17% of margin, 0.05 -> 91%, plateau 204% at 0.2
+#                    l2   0.05 -> 17%,           0.10 -> 62%,  plateau 212% at 0.35
 #  MODE="sweep"      Full run. Baselines (eps-independent) trained ONCE per seed;
 #                    only noise/acorn arms are swept. Resumes from results.csv.
 #
-#  WHY THE FIRST RUN FAILED: eps=0.03 linf gave gap=+0.046 on clean=13.054.
-#  FixedCosineInfoNCE at tau=1 has cosine logits in [-1,1], so each objective's
-#  loss travels only from log(2500)=7.82 to ~5.82. Chance = 2*log(B) = 15.65, so
-#  margin = 2.59 nats and the attack erased 1.8% of it. Target destroy_frac
-#  20-50%.
+#  WHAT CALIBRATION TAUGHT US (and it contradicts the earlier diagnosis)
+#  --------------------------------------------------------------------
+#  On a CLEAN model, eps_rel=0.03 linf destroys ~40% of the learned margin. The
+#  REAL run logged 1.8% for exactly that budget on the trained acorn model. So the
+#  attack was never weak -- ADVERSARIAL TRAINING WORKED: the model flattened
+#  inside the eps ball and the attack stopped biting. `robustness_probe` below
+#  turns that into a measurement by attacking every arm's FINAL model with one
+#  fixed budget, clean baselines included.
+#
+#  Also: log(B) is the CHANCE level, not the max loss. FixedCosineInfoNCE at tau=1
+#  tops out at n_obj*log(1+(B-1)*e^{2/tau}) = 19.65, with chance = 15.65. So
+#  destroy_frac CAN exceed 100%; >10% already means "worse than chance".
+#  And norms are matched on destroy_frac, never on eps_rel.
 # =============================================================================
 
 import os, sys, copy, json, time, math, pickle, itertools, warnings
@@ -42,7 +50,7 @@ print("cebra loaded from:", cebra.__file__)
 
 
 # ============================================================== CONFIG
-MODE        = "calibrate"          # "calibrate" first, then "sweep"
+MODE        = "sweep"              # calibration is done; this is the real run
 
 DATA_FILE   = "cynthi_neurons90.p"
 DATA_URL    = ("https://zenodo.org/records/15267195/files/"
@@ -74,22 +82,34 @@ CLAMP_TO_DATA = True
 CLAMP_RANGE   = (0.0, 1.0)         # data verified to live exactly in [0,1]
 JREG_AT       = "clean"            # penalty only on the clean update
 
-# eps semantics (both RELATIVE so the two norms are comparable):
+# eps semantics (both RELATIVE):
 #   linf : eps = EPS_REL * (hi - lo)
 #   l2   : eps = EPS_REL * mean_t ||x_t||_2
-CAL_STEPS      = 4000              # clean pre-training for calibration
-CAL_BATCHES    = 12                # probe batches per (norm, eps) cell
+N_OBJ    = 2
+CHANCE   = N_OBJ * math.log(BATCH_SIZE)                                   # 15.65
+LOSS_MAX = N_OBJ * math.log(1 + (BATCH_SIZE - 1) * math.exp(2.0 / TAU))   # 19.65
+
+# --- calibration (already run; kept so the mode still works) ------------------
+CAL_STEPS      = 4000
+CAL_BATCHES    = 12
 CAL_GRID       = [0.01, 0.02, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0]
 CAL_NORMS      = ["linf", "l2"]
 
-# --- the sweep itself (fill in after reading the calibration table) -----------
+# --- the sweep itself ---------------------------------------------------------
 SWEEP_NORMS   = ["linf", "l2"]
-SWEEP_EPS     = [0.05, 0.10, 0.20, 0.35]
+SWEEP_EPS = {                       # matched on destroy_frac, NOT on eps_rel
+    "linf": [0.020, 0.028, 0.034, 0.040],      # ~17 / 35 / 50 / 65 % of margin
+    "l2":   [0.050, 0.070, 0.082, 0.100],      # same four levels
+}
 SWEEP_ARMS    = ["noise", "acorn", "acorn_xreg"]
 BASELINE_ARMS = ["cebra", "cebra_2x", "xcebra", "xcebra_2x"]
 
+# --- post-hoc robustness probe (the headline measurement) ---------------------
+ROBUST_EPS     = {"linf": 0.030, "l2": 0.070}   # ONE fixed budget for every arm
+ROBUST_BATCHES = 12
+
 SEEDS         = [0, 1, 2]
-ATTACK_LOG_EVERY = 250
+ATTACK_LOG_EVERY = 100
 ATTR_MAX_SAMPLES = None
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -268,8 +288,8 @@ def make_adversarial_solver(solver, cfg, atk):
     """Rebind solver.__class__ to a subclass of whatever cebra.solver.init built.
     MultiCriterion and _inference are untouched; only `step`, through super().
 
-    cfg/atk are read off `self` (not captured) so calibration can mutate
-    solver._atk["eps"] between probes without rebuilding anything."""
+    cfg/atk are read off `self` (not captured) so the probes can mutate
+    solver._atk["eps"] between measurements without rebuilding anything."""
     Base = type(solver)
 
     class AdversarialSolver(Base):
@@ -342,8 +362,7 @@ def make_adversarial_solver(solver, cfg, atk):
                 with torch.no_grad():
                     adv_loss = float(self._adv_loss(
                         adv_batch.reference, pos_out, neg_out))
-                chance = n_obj * math.log(ref.shape[0])
-                margin = max(chance - clean_loss, 1e-6)
+                margin = max(CHANCE - clean_loss, 1e-6)
                 self._adv_log.append((clean_loss, adv_loss, margin))
             return adv_batch
 
@@ -424,18 +443,81 @@ def train_arm(arm_key, base, seed, neural, position, atk):
     meta = dict(wall_s=time.time() - t0, norm=atk["norm"],
                 eps_rel=atk["eps_rel"], eps=atk["eps"], alpha=atk["alpha"],
                 base=base)
+
     log = getattr(solver, "_adv_log", [])
     if log:
         cl = np.array([x[0] for x in log]); ad = np.array([x[1] for x in log])
         mg = np.array([x[2] for x in log])
+        dfr = (ad - cl) / mg                                 # of learned margin
+        dab = (ad - cl) / np.maximum(LOSS_MAX - cl, 1e-6)    # of absolute headroom
+        np.savez_compressed(
+            os.path.join(OUT_DIR, f"trace_{arm_key}_s{seed}.npz"),
+            step=np.arange(1, len(cl) + 1) * ATTACK_LOG_EVERY,
+            clean=cl, adv=ad, margin=mg, destroy_frac=dfr, destroy_abs=dab)
+        k = max(1, len(dfr) // 5)
+        # early -> late is the internal evidence of HARDENING: same budget,
+        # shrinking effect, within one run.
         meta.update(adv_loss_clean=float(cl.mean()), adv_loss_adv=float(ad.mean()),
-                    adv_loss_gap=float((ad - cl).mean()),
-                    margin=float(mg.mean()),
-                    destroy_frac=float(((ad - cl) / mg).mean()))
+                    adv_loss_gap=float((ad - cl).mean()), margin=float(mg.mean()),
+                    destroy_frac=float(dfr.mean()),
+                    destroy_abs=float(dab.mean()),
+                    destroy_frac_early=float(dfr[:k].mean()),
+                    destroy_frac_late=float(dfr[-k:].mean()))
         print(f"    attack reach: clean={cl.mean():.4f} adv={ad.mean():.4f} "
-              f"gap={np.mean(ad-cl):+.4f} nats  margin={mg.mean():.3f}  "
-              f"DESTROYED={100*np.mean((ad-cl)/mg):.1f}%  (n={len(log)})")
+              f"gap={np.mean(ad-cl):+.4f}  margin={mg.mean():.3f}\n"
+              f"    DESTROYED mean={100*dfr.mean():.1f}%  "
+              f"early={100*dfr[:k].mean():.1f}% -> late={100*dfr[-k:].mean():.1f}%"
+              f"   (abs {100*dab.mean():.1f}% of headroom, n={len(log)})")
     return solver, meta
+
+
+# ============================================================== ROBUSTNESS PROBE
+def robustness_probe(solver, probe_batches, lo, hi, ts_norm):
+    """Apples-to-apples: attack EVERY arm's FINAL model with the SAME fixed
+    budget on the SAME batches -- including the clean baselines, which get
+    wrapped here on the fly. Needs no ground truth and no decoder, so this is
+    the cleanest ACORN-vs-CEBRA claim available. Expect ACORN << CEBRA.
+
+    Note the forced `_adv_cfg = BASE_CFG["acorn"]`: without it the `noise` arm
+    would take the noise path and never actually run PGD."""
+    if not hasattr(solver, "_atk"):
+        solver = make_adversarial_solver(
+            solver, BASE_CFG["acorn"],
+            dict(eps=0.0, alpha=0.0, steps=ADV_STEPS, lo=lo, hi=hi,
+                 clamp=CLAMP_TO_DATA, objective=ATTACK_OBJ, norm="linf",
+                 eps_rel=0.0))
+    saved_atk, saved_cfg = dict(solver._atk), solver._adv_cfg
+    saved_log = solver._adv_log
+    solver._adv_cfg = BASE_CFG["acorn"]          # force the pgd path
+    was_training = solver.model.training
+    solver.model.eval()
+
+    out = {}
+    for norm, er in ROBUST_EPS.items():
+        eps = compute_eps(norm, er, lo, hi, ts_norm)
+        solver._atk.update(norm=norm, eps=eps, alpha=ALPHA_RULE * eps, eps_rel=er)
+        solver._adv_log = []
+        for b_cpu in probe_batches:
+            solver._make_adv_batch(_batch_to(b_cpu, DEVICE), record=True)
+        cl = np.array([x[0] for x in solver._adv_log])
+        ad = np.array([x[1] for x in solver._adv_log])
+        mg = np.array([x[2] for x in solver._adv_log])
+        out[f"robust_destroy_{norm}"] = float(np.mean((ad - cl) / mg))
+        out[f"robust_abs_{norm}"]     = float(np.mean((ad - cl) /
+                                              np.maximum(LOSS_MAX - cl, 1e-6)))
+        out[f"robust_gap_{norm}"]     = float(np.mean(ad - cl))
+        out[f"robust_clean_{norm}"]   = float(cl.mean())
+        print(f"    robustness probe [{norm} eps_rel={er}]: "
+              f"clean={cl.mean():.4f} gap={np.mean(ad-cl):+.4f} "
+              f"DESTROYED={100*out[f'robust_destroy_{norm}']:.1f}%")
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+
+    solver._atk.update(**saved_atk)
+    solver._adv_cfg, solver._adv_log = saved_cfg, saved_log
+    if was_training:
+        solver.model.train()
+    return out
 
 
 # ============================================================== EVAL
@@ -501,7 +583,8 @@ def evaluate(arm_key, seed, solver, neural, position, gts, tuning, meta):
         if "jfinv" in maps:
             # with a flat singular spectrum J_f and pinv(J_f) rank the same
             # neurons -> "you can skip the pinv". Direct corollary of Sigma vs
-            # Sigma^-1. Expect HIGH for acorn, LOW for clean.
+            # Sigma^-1. Expect HIGH for acorn, LOW for clean. NEEDS >=5 seeds:
+            # cebra alone ranged 0.13 to 0.58 across two seeds in run 1.
             row["rank_corr_jf_jfinv"] = spearman(maps["jf"].ravel(),
                                                  maps["jfinv"].ravel())
 
@@ -544,10 +627,10 @@ def evaluate(arm_key, seed, solver, neural, position, gts, tuning, meta):
 
 # ============================================================== CALIBRATE
 def cache_probe_batches(neural, position, n):
-    """Pull n batches ONCE and park them on CPU, so every (norm, eps) cell sees
-    the SAME batches and the destroy_frac differences across the grid are purely
-    the attack. Building a throwaway solver here is wasteful, but it is the only
-    tested way to get a correctly configured ContrastiveMultiObjectiveLoader."""
+    """Pull n batches ONCE and park them on CPU, so every measurement sees the
+    SAME batches and cross-arm differences are purely the model. Building a
+    throwaway solver here is wasteful, but it is the only tested way to get a
+    correctly configured ContrastiveMultiObjectiveLoader."""
     _, loader = build(999, neural, position, n)
     out = []
     for batch in loader:
@@ -596,8 +679,10 @@ def calibrate(neural, position, lo, hi, ts_norm):
             for b_cpu in probe_batches:
                 batch = _batch_to(b_cpu, DEVICE)
                 adv = solver._make_adv_batch(batch, record=True)
-                # how much of the perturbation the [lo,hi] clamp ate. Once this
-                # is large, raising eps buys nothing -- that is the linf ceiling.
+                # NOTE: for l2 this is always ~100% because the data is
+                # nonnegative and mostly near 0, so the zero-clamp eats half of
+                # delta and its norm never reaches the budget. Use the
+                # destroy_frac PLATEAU to detect the ceiling, not this column.
                 with torch.no_grad():
                     d = adv.reference - batch.reference
                     if norm == "linf":
@@ -625,10 +710,9 @@ def calibrate(neural, position, lo, hi, ts_norm):
     import pandas as pd
     pd.DataFrame(table).to_csv(os.path.join(OUT_DIR, "calibration.csv"),
                                index=False)
-    print("\nPick eps_rel values whose DESTROYED lands in 20-50%. Below ~10% the\n"
-          "attack is cosmetic; above ~60% you train on noise. If DESTROYED stops\n"
-          "rising while `hitwall` climbs, you have hit the clamp ceiling and a\n"
-          "larger eps is pointless. Then set MODE='sweep' and SWEEP_EPS.")
+    print(f"\nchance={CHANCE:.2f}  loss_max={LOSS_MAX:.2f}. destroy_frac>100% just\n"
+          "means the attack pushed the batch past chance -- it is not capped.\n"
+          "Match the two norms on destroy_frac, never on eps_rel.")
 
 
 # ============================================================== MAIN
@@ -640,6 +724,7 @@ def main():
     print(f"neural {tuple(neural.shape)}  position {tuple(position.shape)}  "
           f"std={float(neural.std()):.4f}  range=[{float(neural.min())},"
           f"{float(neural.max())}]  mean||x_t||2={ts_norm:.3f}")
+    print(f"chance={CHANCE:.3f}  loss_max={LOSS_MAX:.3f}")
 
     if MODE == "calibrate":
         calibrate(neural, position, lo, hi, ts_norm)
@@ -655,15 +740,19 @@ def main():
     gt_md, _ = build_ground_truth(neural.shape[1], "model")
     gts = {"gtNB": gt_nb, "gtMODEL": gt_md}
 
-    # --- job list: baselines once, sweep arms per (norm, eps) ----------------
+    # ONE fixed batch set, shared by every arm's robustness probe
+    probe_batches = cache_probe_batches(neural, position, ROBUST_BATCHES)
+
+    # --- job list: baselines once per seed, sweep arms per (norm, eps) -------
     jobs = []
     for seed in SEEDS:
         for b in BASELINE_ARMS:
             jobs.append((b, b, seed, "linf", 0.0))
         for norm in SWEEP_NORMS:
-            for er in SWEEP_EPS:
+            for er in SWEEP_EPS[norm]:
                 for b in SWEEP_ARMS:
                     jobs.append((f"{b}_{norm}_e{er:g}", b, seed, norm, er))
+    print(f"\n{len(jobs)} jobs queued ({len(SEEDS)} seeds)")
 
     import pandas as pd
     csv_path = os.path.join(OUT_DIR, "results.csv")
@@ -682,6 +771,7 @@ def main():
                    lo=lo, hi=hi, clamp=CLAMP_TO_DATA, objective=ATTACK_OBJ,
                    norm=norm, eps_rel=er)
         solver, meta = train_arm(arm_key, base, seed, neural, position, atk)
+        meta.update(robustness_probe(solver, probe_batches, lo, hi, ts_norm))
         row = evaluate(arm_key, seed, solver, neural, position, gts, tuning, meta)
         rows.append(row)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
@@ -693,7 +783,10 @@ def main():
 
     df = pd.DataFrame(rows)
     print("\n================ SUMMARY (mean over seeds) ================")
-    key_cols = ["destroy_frac", "sv_sv_ratio", "rank_corr_jf_jfinv",
+    key_cols = ["destroy_frac", "destroy_frac_early", "destroy_frac_late",
+                "robust_destroy_linf", "robust_destroy_l2",
+                "robust_clean_linf",
+                "sv_sv_ratio", "rank_corr_jf_jfinv",
                 "sp_gini", "sp_participation_ratio",
                 "tune_sp_pos_jf", "tune_sel_jf", "tune_auroc_jf",
                 "auroc_rownorm_jf_gtMODEL", "auroc_global_jf_gtMODEL",
@@ -702,7 +795,9 @@ def main():
             .mean().to_string())
 
     # --- the money plot: metric vs eps, one line per norm -------------------
-    plots = [("destroy_frac", "fraction of learned margin destroyed"),
+    plots = [("robust_destroy_linf", "post-hoc robustness (linf eps_rel=0.03, LOWER=better)"),
+             ("robust_destroy_l2",   "post-hoc robustness (l2 eps_rel=0.07, LOWER=better)"),
+             ("destroy_frac", "margin destroyed DURING training"),
              ("sv_sv_ratio", "sv_min/sv_max  (spectrum flatness)"),
              ("rank_corr_jf_jfinv", "rank corr  J_f vs pinv(J_f)"),
              ("tune_sel_jf", "position-vs-hd tuning selectivity"),
@@ -733,9 +828,25 @@ def main():
     plt.savefig(os.path.join(OUT_DIR, "sweep_curves.png"), dpi=150)
     plt.close()
 
+    # --- hardening curves: same budget, shrinking effect over training ------
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for f in sorted(Path(OUT_DIR).glob("trace_*.npz")):
+        z = np.load(f)
+        lbl = f.stem.replace("trace_", "")
+        if not lbl.startswith(("acorn", "noise")):
+            continue
+        ax.plot(z["step"], 100 * z["destroy_frac"], lw=1, alpha=0.75, label=lbl)
+    ax.set_xlabel("training step"); ax.set_ylabel("% of margin destroyed")
+    ax.set_title("hardening: same eps, shrinking effect", fontsize=10)
+    ax.grid(alpha=0.3); ax.legend(fontsize=6, ncol=2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "hardening_curves.png"), dpi=150)
+    plt.close()
+
 
 if __name__ == "__main__":
     main()
+
 
 # # =============================================================================
 # #  xCEBRA / RatInABox  —  CLEAN vs ACORN (manual PGD adversarial training)
