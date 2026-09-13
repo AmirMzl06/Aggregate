@@ -16,7 +16,7 @@ import cebra
 # PATHS
 # ==========================
 
-MODEL_DIR = "../models"
+MODEL_DIR = "./models"
 
 CLEAN_MODEL = os.path.join(MODEL_DIR, "clean.pt")
 ACORN_MODEL = os.path.join(MODEL_DIR, "acorn.pt")
