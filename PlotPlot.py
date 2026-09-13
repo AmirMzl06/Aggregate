@@ -21,9 +21,9 @@ from mpl_toolkits.mplot3d import Axes3D
 
 
 
-# =====================================================
+# ============================================================
 # CONFIG
-# =====================================================
+# ============================================================
 
 PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 
@@ -35,7 +35,7 @@ TARGET_SESSION = "C-CO12"
 
 N_NEURONS = 86
 
-N_CCO_SESSIONS = 53
+N_SESSIONS = 53
 
 SEED = 42
 
@@ -48,16 +48,15 @@ PLOTS_DIR = "plots"
 
 
 
-# =====================================================
+# ============================================================
 # DATA
-# =====================================================
-
+# ============================================================
 
 def session_path(session):
 
     return os.path.join(
         PERICH_DATA_DIR,
-        session+".npz"
+        session + ".npz"
     )
 
 
@@ -75,7 +74,6 @@ def load_session(session):
         np.float32
     )
 
-
     X_test=data["valid_data"].astype(
         np.float32
     )
@@ -87,10 +85,9 @@ def load_session(session):
 
 
 
-# =====================================================
-# MODEL
-# =====================================================
-
+# ============================================================
+# LOAD MODEL
+# ============================================================
 
 def load_model(name):
 
@@ -113,63 +110,33 @@ def load_model(name):
 
 
 
-# =====================================================
-# SELECT NEURONS
-# =====================================================
+# ============================================================
+# EMBEDDING
+# ============================================================
 
+def embed(model,X):
 
-def select_neurons(
-        X,
-        n_neurons,
-        seed):
-
-
-    total=X.shape[1]
-
-
-    if total < n_neurons:
-
-        return None
-
-
-    if total == n_neurons:
-
-        return X
-
-
-
-    rng=np.random.default_rng(
-        seed
-    )
-
-
-    idx=np.sort(
-        rng.choice(
-            total,
-            size=n_neurons,
-            replace=False
+    return np.asarray(
+        model.transform(
+            X.astype(np.float32)
         )
     )
 
 
-    return X[:,idx]
 
 
 
-
-
-# =====================================================
-# BUILD CROSS SESSION
-# =====================================================
+# ============================================================
+# ALLOCATE 86 NEURONS
+# ============================================================
 
 
 def get_sessions():
 
     return [
-        d for d in range(N_CCO_SESSIONS)
-        if d != TARGET_DAY
+        i for i in range(N_SESSIONS)
+        if i != TARGET_DAY
     ]
-
 
 
 
@@ -187,10 +154,11 @@ def allocate_neurons():
     allocation={}
 
 
-    remaining=N_NEURONS
+    remain=N_NEURONS
 
 
-    while remaining>0:
+    while remain>0:
+
 
         s=int(
             rng.choice(
@@ -205,7 +173,8 @@ def allocate_neurons():
         )+1
 
 
-        remaining-=1
+        remain-=1
+
 
 
     return allocation
@@ -214,22 +183,26 @@ def allocate_neurons():
 
 
 
+# ============================================================
+# BUILD CROSS SESSION MATRIX
+# ============================================================
+
+
 def build_cross_test():
+
 
     allocation=allocate_neurons()
 
 
-    print(
-        "\nAllocation:"
-    )
+    print("\nNeuron allocation")
 
-    print(
-        allocation
-    )
+    print(allocation)
 
 
 
     blocks=[]
+
+    time_lengths=[]
 
 
 
@@ -244,25 +217,48 @@ def build_cross_test():
         )
 
 
+        available=X_test.shape[1]
+
+
+        if available < n:
+
+            print(
+                "skip",
+                session,
+                "has only",
+                available
+            )
+
+            continue
+
+
+
         rng=np.random.default_rng(
             SEED+day
         )
 
 
         idx=rng.choice(
-            X_test.shape[1],
+            available,
             size=n,
             replace=False
         )
 
 
+
         X_sel=X_test[:,idx]
+
 
 
         blocks.append(
             X_sel.astype(
                 np.float32
             )
+        )
+
+
+        time_lengths.append(
+            X_sel.shape[0]
         )
 
 
@@ -273,38 +269,42 @@ def build_cross_test():
 
 
 
-    # -------------------------------
-    # REMOVE EXTRA TIME BINS
-    # -------------------------------
+
+    # ---------------------------------
+    # equalize time bins
+    # ---------------------------------
 
 
     min_time=min(
-        x.shape[0]
-        for x in blocks
+        time_lengths
     )
 
 
     print(
-        "minimum time bins:",
+        "minimum time:",
         min_time
     )
 
 
-    blocks=[
-        x[:min_time]
-        for x in blocks
-    ]
+    trimmed=[]
+
+
+    for X in blocks:
+
+        trimmed.append(
+            X[:min_time]
+        )
 
 
 
-    # -------------------------------
-    # CONCATENATE SESSIONS
-    # -------------------------------
+    # ---------------------------------
+    # concatenate neurons
+    # ---------------------------------
 
 
     X_cross=np.concatenate(
-        blocks,
-        axis=0
+        trimmed,
+        axis=1
     )
 
 
@@ -321,12 +321,12 @@ def build_cross_test():
 
 
 
-# =====================================================
-# NORMALIZE
-# =====================================================
+# ============================================================
+# NORMALIZATION
+# ============================================================
 
 
-def normalize(
+def normalize_using_reference(
         X,
         ref):
 
@@ -334,6 +334,7 @@ def normalize(
     mu=ref.mean(
         axis=0
     )
+
 
     std=ref.std(
         axis=0
@@ -353,35 +354,16 @@ def normalize(
 
 
 
-# =====================================================
-# EMBEDDING
-# =====================================================
-
-
-def embed(
-        model,
-        X):
-
-    return np.asarray(
-        model.transform(
-            X
-        )
-    )
-
-
-
-
-
-# =====================================================
+# ============================================================
 # PCA PLOT
-# =====================================================
+# ============================================================
 
 
-def plot_pca(
+def pca_plot(
         A,
         B,
         title,
-        name):
+        filename):
 
 
     os.makedirs(
@@ -390,10 +372,15 @@ def plot_pca(
     )
 
 
-    all_data=np.concatenate(
-        [A,B],
+
+    data=np.concatenate(
+        [
+            A,
+            B
+        ],
         axis=0
     )
+
 
 
     pca=PCA(
@@ -401,18 +388,25 @@ def plot_pca(
     )
 
 
-    pca.fit(
-        all_data
+    pca.fit(data)
+
+
+
+    ZA=pca.transform(
+        A
     )
 
 
-    A3=pca.transform(A)
+    ZB=pca.transform(
+        B
+    )
 
-    B3=pca.transform(B)
 
 
-
+    # -----------------
     # 2D
+    # -----------------
+
 
     plt.figure(
         figsize=(7,6)
@@ -420,16 +414,16 @@ def plot_pca(
 
 
     plt.scatter(
-        A3[:,0],
-        A3[:,1],
+        ZA[:,0],
+        ZA[:,1],
         s=5,
         label="C-CO12"
     )
 
 
     plt.scatter(
-        B3[:,0],
-        B3[:,1],
+        ZB[:,0],
+        ZB[:,1],
         s=5,
         label="Cross"
     )
@@ -437,15 +431,19 @@ def plot_pca(
 
     plt.legend()
 
+
     plt.title(
-        title+" 2D"
+        title+" PCA 2D"
     )
+
+
+    plt.tight_layout()
 
 
     plt.savefig(
         os.path.join(
             PLOTS_DIR,
-            name+"_2D.png"
+            filename+"_2D.png"
         ),
         dpi=200
     )
@@ -455,7 +453,10 @@ def plot_pca(
 
 
 
+    # -----------------
     # 3D
+    # -----------------
+
 
     fig=plt.figure(
         figsize=(8,7)
@@ -469,18 +470,18 @@ def plot_pca(
 
 
     ax.scatter(
-        A3[:,0],
-        A3[:,1],
-        A3[:,2],
+        ZA[:,0],
+        ZA[:,1],
+        ZA[:,2],
         s=5,
         label="C-CO12"
     )
 
 
     ax.scatter(
-        B3[:,0],
-        B3[:,1],
-        B3[:,2],
+        ZB[:,0],
+        ZB[:,1],
+        ZB[:,2],
         s=5,
         label="Cross"
     )
@@ -490,14 +491,17 @@ def plot_pca(
 
 
     ax.set_title(
-        title+" 3D"
+        title+" PCA 3D"
     )
+
+
+    plt.tight_layout()
 
 
     plt.savefig(
         os.path.join(
             PLOTS_DIR,
-            name+"_3D.png"
+            filename+"_3D.png"
         ),
         dpi=200
     )
@@ -509,9 +513,9 @@ def plot_pca(
 
 
 
-# =====================================================
+# ============================================================
 # MAIN
-# =====================================================
+# ============================================================
 
 
 def main():
@@ -534,95 +538,118 @@ def main():
 
 
 
+    # CCO12
+
     _,X12=load_session(
         TARGET_SESSION
     )
 
 
 
+    print(
+        "CCO12:",
+        X12.shape
+    )
+
+
+
+    # Cross
+
     Xcross=build_cross_test()
 
 
 
+    print(
+        "Cross:",
+        Xcross.shape
+    )
+
+
+
+
     for name,model in [
+
         ("clean",clean),
+
         ("acorn",acorn)
+
     ]:
 
 
         print(
-            "\nMODEL",
+            "\nMODEL:",
             name
         )
 
 
 
-        # -----------------
+        # =========================
         # RAW
-        # -----------------
+        # =========================
 
-        e12=embed(
+
+        emb12=embed(
             model,
             X12
         )
 
 
-        ecross=embed(
+        embcross=embed(
             model,
             Xcross
         )
 
 
-        plot_pca(
-            e12,
-            ecross,
-            name+"_raw",
+        pca_plot(
+            emb12,
+            embcross,
+            name+"_RAW",
             name+"_raw"
         )
 
 
 
-        # -----------------
-        # STD using CCO12
-        # -----------------
+        # =========================
+        # CCO12 STD
+        # =========================
 
 
-        X12n=normalize(
+        X12_std=normalize_using_reference(
             X12,
             X12
         )
 
 
-        Xcrossn=normalize(
+        Xcross_std=normalize_using_reference(
             Xcross,
             X12
         )
 
 
 
-        e12n=embed(
+        emb12_std=embed(
             model,
-            X12n
+            X12_std
         )
 
 
-        ecrossn=embed(
+        embcross_std=embed(
             model,
-            Xcrossn
+            Xcross_std
         )
 
 
 
-        plot_pca(
-            e12n,
-            ecrossn,
-            name+"_CCO12std",
+        pca_plot(
+            emb12_std,
+            embcross_std,
+            name+"_STD",
             name+"_std"
         )
 
 
 
-    print("DONE")
+    print("\nDONE")
 
 
 
