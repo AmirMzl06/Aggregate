@@ -1,389 +1,262 @@
 import os
+import sys
+import gc
+import random
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-import sys
-from sklearn.decomposition import PCA
-from mpl_toolkits.mplot3d import Axes3D
 from utils.constants import CEBRA_DIR
 
 sys.path.insert(0, str(CEBRA_DIR))
-
 import cebra
+from cebra import CEBRA
+from sklearn.decomposition import PCA
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-
-# ==========================
-# PATHS
-# ==========================
-
-MODEL_DIR = "./models"
-
-CLEAN_MODEL = os.path.join(MODEL_DIR, "clean.pt")
-ACORN_MODEL = os.path.join(MODEL_DIR, "acorn.pt")
-
-OUT = "cross_embedding_plots"
-os.makedirs(OUT, exist_ok=True)
-
-
-DATA_ROOT = "/data/hossein/mm_project/perich_data_valid_final_raw"
-
-TARGET = "C-CO12"
-
+PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
+DATASET_NAME = "C-CO"
+TARGET_DAY = 12
+TARGET_SESSION = f"{DATASET_NAME}{TARGET_DAY}"
 N_NEURONS = 86
-SEED = 0
+N_CCO_SESSIONS = 53
+SEED = 42
+MODELS_DIR = "models"
+PLOTS_DIR = "plots_cross_session"
+CLEAN_MODEL_PATH = os.path.join(MODELS_DIR, "clean.pt")
+ACORN_MODEL_PATH = os.path.join(MODELS_DIR, "acorn.pt")
+os.makedirs(PLOTS_DIR, exist_ok=True)
 
+def seed_all(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+seed_all()
 
+def session_path(session_name):
+    return os.path.join(PERICH_DATA_DIR, f"{session_name}.npz")
 
-# ==========================
-# Load sessions
-# ==========================
+def load_test(session_name):
+    path = session_path(session_name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    data = np.load(path, allow_pickle=True)
+    X_test = data["valid_data"].astype(np.float32)
+    return X_test
 
-def load_session(name):
+def load_target_test():
+    X_target = load_test(TARGET_SESSION)
+    print(f"{TARGET_SESSION} test:", X_target.shape)
+    if X_target.shape[1] != N_NEURONS:
+        raise RuntimeError(f"{TARGET_SESSION} has " f"{X_target.shape[1]} neurons, " f"expected {N_NEURONS}.")
+    if not np.isfinite(X_target).all():
+        raise RuntimeError(f"{TARGET_SESSION} test " "contains NaN or Inf.")
+    return X_target
 
-    path = os.path.join(DATA_ROOT, name + ".npz")
+def get_other_session_ids():
+    return [day for day in range(N_CCO_SESSIONS) if day != TARGET_DAY]
 
-    d = np.load(path)
+def build_cross_session_test_corpus():
+    print("\n" + "=" * 100)
+    print("BUILDING CROSS-SESSION TEST CORPUS")
+    print("=" * 100)
+    parts = []
+    used = []
+    skipped = []
+    for day in get_other_session_ids():
+        session = f"{DATASET_NAME}{day}"
+        path = session_path(session)
+        if not os.path.exists(path):
+            print(f"[SKIP] {session}: " "file not found")
+            skipped.append(session)
+            continue
+        try:
+            X_test = load_test(session)
+        except Exception as exc:
+            print(f"[SKIP] {session}: " f"{exc}")
+            skipped.append(session)
+            continue
+        if X_test.shape[0] == 0:
+            print(f"[SKIP] {session}: " "empty test set")
+            skipped.append(session)
+            continue
+        if X_test.shape[1] == 0:
+            print(f"[SKIP] {session}: " "zero neurons")
+            skipped.append(session)
+            continue
+        if not np.isfinite(X_test).all():
+            print(f"[SKIP] {session}: " "NaN/Inf in test")
+            skipped.append(session)
+            continue
+        parts.append(X_test.astype(np.float32))
+        used.append(session)
+        print(f"[OK]   {session}: " f"{X_test.shape}")
+    if not parts:
+        raise RuntimeError("No usable cross-session " "test sets found.")
+    corpus = np.concatenate(parts, axis=0).astype(np.float32)
+    print("\nCross-session test corpus:", corpus.shape)
+    print("Used sessions:", used)
+    if skipped:
+        print("Skipped sessions:", skipped)
+    return corpus
 
-    X_train = d["train_data"].astype(np.float32)
-    X_test  = d["valid_data"].astype(np.float32)
+def select_random_neurons(corpus, n_neurons, seed=SEED):
+    total_neurons = corpus.shape[1]
+    if total_neurons < n_neurons:
+        raise RuntimeError(f"Cross-session corpus has " f"only {total_neurons} neurons, " f"cannot select {n_neurons}.")
+    rng = np.random.default_rng(seed)
+    idx = np.sort(rng.choice(total_neurons, size=n_neurons, replace=False))
+    selected = corpus[:, idx].astype(np.float32)
+    print("\nRandomly selected neurons:", n_neurons)
+    print("Selected indices:", idx)
+    print("Selected corpus:", selected.shape)
+    return selected, idx
 
-    return X_train, X_test
+def match_mean_std_to_target(X_source, X_target):
+    if X_source.shape[1] != X_target.shape[1]:
+        raise RuntimeError("Source and target must have " "the same number of neurons.")
+    source_mean = X_source.mean(axis=0)
+    source_std = X_source.std(axis=0)
+    target_mean = X_target.mean(axis=0)
+    target_std = X_target.std(axis=0)
+    source_std_safe = source_std.copy()
+    source_std_safe[source_std_safe < 1e-8] = 1.0
+    X_matched = ((X_source - source_mean) / source_std_safe) * target_std
+    X_matched += target_mean
+    X_matched = X_matched.astype(np.float32)
+    return X_matched
 
+def print_statistics(X_target, X_cross):
+    target_mean = X_target.mean(axis=0)
+    target_std = X_target.std(axis=0)
+    cross_mean = X_cross.mean(axis=0)
+    cross_std = X_cross.std(axis=0)
+    mean_diff = np.max(np.abs(target_mean - cross_mean))
+    std_diff = np.max(np.abs(target_std - cross_std))
+    print("\n" + "=" * 100)
+    print("MEAN / STD MATCH CHECK")
+    print("=" * 100)
+    print("Max absolute mean diff:", f"{mean_diff:.10f}")
+    print("Max absolute std diff :", f"{std_diff:.10f}")
+    print("\nFirst 10 neurons:")
+    print("Target mean:", target_mean[:10])
+    print("Cross  mean:", cross_mean[:10])
+    print("\nTarget std:", target_std[:10])
+    print("Cross  std:", cross_std[:10])
 
-
-# ==========================
-# Mean std matching
-# ==========================
-
-def match_distribution(X, ref):
-
-    """
-    Match neuron-wise mean/std
-    X: other session
-    ref: CCO12
-    """
-
-    mu_x = X.mean(axis=0)
-    std_x = X.std(axis=0)
-
-    mu_r = ref.mean(axis=0)
-    std_r = ref.std(axis=0)
-
-
-    X = (X - mu_x) / (std_x + 1e-8)
-
-    X = X * std_r + mu_r
-
-    return X
-
-
-
-# ==========================
-# random 86 neurons
-# ==========================
-
-def select_neurons(X, idx):
-
-    return X[:, idx]
-
-
-
-# ==========================
-# Build model
-# ==========================
-
-def load_model(weight):
-
-    model = cebra.models.init(
-        name="offset10-model",
-        num_neurons=N_NEURONS,
-        num_units=256,
-        num_output=14
-    )
-
-    state = torch.load(
-        weight,
-        map_location="cpu",
-        weights_only=False
-    )
-    if "model_state_dict" in state:
-        state = state["model_state_dict"]
-
-    model.load_state_dict(state)
-
-    model.to(DEVICE)
-    model.eval()
-
+def load_model(path, name):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} not found.")
+    model = CEBRA.load(path)
+    print(f"\nLoaded {name}:", path)
     return model
 
+def embed(model, X):
+    return np.asarray(model.transform(X.astype(np.float32)), dtype=np.float32)
 
+def plot_pca_comparison(emb_target, emb_cross, model_name):
+    combined = np.concatenate([emb_target, emb_cross], axis=0)
+    pca = PCA(n_components=3)
+    pca.fit(combined)
+    proj_target = pca.transform(emb_target)
+    proj_cross = pca.transform(emb_cross)
+    var = pca.explained_variance_ratio_
 
-# ==========================
-# Embedding
-# ==========================
-
-def embedding(model, X):
-
-    x = torch.tensor(X).float().to(DEVICE)
-
-    with torch.no_grad():
-
-        z = model(x)
-
-        if isinstance(z, tuple):
-            z = torch.cat(z, dim=1)
-
-    return z.cpu().numpy()
-
-
-
-# ==========================
-# PCA plots
-# ==========================
-
-def plot_pca(real, cross, name):
-
-    X = np.concatenate(
-        [real, cross],
-        axis=0
-    )
-
-    pca2 = PCA(n_components=2)
-    pca3 = PCA(n_components=3)
-
-
-    p2 = pca2.fit_transform(X)
-
-    p3 = pca3.fit_transform(X)
-
-
-    n = len(real)
-
-
-    # ---------- 2D ----------
-
-    plt.figure(figsize=(7,6))
-
-    plt.scatter(
-        p2[:n,0],
-        p2[:n,1],
-        s=5,
-        alpha=0.5,
-        label="C-CO12"
-    )
-
-    plt.scatter(
-        p2[n:,0],
-        p2[n:,1],
-        s=5,
-        alpha=0.5,
-        label="Other C-CO"
-    )
-
-
+    plt.figure(figsize=(8, 7))
+    plt.scatter(proj_target[:, 0], proj_target[:, 1], s=6, c="red", alpha=0.5, label=f"{TARGET_SESSION} test")
+    plt.scatter(proj_cross[:, 0], proj_cross[:, 1], s=6, c="blue", alpha=0.5, label="Cross-session test")
+    plt.xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+    plt.ylabel(f"PC2 ({var[1] * 100:.1f}%)")
+    plt.title(f"{model_name.upper()} -- " "C-CO12 vs cross-session\n" "PCA 2D")
     plt.legend()
-    plt.title(name+" PCA 2D")
     plt.tight_layout()
-
-    plt.savefig(
-        os.path.join(
-            OUT,
-            name+"_PCA2D.png"
-        ),
-        dpi=200
-    )
-
+    path_2d = os.path.join(PLOTS_DIR, f"{model_name}_cross_session_2d.png")
+    plt.savefig(path_2d, dpi=300, bbox_inches="tight")
     plt.close()
+    print("Saved:", path_2d)
 
-
-
-    # ---------- 3D ----------
-
-    fig = plt.figure(figsize=(8,7))
-
-    ax = fig.add_subplot(
-        111,
-        projection="3d"
-    )
-
-
-    ax.scatter(
-        p3[:n,0],
-        p3[:n,1],
-        p3[:n,2],
-        s=5,
-        label="C-CO12"
-    )
-
-    ax.scatter(
-        p3[n:,0],
-        p3[n:,1],
-        p3[n:,2],
-        s=5,
-        label="Other C-CO"
-    )
-
-
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(proj_target[:, 0], proj_target[:, 1], proj_target[:, 2], s=6, c="red", alpha=0.5, label=f"{TARGET_SESSION} test")
+    ax.scatter(proj_cross[:, 0], proj_cross[:, 1], proj_cross[:, 2], s=6, c="blue", alpha=0.5, label="Cross-session test")
+    ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
+    ax.set_zlabel(f"PC3 ({var[2] * 100:.1f}%)")
+    ax.set_title(f"{model_name.upper()} -- " "C-CO12 vs cross-session\n" "PCA 3D")
     ax.legend()
-    ax.set_title(name+" PCA 3D")
-
-
-    plt.savefig(
-        os.path.join(
-            OUT,
-            name+"_PCA3D.png"
-        ),
-        dpi=200
-    )
-
+    plt.tight_layout()
+    path_3d = os.path.join(PLOTS_DIR, f"{model_name}_cross_session_3d.png")
+    plt.savefig(path_3d, dpi=300, bbox_inches="tight")
     plt.close()
+    print("Saved:", path_3d)
+    return path_2d, path_3d
 
+def main():
+    print("\n" + "#" * 120)
+    print("CROSS-SESSION EMBEDDING TEST")
+    print(f"TARGET SESSION = {TARGET_SESSION}")
+    print(f"N NEURONS      = {N_NEURONS}")
+    print("SOURCE         = OTHER C-CO TEST SETS ONLY")
+    print("NORMALIZATION  = TARGET C-CO12 MEAN / STD")
+    print("#" * 120)
 
+    X_target_test = load_target_test()
+    other_test_corpus = build_cross_session_test_corpus()
+    X_cross_random, selected_idx = select_random_neurons(other_test_corpus, N_NEURONS, seed=SEED)
+    X_cross_matched = match_mean_std_to_target(X_cross_random, X_target_test)
+    print_statistics(X_target_test, X_cross_matched)
 
-# ==========================
-# MAIN
-# ==========================
+    np.save(os.path.join(PLOTS_DIR, "cross_session_test_random86_meanstd_matched.npy"), X_cross_matched)
+    np.save(os.path.join(PLOTS_DIR, "selected_neuron_indices.npy"), selected_idx)
 
+    clean_model = load_model(CLEAN_MODEL_PATH, "CLEAN")
+    acorn_model = load_model(ACORN_MODEL_PATH, "ACORN")
 
-print("Loading CCO12")
+    print("\n" + "=" * 100)
+    print("CLEAN EMBEDDINGS")
+    print("=" * 100)
+    clean_target_emb = embed(clean_model, X_target_test)
+    clean_cross_emb = embed(clean_model, X_cross_matched)
+    print("CLEAN target embedding:", clean_target_emb.shape)
+    print("CLEAN cross embedding:", clean_cross_emb.shape)
+    np.save(os.path.join(PLOTS_DIR, "clean_target_test_embedding.npy"), clean_target_emb)
+    np.save(os.path.join(PLOTS_DIR, "clean_cross_session_embedding.npy"), clean_cross_emb)
+    plot_pca_comparison(clean_target_emb, clean_cross_emb, "clean")
 
-_, X_test = load_session(TARGET)
+    print("\n" + "=" * 100)
+    print("ACORN EMBEDDINGS")
+    print("=" * 100)
+    acorn_target_emb = embed(acorn_model, X_target_test)
+    acorn_cross_emb = embed(acorn_model, X_cross_matched)
+    print("ACORN target embedding:", acorn_target_emb.shape)
+    print("ACORN cross embedding:", acorn_cross_emb.shape)
+    np.save(os.path.join(PLOTS_DIR, "acorn_target_test_embedding.npy"), acorn_target_emb)
+    np.save(os.path.join(PLOTS_DIR, "acorn_cross_session_embedding.npy"), acorn_cross_emb)
+    plot_pca_comparison(acorn_target_emb, acorn_cross_emb, "acorn")
 
+    del clean_model
+    del acorn_model
+    del clean_target_emb
+    del clean_cross_emb
+    del acorn_target_emb
+    del acorn_cross_emb
+    del X_target_test
+    del other_test_corpus
+    del X_cross_random
+    del X_cross_matched
+    gc.collect()
 
-print(
-    "CCO12:",
-    X_test.shape
-)
+    print("\n" + "#" * 120)
+    print("DONE")
+    print("#" * 120)
+    print("Models loaded from:")
+    print(CLEAN_MODEL_PATH)
+    print(ACORN_MODEL_PATH)
+    print("\nPlots saved in:")
+    print(PLOTS_DIR)
 
-
-
-# choose random neurons
-rng = np.random.default_rng(SEED)
-
-neuron_idx = rng.choice(
-    X_test.shape[1],
-    N_NEURONS,
-    replace=False
-)
-
-
-X_ref = X_test[:, neuron_idx]
-
-
-print(
-    "Selected neurons:",
-    neuron_idx
-)
-
-
-
-# other sessions
-
-sessions = []
-
-for i in range(53):
-
-    name=f"C-CO{i}"
-
-    if name == TARGET:
-        continue
-
-    try:
-        _, Xt = load_session(name)
-
-        Xt = Xt[:, neuron_idx]
-
-        sessions.append(Xt)
-
-    except:
-        pass
-
-
-
-cross = np.concatenate(
-    sessions,
-    axis=0
-)
-
-
-print(
-    "Before matching:",
-    cross.shape
-)
-
-
-
-cross = match_distribution(
-    cross,
-    X_ref
-)
-
-
-print(
-    "After matching mean/std"
-)
-
-
-
-# ==========================
-# Run both models
-# ==========================
-
-
-for name,weight in [
-    ("CLEAN", CLEAN_MODEL),
-    ("ACORN", ACORN_MODEL)
-]:
-
-    print("Running", name)
-
-
-    model = load_model(weight)
-
-
-    emb_real = embedding(
-        model,
-        X_ref
-    )
-
-
-    emb_cross = embedding(
-        model,
-        cross
-    )
-
-
-    print(
-        emb_real.shape,
-        emb_cross.shape
-    )
-
-
-    np.save(
-        os.path.join(
-            OUT,
-            name+"_real_embedding.npy"
-        ),
-        emb_real
-    )
-
-
-    np.save(
-        os.path.join(
-            OUT,
-            name+"_cross_embedding.npy"
-        ),
-        emb_cross
-    )
-
-
-    plot_pca(
-        emb_real,
-        emb_cross,
-        name
-    )
-
-
-print("DONE")
+if __name__ == "__main__":
+    main()
