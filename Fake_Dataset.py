@@ -142,7 +142,7 @@ ADV_CACHE_RTOL      = 1e-5
 # --- reporting ---------------------------------------------------------------
 PRIMARY_METRIC = "auroc_global"
 N_BOOTSTRAP    = 1000
-RESULT_TAG     = f"{ARCH_VARIANT}"
+RESULT_TAG     = f"{ARCH_VARIANT}_Lorenzo"
 SELECT_SEED0   = 90_001        # disjoint from EVAL_SEED0 by construction
 EVAL_SEED0     = 1_234
 SEED_STRIDE    = 977
