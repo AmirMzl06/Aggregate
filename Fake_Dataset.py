@@ -1,5 +1,5 @@
 # ### Lorenzo
-### Lorenzo v2  --  stochastic Lorenz latents + DGP gates
+### Lorenzo v3  --  stochastic Lorenz latents, single-variable calibration
 from __future__ import annotations
 
 import math
@@ -78,23 +78,26 @@ STANDARDIZE     = False
 #
 # The tension is real and cannot be wished away: a noise-dominated conditional
 # smears the attractor, a drift-dominated one reintroduces the degeneracy.
-# LORENZ_DRIFT_RATIO makes that trade explicit instead of accidental.
 LATENT_PROCESS = "lorenz_sde"   # "brownian" | "lorenz_sde" | "lorenz_det"
 
-BROWNIAN_SIGMA     = 0.10   # per-step SD in the [-1,1] box, "brownian" only
-LATENT_STEP_SD     = 0.10   # TARGET per-step SD in the box for lorenz_sde;
-                            # matched to BROWNIAN_SIGMA so the contrastive task
-                            # has the same difficulty as the Brownian baseline
-LORENZ_DRIFT_RATIO = 0.30   # ||drift step|| / ||diffusion step|| per coordinate.
-                            # The linear predictability of the increment is then
-                            # bounded by R^2/(1+R^2) = 0.083 -- comfortably under
-                            # DRIFT_R2_MAX below.
+BROWNIAN_SIGMA   = 0.10   # per-step SD in the box, "brownian" only
+LATENT_STEP_SD   = 0.10   # reference value for reporting only; nothing is
+                          # solved for it any more
+
+# dt is now FIXED, not solved for.  The previous version solved for dt AND
+# sigma_d simultaneously against two targets that turned out to be mutually
+# unreachable for Lorenz-63, and the iteration ran sigma_d up until explicit
+# Euler blew up.  Only sigma_d is searched now, dt is a plain knob.
+LORENZ_DT              = 0.02
+LORENZ_DRIFT_CAP       = 5.0    # max drift DISPLACEMENT per step, raw units
+LORENZ_TARGET_DRIFT_R2 = 0.08   # what the noise level is bisected to achieve
+LORENZ_SIGMA_D_LO      = 0.5    # bisection bracket
+LORENZ_SIGMA_D_HI      = 400.0
+LORENZ_BISECT_ITERS    = 14
 LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
-LORENZ_BURN_IN     = 2000
-LORENZ_DT0         = 0.01   # calibration seeds only; solved for, not used raw
-LORENZ_SIGMA_D0    = 20.0
-LORENZ_CAL_ROUNDS  = 4
-LORENZ_CAL_STEPS   = 6000
+LORENZ_BURN_IN   = 2000
+LORENZ_CAL_STEPS = 4000
+STEP_SD_LO, STEP_SD_HI = 0.02, 0.30   # sane range for the per-step displacement
 
 # --- optimisation -------------------------------------------------------------
 LEARNING_RATE    = 3e-4
@@ -144,10 +147,10 @@ SURROGATE_AUROC_MIN = 0.995
 JREG_SELFTEST_RTOL  = 0.15
 ADV_CACHE_RTOL      = 1e-5
 
-# NEW -- the cheap pre-flight gates.  These cost milliseconds and would have
-# caught the failed Lorenz run before a single optimizer step.
+# The cheap pre-flight gates.  These cost milliseconds and would have caught the
+# failed deterministic-Lorenz run before a single optimizer step.
 DRIFT_R2_MAX  = 0.15   # linear R2 of predicting z[t+off]-z[t] from z[t].
-                       # brownian -> 0.00 ; lorenz_sde @ ratio 0.30 -> ~0.08 ;
+                       # brownian -> 0.00 ; lorenz_sde (calibrated) -> ~0.08 ;
                        # lorenz_det -> >0.5, i.e. the increment is a function of
                        # the state and the conditional is not a distribution.
 NCE_GAP_MAX   = 0.50   # eval_nce - nce_clean_train.  A large positive gap means
@@ -265,8 +268,7 @@ def _banner():
     print(f" STAGE={STAGE}  arch={ARCH_VARIANT}  model={MODEL_NAME} "
           f"tanh_scale={TANH_SCALE}")
     print(f" latent process = {LATENT_PROCESS}"
-          + (f"  (drift/diffusion={LORENZ_DRIFT_RATIO}, "
-             f"step_sd target={LATENT_STEP_SD})"
+          + (f"  (dt={LORENZ_DT}, target drift_r2={LORENZ_TARGET_DRIFT_R2})"
              if LATENT_PROCESS.startswith("lorenz") else
              f"  (sigma={BROWNIAN_SIGMA})"))
     print(f" device={DEVICE}  standardize={STANDARDIZE}  d_list={D_LATENT_LIST}")
@@ -310,93 +312,127 @@ def _lorenz_deriv(state: np.ndarray) -> np.ndarray:
 
 
 def _integrate_lorenz(n_chains: int, n_steps: int, dt: float, sigma_d: float,
-                      rng, burn_in: int) -> Tuple[np.ndarray, float, float]:
-    """Euler-Maruyama for dz = f(z) dt + sigma_d sqrt(dt) dW, all chains at once.
+                      rng, burn_in: int) -> np.ndarray:
+    """Euler-Maruyama for dz = f(z) dt + sigma_d sqrt(dt) dW, CAPPED drift step.
 
-    sigma_d = 0 recovers the deterministic system (the 'lorenz_det' trap).
-    Returns the post-burn-in trajectory [n_steps, n_chains, 3] plus the realised
-    per-coordinate RMS drift step and RMS diffusion step, which the calibrator
-    below solves against."""
+    Why the cap exists.  The Lorenz drift is quadratic (x*z, x*y), so it is not
+    globally Lipschitz.  Additive noise occasionally pushes the state off the
+    attractor; |f| then grows like the square of the excursion, the explicit
+    Euler increment f*dt overshoots further out, and the iteration reaches inf
+    within a few hundred steps.  That is a failure of explicit Euler, not of the
+    SDE.  Capping the drift DISPLACEMENT (never the state) at LORENZ_DRIFT_CAP
+    raw units is a no-op in the normal regime -- on the attractor |f|*dt is
+    about 2.6 at dt=0.02, well under the cap -- and acts purely as a brake
+    during a runaway, where the Lorenz drift points inward anyway, so the
+    process stays recurrent instead of diverging.
+
+    sigma_d = 0 recovers the deterministic system (the 'lorenz_det' trap)."""
     state = (np.array([1.0, 1.0, 1.0])[None]
              + rng.normal(scale=2.0, size=(n_chains, 3)))
     out = np.empty((n_steps, n_chains, 3), dtype=np.float64)
     sq = math.sqrt(dt)
-    drift_sq = diff_sq = 0.0
-    n_acc = 0
     for t in range(burn_in + n_steps):
-        f = _lorenz_deriv(state)
-        noise = rng.normal(size=state.shape)
-        state = state + f * dt + sigma_d * sq * noise
-        if not np.all(np.isfinite(state)):
-            raise RuntimeError(
-                f"Lorenz SDE diverged at step {t} (dt={dt:g}, sigma_d={sigma_d:g}). "
-                f"Reduce LORENZ_DT0 or LORENZ_DRIFT_RATIO.")
+        step = _lorenz_deriv(state) * dt
+        mag = np.linalg.norm(step, axis=-1, keepdims=True)
+        step = step * np.minimum(1.0, LORENZ_DRIFT_CAP / np.maximum(mag, 1e-12))
+        state = state + step + sigma_d * sq * rng.normal(size=state.shape)
         if t >= burn_in:
             out[t - burn_in] = state
-            drift_sq += float(np.mean((f * dt) ** 2))
-            diff_sq += float(np.mean((sigma_d * sq * noise) ** 2))
-            n_acc += 1
-    return (out,
-            math.sqrt(drift_sq / max(n_acc, 1)),
-            math.sqrt(diff_sq / max(n_acc, 1)))
+    if not np.all(np.isfinite(out)):
+        raise RuntimeError("Lorenz SDE non-finite despite the drift cap; "
+                           "lower LORENZ_DT.")
+    return out
+
+
+def _probe_lorenz(sigma_d: float, cal_seed: int = 20260913) -> Tuple[float, float]:
+    """(drift_r2, normalised per-step displacement) at this noise level.
+
+    A FIXED seed, so the bisection below sees a smooth deterministic function of
+    sigma_d (common random numbers) rather than a noisy one."""
+    rng = np.random.default_rng(cal_seed)
+    traj = _integrate_lorenz(2, LORENZ_CAL_STEPS, LORENZ_DT, sigma_d, rng,
+                             LORENZ_BURN_IN)
+    z = traj[:, 0, :]
+    z = z - z.mean(0, keepdims=True)
+    scale = float(np.max(np.abs(z)))
+    step = float(np.sqrt(np.mean((z[TIME_OFFSET:] - z[:-TIME_OFFSET]) ** 2)))
+    return drift_predictability(z, TIME_OFFSET), step / max(scale, 1e-12)
 
 
 _LORENZ_CAL: Optional[Tuple[float, float]] = None
 
 
 def calibrate_lorenz() -> Tuple[float, float]:
-    """Solve for (dt, sigma_d) hitting BOTH targets, ONCE for the whole run.
+    """Bisect sigma_d until drift_r2 hits LORENZ_TARGET_DRIFT_R2.
 
-    Per-coordinate, with rms_f = RMS of f(z) and scale = max|z| after centering:
-        diffusion step   b = sigma_d sqrt(dt)
-        drift step       a = dt rms_f
-        ratio            R = a / b       = sqrt(dt) rms_f / sigma_d
-        normalised step  S = b / scale
-    =>  dt = S * scale * R / rms_f   and   sigma_d = sqrt(dt) * rms_f / R.
-    rms_f and scale themselves depend on (dt, sigma_d), so iterate a few times.
+    Searching ONE variable against the quantity the gate actually reads -- not
+    two variables against two analytic proxies -- is what makes this terminate.
+    drift_r2 is monotonically decreasing in sigma_d (more noise, less of the
+    increment is explained by the state), so bisection is well posed, and the
+    bracket is hard-bounded so it cannot run away.
 
-    Calibrated GLOBALLY with a fixed RNG, never per seed: if every seed used its
-    own dt the arms would be compared across different data-generating
-    processes, which is a confound, not a replicate."""
+    Calibrated ONCE for the whole run with a fixed RNG, never per seed: if every
+    seed used its own noise level the arms would be compared across different
+    data-generating processes, which is a confound, not a replicate."""
     global _LORENZ_CAL
     if _LORENZ_CAL is not None:
         return _LORENZ_CAL
-    rng = np.random.default_rng(20260913)
-    dt, sigma_d = LORENZ_DT0, LORENZ_SIGMA_D0
-    R = LORENZ_DRIFT_RATIO
-    print(f"[dgp] calibrating lorenz_sde: target drift/diffusion={R:g}, "
-          f"target step_sd={LATENT_STEP_SD:g}")
-    for k in range(LORENZ_CAL_ROUNDS):
-        traj, a, b = _integrate_lorenz(2, LORENZ_CAL_STEPS, dt, sigma_d, rng,
-                                       LORENZ_BURN_IN)
-        z = traj.reshape(-1, 3)
-        z = z - z.mean(0, keepdims=True)
-        scale = float(np.max(np.abs(z)))
-        rms_f = float(np.sqrt(np.mean(_lorenz_deriv(traj.reshape(-1, 3)) ** 2)))
-        print(f"  [dgp] round {k}: dt={dt:.5f} sigma_d={sigma_d:7.3f} "
-              f"drift/diff={a / max(b, 1e-12):.3f} step_sd={b / scale:.4f} "
-              f"scale={scale:.2f} rms_f={rms_f:.2f}")
-        dt = LATENT_STEP_SD * scale * R / max(rms_f, 1e-12)
-        sigma_d = math.sqrt(dt) * rms_f / max(R, 1e-12)
-    _LORENZ_CAL = (dt, sigma_d)
-    print(f"[dgp] calibrated: dt={dt:.5f}  sigma_d={sigma_d:.3f}")
+    tgt = LORENZ_TARGET_DRIFT_R2
+    lo, hi = LORENZ_SIGMA_D_LO, LORENZ_SIGMA_D_HI
+    r_lo, _ = _probe_lorenz(lo)
+    r_hi, _ = _probe_lorenz(hi)
+    print(f"[dgp] calibrating lorenz_sde: dt={LORENZ_DT:g} (fixed), "
+          f"target drift_r2={tgt:g}")
+    print(f"  [dgp] bracket: sigma_d={lo:g} -> drift_r2={r_lo:.4f} ; "
+          f"sigma_d={hi:g} -> drift_r2={r_hi:.4f}")
+    if r_lo <= tgt:
+        sigma_d = lo
+        print("  [dgp] even the smallest noise already meets the target.")
+    elif r_hi > tgt:
+        raise RuntimeError(
+            f"drift_r2 is still {r_hi:.3f} at sigma_d={hi:g}: this Lorenz "
+            f"configuration cannot be made noise-dominated at dt={LORENZ_DT:g}. "
+            f"Raise LORENZ_SIGMA_D_HI, lower LORENZ_DT, or use "
+            f"LATENT_PROCESS='brownian'.")
+    else:
+        for _ in range(LORENZ_BISECT_ITERS):
+            mid = math.sqrt(lo * hi)          # geometric: sigma_d spans decades
+            r, _ = _probe_lorenz(mid)
+            if r > tgt:
+                lo = mid                       # too deterministic, need more noise
+            else:
+                hi = mid
+        sigma_d = hi                           # the side that MEETS the target
+    r, s = _probe_lorenz(sigma_d)
+    print(f"[dgp] calibrated: sigma_d={sigma_d:.3f}  drift_r2={r:.4f}  "
+          f"step_sd={s:.4f}")
+    if not (STEP_SD_LO <= s <= STEP_SD_HI):
+        print(f"  !! [dgp] per-step displacement {s:.4f} is outside "
+              f"[{STEP_SD_LO}, {STEP_SD_HI}].  It scales like sqrt(dt), so set "
+              f"LORENZ_DT = {LORENZ_DT * (LATENT_STEP_SD / max(s, 1e-9)) ** 2:.5f} "
+              f"and rerun the calibration.")
+    if sigma_d > 60.0:
+        print(f"  !! [dgp] sigma_d={sigma_d:.1f} is large relative to the "
+              f"attractor (~20 raw units): the butterfly is mostly washed out "
+              f"and this is closer to a drift-biased random walk than to Lorenz "
+              f"dynamics.  Fine for the benchmark, but do not oversell it as "
+              f"'chaotic latents' in the paper.")
+    _LORENZ_CAL = (LORENZ_DT, sigma_d)
     return _LORENZ_CAL
 
 
 def lorenz_latents(T: int, d: int, rng, stochastic: bool) -> np.ndarray:
     """ceil(d/3) independent Lorenz-63 chains -> [T, d] in the [-1,1] box.
 
-    Independent chains (different random ICs; Lorenz is extremely sensitive to
-    them) give genuinely independent latent blocks, and at d=6 the two chains
-    line up exactly with the Figure-5 split d1 = d//2 + d%2 = 3, so z1 is
-    chain 1 and z2 is chain 2.
+    Independent chains (different random ICs) give genuinely independent latent
+    blocks, and at d=6 the two chains line up exactly with the Figure-5 split
+    d1 = d//2 + d%2 = 3, so z1 is chain 1 and z2 is chain 2.
 
-    Centering before the max-abs rescale is NOT cosmetic: the Lorenz z
-    coordinate lives in roughly [1, 48] and never goes negative, so without it
-    latent columns 2 and 5 would carry a +0.5 DC offset and never visit half
-    the box, while mix.gain -- calibrated on a global np.std that already
-    contains that offset -- would silently shrink the fluctuating part of every
-    pre-activation below TARGET_PRE_SD."""
+    Centering before the max-abs rescale is not cosmetic: the Lorenz z
+    coordinate is strictly positive, so without it latent columns 2 and 5 would
+    carry a DC offset and never visit half the box, while mix.gain -- calibrated
+    on a global std that already contains that offset -- would silently shrink
+    the fluctuating part of every pre-activation below TARGET_PRE_SD."""
     n_chains = int(np.ceil(d / 3))
     if d % 3 != 0:
         warnings.warn(
@@ -406,10 +442,9 @@ def lorenz_latents(T: int, d: int, rng, stochastic: bool) -> np.ndarray:
     if stochastic:
         dt, sigma_d = calibrate_lorenz()
     else:
-        dt, sigma_d = LORENZ_DT0, 0.0
-    traj, _, _ = _integrate_lorenz(n_chains, T, dt, sigma_d, rng,
-                                   LORENZ_BURN_IN)
-    z = traj.transpose(0, 1, 2).reshape(T, n_chains * 3)[:, :d]
+        dt, sigma_d = LORENZ_DT, 0.0
+    traj = _integrate_lorenz(n_chains, T, dt, sigma_d, rng, LORENZ_BURN_IN)
+    z = traj.reshape(T, n_chains * 3)[:, :d]
     z = z - z.mean(axis=0, keepdims=True)
     scale = np.max(np.abs(z), axis=0, keepdims=True)
     scale[scale < 1e-12] = 1.0
@@ -441,8 +476,7 @@ def drift_predictability(z: np.ndarray, offset: int,
     independent of the state, so this is ~0 (Brownian: exactly 0).  For a
     deterministic flow the increment IS a function of the state, so this is
     large and InfoNCE can be solved by a flow-invariant encoder that discards
-    z entirely.  With the Langevin form at drift/diffusion ratio R the ceiling
-    is R^2/(1+R^2) -- 0.083 at R=0.30."""
+    z entirely."""
     a = z[:-offset]
     delta = z[offset:] - a
     if len(a) > max_pts:
@@ -464,12 +498,10 @@ def describe_latents(z: np.ndarray) -> dict:
     delta = z[TIME_OFFSET:] - z[:-TIME_OFFSET]
     step_sd = float(np.sqrt(np.mean(delta ** 2)))
     r2 = drift_predictability(z, TIME_OFFSET)
-    # per-coordinate autocorrelation at the positive lag: near 1 means the
-    # positive is nearly the anchor and the task is trivial
     zc = z - z.mean(0, keepdims=True)
     ac1 = float(np.mean(np.sum(zc[TIME_OFFSET:] * zc[:-TIME_OFFSET], 0) /
                         (np.sum(zc ** 2, 0) + 1e-30)))
-    print(f"    [dgp] step_sd={step_sd:.4f} (target {LATENT_STEP_SD:.4f})  "
+    print(f"    [dgp] step_sd={step_sd:.4f} (ref {LATENT_STEP_SD:.4f})  "
           f"drift_r2={r2:.4f} (max {DRIFT_R2_MAX})  lag{TIME_OFFSET}_ac="
           f"{ac1:.4f}  |z|max={np.abs(z).max():.3f}")
     if r2 > DRIFT_R2_MAX:
@@ -478,9 +510,8 @@ def describe_latents(z: np.ndarray) -> dict:
             f"largely a deterministic function of the state, so p(z'|z) is not "
             f"a proper conditional and InfoNCE admits a flow-invariant "
             f"degenerate optimum that carries no information about z.  This is "
-            f"exactly what made every seed fail the R2 gate.  Fix: "
-            f"LATENT_PROCESS='lorenz_sde' with a smaller LORENZ_DRIFT_RATIO, "
-            f"or 'brownian'.")
+            f"exactly what made every seed fail the R2 gate.  Fix: lower "
+            f"LORENZ_TARGET_DRIFT_R2, or LATENT_PROCESS='brownian'.")
     return dict(step_sd=step_sd, drift_r2=r2, lag_ac=ac1)
 
 
@@ -1636,7 +1667,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 # from __future__ import annotations
