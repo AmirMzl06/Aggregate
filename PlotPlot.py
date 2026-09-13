@@ -103,8 +103,11 @@ def load_model(weight):
         num_output=14
     )
 
-    state = torch.load(weight, map_location="cpu")
-
+    state = torch.load(
+        weight,
+        map_location="cpu",
+        weights_only=False
+    )
     if "model_state_dict" in state:
         state = state["model_state_dict"]
 
