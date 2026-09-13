@@ -3,657 +3,143 @@ import sys
 import random
 import numpy as np
 import torch
-
-
 from utils.constants import CEBRA_DIR
+
 sys.path.insert(0, str(CEBRA_DIR))
-
 from cebra import CEBRA
-
-
 from sklearn.decomposition import PCA
-
 import matplotlib
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
 PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
-
 DATASET_NAME = "C-CO"
-
 TARGET_DAY = 12
-
 TARGET_SESSION = "C-CO12"
-
 N_NEURONS = 86
-
 N_SESSIONS = 53
-
 SEED = 42
-
-
 MODELS_DIR = "models"
-
 PLOTS_DIR = "plots_Cross"
 
-
-
-
-
-# ============================================================
-# DATA
-# ============================================================
-
 def session_path(session):
-
-    return os.path.join(
-        PERICH_DATA_DIR,
-        session + ".npz"
-    )
-
-
-
+    return os.path.join(PERICH_DATA_DIR, session + ".npz")
 
 def load_session(session):
-
-    data=np.load(
-        session_path(session),
-        allow_pickle=True
-    )
-
-
-    X_train=data["train_data"].astype(
-        np.float32
-    )
-
-    X_test=data["valid_data"].astype(
-        np.float32
-    )
-
-
-    return X_train,X_test
-
-
-
-
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
+    data = np.load(session_path(session), allow_pickle=True)
+    X_train = data["train_data"].astype(np.float32)
+    X_test = data["valid_data"].astype(np.float32)
+    return X_train, X_test
 
 def load_model(name):
-
-    path=os.path.join(
-        MODELS_DIR,
-        name+".pt"
-    )
-
-
-    model=CEBRA.load(path)
-
-    print(
-        "loaded:",
-        path
-    )
-
+    path = os.path.join(MODELS_DIR, name + ".pt")
+    model = CEBRA.load(path)
+    print("loaded:", path)
     return model
 
-
-
-
-
-# ============================================================
-# EMBEDDING
-# ============================================================
-
-def embed(model,X):
-
-    return np.asarray(
-        model.transform(
-            X.astype(np.float32)
-        )
-    )
-
-
-
-
-
-# ============================================================
-# ALLOCATE 86 NEURONS
-# ============================================================
-
+def embed(model, X):
+    return np.asarray(model.transform(X.astype(np.float32)))
 
 def get_sessions():
-
-    return [
-        i for i in range(N_SESSIONS)
-        if i != TARGET_DAY
-    ]
-
-
-
+    return [i for i in range(N_SESSIONS) if i != TARGET_DAY]
 
 def allocate_neurons():
-
-    rng=np.random.default_rng(
-        SEED
-    )
-
-
-    sessions=get_sessions()
-
-
-    allocation={}
-
-
-    remain=N_NEURONS
-
-
-    while remain>0:
-
-
-        s=int(
-            rng.choice(
-                sessions
-            )
-        )
-
-
-        allocation[s]=allocation.get(
-            s,
-            0
-        )+1
-
-
-        remain-=1
-
-
-
+    rng = np.random.default_rng(SEED)
+    sessions = get_sessions()
+    allocation = {}
+    remain = N_NEURONS
+    while remain > 0:
+        s = int(rng.choice(sessions))
+        allocation[s] = allocation.get(s, 0) + 1
+        remain -= 1
     return allocation
 
-
-
-
-
-# ============================================================
-# BUILD CROSS SESSION MATRIX
-# ============================================================
-
-
 def build_cross_test():
-
-
-    allocation=allocate_neurons()
-
-
+    allocation = allocate_neurons()
     print("\nNeuron allocation")
-
     print(allocation)
-
-
-
-    blocks=[]
-
-    time_lengths=[]
-
-
-
-    for day,n in allocation.items():
-
-
-        session=f"{DATASET_NAME}{day}"
-
-
-        _,X_test=load_session(
-            session
-        )
-
-
-        available=X_test.shape[1]
-
-
+    blocks = []
+    time_lengths = []
+    for day, n in allocation.items():
+        session = f"{DATASET_NAME}{day}"
+        _, X_test = load_session(session)
+        available = X_test.shape[1]
         if available < n:
-
-            print(
-                "skip",
-                session,
-                "has only",
-                available
-            )
-
+            print("skip", session, "has only", available)
             continue
-
-
-
-        rng=np.random.default_rng(
-            SEED+day
-        )
-
-
-        idx=rng.choice(
-            available,
-            size=n,
-            replace=False
-        )
-
-
-
-        X_sel=X_test[:,idx]
-
-
-
-        blocks.append(
-            X_sel.astype(
-                np.float32
-            )
-        )
-
-
-        time_lengths.append(
-            X_sel.shape[0]
-        )
-
-
-        print(
-            session,
-            X_sel.shape
-        )
-
-
-
-
-    # ---------------------------------
-    # equalize time bins
-    # ---------------------------------
-
-
-    min_time=min(
-        time_lengths
-    )
-
-
-    print(
-        "minimum time:",
-        min_time
-    )
-
-
-    trimmed=[]
-
-
+        rng = np.random.default_rng(SEED + day)
+        idx = rng.choice(available, size=n, replace=False)
+        X_sel = X_test[:, idx]
+        blocks.append(X_sel.astype(np.float32))
+        time_lengths.append(X_sel.shape[0])
+        print(session, X_sel.shape)
+    min_time = min(time_lengths)
+    print("minimum time:", min_time)
+    trimmed = []
     for X in blocks:
-
-        trimmed.append(
-            X[:min_time]
-        )
-
-
-
-    # ---------------------------------
-    # concatenate neurons
-    # ---------------------------------
-
-
-    X_cross=np.concatenate(
-        trimmed,
-        axis=1
-    )
-
-
-
-    print(
-        "FINAL CROSS:",
-        X_cross.shape
-    )
-
-
+        trimmed.append(X[:min_time])
+    X_cross = np.concatenate(trimmed, axis=1)
+    print("FINAL CROSS:", X_cross.shape)
     return X_cross
 
+def normalize_using_reference(X, ref):
+    mu_x = X.mean(axis=0, keepdims=True)
+    std_x = X.std(axis=0, keepdims=True)
+    mu_ref = ref.mean(axis=0, keepdims=True)
+    std_ref = ref.std(axis=0, keepdims=True)
+    std_x = np.where(std_x < 1e-8, 1.0, std_x)
+    X_matched = (X - mu_x) / std_x
+    X_matched = X_matched * std_ref + mu_ref
+    return X_matched.astype(np.float32)
 
-
-
-
-# ============================================================
-# NORMALIZATION
-# ============================================================
-
-
-def normalize_using_reference(
-        X,
-        ref):
-
-
-    mu=ref.mean(
-        axis=0
-    )
-
-
-    std=ref.std(
-        axis=0
-    )
-
-
-    std[std==0]=1
-
-
-    return (
-        (X-mu)/std
-    ).astype(
-        np.float32
-    )
-
-
-
-
-
-# ============================================================
-# PCA PLOT
-# ============================================================
-
-
-def pca_plot(
-        A,
-        B,
-        title,
-        filename):
-
-
-    os.makedirs(
-        PLOTS_DIR,
-        exist_ok=True
-    )
-
-
-
-    data=np.concatenate(
-        [
-            A,
-            B
-        ],
-        axis=0
-    )
-
-
-
-    pca=PCA(
-        n_components=3
-    )
-
-
+def pca_plot(A, B, title, filename):
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    data = np.concatenate([A, B], axis=0)
+    pca = PCA(n_components=3)
     pca.fit(data)
+    ZA = pca.transform(A)
+    ZB = pca.transform(B)
 
-
-
-    ZA=pca.transform(
-        A
-    )
-
-
-    ZB=pca.transform(
-        B
-    )
-
-
-
-    # -----------------
-    # 2D
-    # -----------------
-
-
-    plt.figure(
-        figsize=(7,6)
-    )
-
-
-    plt.scatter(
-        ZA[:,0],
-        ZA[:,1],
-        s=5,
-        label="C-CO12"
-    )
-
-
-    plt.scatter(
-        ZB[:,0],
-        ZB[:,1],
-        s=5,
-        label="Cross"
-    )
-
-
+    plt.figure(figsize=(7, 6))
+    plt.scatter(ZA[:, 0], ZA[:, 1], s=5, label="C-CO12")
+    plt.scatter(ZB[:, 0], ZB[:, 1], s=5, label="Cross")
     plt.legend()
-
-
-    plt.title(
-        title+" PCA 2D"
-    )
-
-
+    plt.title(title + " PCA 2D")
     plt.tight_layout()
-
-
-    plt.savefig(
-        os.path.join(
-            PLOTS_DIR,
-            filename+"_2D.png"
-        ),
-        dpi=200
-    )
-
-
+    plt.savefig(os.path.join(PLOTS_DIR, filename + "_2D.png"), dpi=200)
     plt.close()
 
-
-
-    # -----------------
-    # 3D
-    # -----------------
-
-
-    fig=plt.figure(
-        figsize=(8,7)
-    )
-
-
-    ax=fig.add_subplot(
-        111,
-        projection="3d"
-    )
-
-
-    ax.scatter(
-        ZA[:,0],
-        ZA[:,1],
-        ZA[:,2],
-        s=5,
-        label="C-CO12"
-    )
-
-
-    ax.scatter(
-        ZB[:,0],
-        ZB[:,1],
-        ZB[:,2],
-        s=5,
-        label="Cross"
-    )
-
-
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(ZA[:, 0], ZA[:, 1], ZA[:, 2], s=5, label="C-CO12")
+    ax.scatter(ZB[:, 0], ZB[:, 1], ZB[:, 2], s=5, label="Cross")
     ax.legend()
-
-
-    ax.set_title(
-        title+" PCA 3D"
-    )
-
-
+    ax.set_title(title + " PCA 3D")
     plt.tight_layout()
-
-
-    plt.savefig(
-        os.path.join(
-            PLOTS_DIR,
-            filename+"_3D.png"
-        ),
-        dpi=200
-    )
-
-
+    plt.savefig(os.path.join(PLOTS_DIR, filename + "_3D.png"), dpi=200)
     plt.close()
-
-
-
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
 
 def main():
-
-
     random.seed(SEED)
-
     np.random.seed(SEED)
-
-
-
-    clean=load_model(
-        "clean"
-    )
-
-
-    acorn=load_model(
-        "acorn"
-    )
-
-
-
-    # CCO12
-
-    _,X12=load_session(
-        TARGET_SESSION
-    )
-
-
-
-    print(
-        "CCO12:",
-        X12.shape
-    )
-
-
-
-    # Cross
-
-    Xcross=build_cross_test()
-
-
-
-    print(
-        "Cross:",
-        Xcross.shape
-    )
-
-
-
-
-    for name,model in [
-
-        ("clean",clean),
-
-        ("acorn",acorn)
-
-    ]:
-
-
-        print(
-            "\nMODEL:",
-            name
-        )
-
-
-
-        # =========================
-        # RAW
-        # =========================
-
-
-        emb12=embed(
-            model,
-            X12
-        )
-
-
-        embcross=embed(
-            model,
-            Xcross
-        )
-
-
-        pca_plot(
-            emb12,
-            embcross,
-            name+"_RAW",
-            name+"_raw"
-        )
-
-
-
-        # =========================
-        # CCO12 STD
-        # =========================
-
-
-        X12_std=normalize_using_reference(
-            X12,
-            X12
-        )
-
-
-        Xcross_std=normalize_using_reference(
-            Xcross,
-            X12
-        )
-
-
-
-        emb12_std=embed(
-            model,
-            X12_std
-        )
-
-
-        embcross_std=embed(
-            model,
-            Xcross_std
-        )
-
-
-
-        pca_plot(
-            emb12_std,
-            embcross_std,
-            name+"_STD",
-            name+"_std"
-        )
-
-
-
+    clean = load_model("clean")
+    acorn = load_model("acorn")
+    _, X12 = load_session(TARGET_SESSION)
+    print("CCO12:", X12.shape)
+    Xcross = build_cross_test()
+    print("Cross:", Xcross.shape)
+    for name, model in [("clean", clean), ("acorn", acorn)]:
+        print("\nMODEL:", name)
+        emb12 = embed(model, X12)
+        embcross = embed(model, Xcross)
+        pca_plot(emb12, embcross, name + "_RAW", name + "_raw")
+        X12_std = normalize_using_reference(X12, X12)
+        Xcross_std = normalize_using_reference(Xcross, X12)
+        emb12_std = embed(model, X12_std)
+        embcross_std = embed(model, Xcross_std)
+        pca_plot(emb12_std, embcross_std, name + "_STD", name + "_std")
     print("\nDONE")
 
-
-
-
-if __name__=="__main__":
-
+if __name__ == "__main__":
     main()
