@@ -5,6 +5,9 @@ import matplotlib.pyplot as plt
 
 from sklearn.decomposition import PCA
 from mpl_toolkits.mplot3d import Axes3D
+from utils.constants import CEBRA_DIR
+
+sys.path.insert(0, str(CEBRA_DIR))
 
 import cebra
 
