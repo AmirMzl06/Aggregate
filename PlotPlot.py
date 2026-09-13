@@ -4,16 +4,21 @@ import random
 import numpy as np
 import torch
 
+
 from utils.constants import CEBRA_DIR
 sys.path.insert(0, str(CEBRA_DIR))
 
 from cebra import CEBRA
 
+
 from sklearn.decomposition import PCA
+
 import matplotlib
 matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+
 
 
 # =====================================================
@@ -23,131 +28,220 @@ from mpl_toolkits.mplot3d import Axes3D
 PERICH_DATA_DIR = "/data/hossein/mm_project/perich_data_valid_final_raw/"
 
 DATASET_NAME = "C-CO"
+
 TARGET_DAY = 12
+
 TARGET_SESSION = "C-CO12"
 
 N_NEURONS = 86
-N_SESSIONS = 53
+
+N_CCO_SESSIONS = 53
 
 SEED = 42
 
+
 MODELS_DIR = "models"
-PLOTS_DIR = "plots_Cross"
+
+PLOTS_DIR = "plots"
+
+
+
 
 
 # =====================================================
-# LOAD DATA
+# DATA
 # =====================================================
 
-def session_path(name):
+
+def session_path(session):
+
     return os.path.join(
         PERICH_DATA_DIR,
-        f"{name}.npz"
+        session+".npz"
     )
 
 
-def load_test(session):
 
-    path = session_path(session)
 
-    data = np.load(path)
+def load_session(session):
 
-    X_test = data["valid_data"].astype(np.float32)
+    data=np.load(
+        session_path(session),
+        allow_pickle=True
+    )
 
-    return X_test
+
+    X_train=data["train_data"].astype(
+        np.float32
+    )
+
+
+    X_test=data["valid_data"].astype(
+        np.float32
+    )
+
+
+    return X_train,X_test
+
+
 
 
 
 # =====================================================
-# LOAD MODELS
+# MODEL
 # =====================================================
+
 
 def load_model(name):
 
-    path = os.path.join(
+    path=os.path.join(
         MODELS_DIR,
-        f"{name}.pt"
+        name+".pt"
     )
 
-    model = CEBRA.load(path)
 
-    print("loaded:", path)
+    model=CEBRA.load(path)
+
+    print(
+        "loaded:",
+        path
+    )
 
     return model
 
 
 
+
+
 # =====================================================
-# RANDOM NEURON PICKING
+# SELECT NEURONS
 # =====================================================
 
-def choose_neurons_per_session(
-        session_ids,
-        total_neurons=86,
-        seed=42):
 
-    """
-    Allocate 86 neurons randomly across sessions.
-    """
-
-    rng = np.random.default_rng(seed)
+def select_neurons(
+        X,
+        n_neurons,
+        seed):
 
 
-    allocation = {}
-
-    remaining = total_neurons
+    total=X.shape[1]
 
 
-    usable = session_ids.copy()
+    if total < n_neurons:
+
+        return None
 
 
-    while remaining > 0:
+    if total == n_neurons:
 
-        s = rng.choice(usable)
+        return X
 
-        allocation[s] = allocation.get(s,0)+1
 
-        remaining -= 1
+
+    rng=np.random.default_rng(
+        seed
+    )
+
+
+    idx=np.sort(
+        rng.choice(
+            total,
+            size=n_neurons,
+            replace=False
+        )
+    )
+
+
+    return X[:,idx]
+
+
+
+
+
+# =====================================================
+# BUILD CROSS SESSION
+# =====================================================
+
+
+def get_sessions():
+
+    return [
+        d for d in range(N_CCO_SESSIONS)
+        if d != TARGET_DAY
+    ]
+
+
+
+
+
+def allocate_neurons():
+
+    rng=np.random.default_rng(
+        SEED
+    )
+
+
+    sessions=get_sessions()
+
+
+    allocation={}
+
+
+    remaining=N_NEURONS
+
+
+    while remaining>0:
+
+        s=int(
+            rng.choice(
+                sessions
+            )
+        )
+
+
+        allocation[s]=allocation.get(
+            s,
+            0
+        )+1
+
+
+        remaining-=1
 
 
     return allocation
 
 
 
-def get_cross_session_test():
-
-    """
-    Take ONLY test sets.
-    Random neurons from each session.
-    Total = 86 neurons.
-    """
-
-    sessions = [
-        i for i in range(N_SESSIONS)
-        if i != TARGET_DAY
-    ]
 
 
-    allocation = choose_neurons_per_session(
-        sessions,
-        N_NEURONS,
-        SEED
+def build_cross_test():
+
+    allocation=allocate_neurons()
+
+
+    print(
+        "\nAllocation:"
+    )
+
+    print(
+        allocation
     )
 
 
-    print("\nNeuron allocation:")
-    print(allocation)
 
+    blocks=[]
 
-
-    selected=[]
 
 
     for day,n in allocation.items():
 
+
         session=f"{DATASET_NAME}{day}"
 
-        X=load_test(session)
+
+        _,X_test=load_session(
+            session
+        )
 
 
         rng=np.random.default_rng(
@@ -156,34 +250,67 @@ def get_cross_session_test():
 
 
         idx=rng.choice(
-            X.shape[1],
+            X_test.shape[1],
             size=n,
             replace=False
         )
 
 
-        X=X[:,idx]
+        X_sel=X_test[:,idx]
 
 
-        selected.append(X)
+        blocks.append(
+            X_sel.astype(
+                np.float32
+            )
+        )
 
 
         print(
             session,
-            "test:",
-            X.shape
+            X_sel.shape
         )
 
 
 
-    X_cross=np.concatenate(
-        selected,
-        axis=1
+    # -------------------------------
+    # REMOVE EXTRA TIME BINS
+    # -------------------------------
+
+
+    min_time=min(
+        x.shape[0]
+        for x in blocks
     )
 
 
     print(
-        "cross session shape:",
+        "minimum time bins:",
+        min_time
+    )
+
+
+    blocks=[
+        x[:min_time]
+        for x in blocks
+    ]
+
+
+
+    # -------------------------------
+    # CONCATENATE SESSIONS
+    # -------------------------------
+
+
+    X_cross=np.concatenate(
+        blocks,
+        axis=0
+    )
+
+
+
+    print(
+        "FINAL CROSS:",
         X_cross.shape
     )
 
@@ -192,27 +319,37 @@ def get_cross_session_test():
 
 
 
+
+
 # =====================================================
-# NORMALIZATION USING CCO12 TEST
+# NORMALIZE
 # =====================================================
 
-def normalize_with_cco12(
+
+def normalize(
         X,
         ref):
 
 
-    mu=ref.mean(axis=0)
+    mu=ref.mean(
+        axis=0
+    )
 
-    std=ref.std(axis=0)
+    std=ref.std(
+        axis=0
+    )
 
 
     std[std==0]=1
 
 
-    Xn=(X-mu)/std
+    return (
+        (X-mu)/std
+    ).astype(
+        np.float32
+    )
 
 
-    return Xn.astype(np.float32)
 
 
 
@@ -221,13 +358,17 @@ def normalize_with_cco12(
 # =====================================================
 
 
-def embed(model,X):
+def embed(
+        model,
+        X):
 
     return np.asarray(
         model.transform(
-            X.astype(np.float32)
+            X
         )
     )
+
+
 
 
 
@@ -236,7 +377,7 @@ def embed(model,X):
 # =====================================================
 
 
-def pca_plot(
+def plot_pca(
         A,
         B,
         title,
@@ -249,48 +390,55 @@ def pca_plot(
     )
 
 
-    pca=PCA(
-        n_components=3
-    )
-
-
-    Z=np.concatenate(
+    all_data=np.concatenate(
         [A,B],
         axis=0
     )
 
 
-    pca.fit(Z)
+    pca=PCA(
+        n_components=3
+    )
 
 
-    ZA=pca.transform(A)
-    ZB=pca.transform(B)
+    pca.fit(
+        all_data
+    )
+
+
+    A3=pca.transform(A)
+
+    B3=pca.transform(B)
 
 
 
-    # -------- 2D --------
+    # 2D
 
-    plt.figure(figsize=(7,6))
+    plt.figure(
+        figsize=(7,6)
+    )
+
 
     plt.scatter(
-        ZA[:,0],
-        ZA[:,1],
+        A3[:,0],
+        A3[:,1],
         s=5,
         label="C-CO12"
     )
 
+
     plt.scatter(
-        ZB[:,0],
-        ZB[:,1],
+        B3[:,0],
+        B3[:,1],
         s=5,
-        label="cross sessions"
+        label="Cross"
     )
 
 
     plt.legend()
 
     plt.title(
-        title+" PCA 2D"
+        title+" 2D"
     )
 
 
@@ -302,15 +450,17 @@ def pca_plot(
         dpi=200
     )
 
+
     plt.close()
 
 
 
-    # -------- 3D --------
+    # 3D
 
     fig=plt.figure(
         figsize=(8,7)
     )
+
 
     ax=fig.add_subplot(
         111,
@@ -319,27 +469,28 @@ def pca_plot(
 
 
     ax.scatter(
-        ZA[:,0],
-        ZA[:,1],
-        ZA[:,2],
+        A3[:,0],
+        A3[:,1],
+        A3[:,2],
         s=5,
         label="C-CO12"
     )
 
 
     ax.scatter(
-        ZB[:,0],
-        ZB[:,1],
-        ZB[:,2],
+        B3[:,0],
+        B3[:,1],
+        B3[:,2],
         s=5,
-        label="cross sessions"
+        label="Cross"
     )
 
 
     ax.legend()
 
+
     ax.set_title(
-        title+" PCA 3D"
+        title+" 3D"
     )
 
 
@@ -351,7 +502,10 @@ def pca_plot(
         dpi=200
     )
 
+
     plt.close()
+
+
 
 
 
@@ -363,37 +517,30 @@ def pca_plot(
 def main():
 
 
-    seed=SEED
+    random.seed(SEED)
 
-    random.seed(seed)
-    np.random.seed(seed)
-
-
-    clean=load_model("clean")
-
-    acorn=load_model("acorn")
+    np.random.seed(SEED)
 
 
 
-    # CCO12 test
+    clean=load_model(
+        "clean"
+    )
 
-    X12=load_test(
+
+    acorn=load_model(
+        "acorn"
+    )
+
+
+
+    _,X12=load_session(
         TARGET_SESSION
     )
 
 
-    # cross session test only
 
-    Xcross=get_cross_session_test()
-
-
-
-    # sanity
-
-    print(
-        X12.shape,
-        Xcross.shape
-    )
+    Xcross=build_cross_test()
 
 
 
@@ -403,15 +550,16 @@ def main():
     ]:
 
 
-        print("\nMODEL:",name)
+        print(
+            "\nMODEL",
+            name
+        )
 
 
 
-        # ==============================
-        # CASE 1
-        # NO NORMALIZATION
-        # ==============================
-
+        # -----------------
+        # RAW
+        # -----------------
 
         e12=embed(
             model,
@@ -425,7 +573,7 @@ def main():
         )
 
 
-        pca_plot(
+        plot_pca(
             e12,
             ecross,
             name+"_raw",
@@ -434,42 +582,42 @@ def main():
 
 
 
-        # ==============================
-        # CASE 2
-        # CCO12 TEST STD NORMALIZATION
-        # ==============================
+        # -----------------
+        # STD using CCO12
+        # -----------------
 
 
-        X12_norm=normalize_with_cco12(
+        X12n=normalize(
             X12,
             X12
         )
 
 
-        Xcross_norm=normalize_with_cco12(
+        Xcrossn=normalize(
             Xcross,
             X12
         )
 
 
+
         e12n=embed(
             model,
-            X12_norm
+            X12n
         )
 
 
         ecrossn=embed(
             model,
-            Xcross_norm
+            Xcrossn
         )
 
 
 
-        pca_plot(
+        plot_pca(
             e12n,
             ecrossn,
             name+"_CCO12std",
-            name+"_CCO12std"
+            name+"_std"
         )
 
 
@@ -478,5 +626,7 @@ def main():
 
 
 
+
 if __name__=="__main__":
+
     main()
