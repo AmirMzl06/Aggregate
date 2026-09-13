@@ -486,6 +486,11 @@ from sklearn.metrics import r2_score
 from utils.constants import CEBRA_DIR
 from utils.min_distance import min_l2_distance
 
+# sys.path.insert(0, str(CEBRA_DIR))
+CEBRA_DIR = Path(__file__).resolve().parent / "CEBRA-agg"
+for _m in list(sys.modules):
+    if _m == "cebra" or _m.startswith("cebra."):
+        del sys.modules[_m]
 sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 from cebra import CEBRA
