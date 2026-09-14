@@ -103,10 +103,10 @@ def clear_cebra_modules():
 # cebra, CEBRA = import_pnhard_cebra()
 class _PNHardSolverImportFix(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """
-    Runtime-only fix for CEBRA-NPHard import order.
-    Does NOT modify any file inside CEBRA-NPHard.
-    It only executes cebra/solver/__init__.py in memory with
-    single_session imported before multiobjective.
+    Runtime-only import-order fix for CEBRA-NPHard.
+    No file inside the fork is modified.
+    We only execute solver/__init__.py in memory with
+    single_session loaded before every other solver module.
     """
     def __init__(self, fork_root: Path):
         self.solver_dir = fork_root / "cebra" / "solver"
@@ -125,22 +125,32 @@ class _PNHardSolverImportFix(importlib.abc.MetaPathFinder, importlib.abc.Loader)
     def exec_module(self, module):
         source = self.init_file.read_text(encoding="utf-8")
         lines = source.splitlines()
-        single_line = "from cebra.solver.single_session import *"
-        multiobjective_line = "from cebra.solver.multiobjective import *"
-        def find_line(target):
-            for i, line in enumerate(lines):
-                if line.strip() == target:
-                    return i
-            raise RuntimeError(f"Could not find this line in {self.init_file}:\n{target}")
-        single_idx = find_line(single_line)
-        multi_idx = find_line(multiobjective_line)
-        if single_idx > multi_idx:
-            line = lines.pop(single_idx)
-            multi_idx = find_line(multiobjective_line)
-            lines.insert(multi_idx, line)
+        single_stmt = "from cebra.solver.single_session import *"
+        single_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == single_stmt:
+                single_idx = i
+                break
+        if single_idx is None:
+            raise RuntimeError("Could not find single_session import in " f"{self.init_file}")
+        single_line = lines.pop(single_idx)
+        first_solver_import = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("from cebra.solver."):
+                first_solver_import = i
+                break
+        if first_solver_import is None:
+            raise RuntimeError("Could not locate solver imports in " f"{self.init_file}")
+        lines.insert(first_solver_import, single_line)
+        print("\nPNHard solver import order (runtime only):")
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("from cebra.solver."):
+                print("  ", stripped)
         patched_source = "\n".join(lines) + "\n"
         exec(compile(patched_source, str(self.init_file), "exec"), module.__dict__)
-
+     
 def import_pnhard_cebra():
     clear_cebra_modules()
     for p in (str(PNHARD_CEBRA_DIR), str(ACORN_CEBRA_DIR)):
