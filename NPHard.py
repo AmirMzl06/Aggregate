@@ -24,9 +24,6 @@ Final line section prints R2 for all three models side by side.
 
 from __future__ import annotations
 
-import importlib.abc
-import importlib.util
-
 import csv
 import gc
 import importlib
@@ -69,110 +66,34 @@ def clear_cebra_modules():
             del sys.modules[name]
     importlib.invalidate_caches()
 
-
-# def import_pnhard_cebra():
-#     clear_cebra_modules()
-#     for p in (str(PNHARD_CEBRA_DIR), str(ACORN_CEBRA_DIR)):
-#         while p in sys.path:
-#             sys.path.remove(p)
-#     sys.path.insert(0, str(PNHARD_CEBRA_DIR))
-
-#     import cebra
-#     from cebra import CEBRA
-#     import cebra.attribution
-
-#     print("\nUsing CEBRA-PNHard:")
-#     print(cebra.__file__)
-
-#     params = inspect.signature(CEBRA.__init__).parameters
-#     required = {
-#         "extra_negatives",
-#         "extra_negative_fraction",
-#         "extra_negative_candidate_multiplier",
-#         "extra_negative_normalize",
-#     }
-#     missing = required.difference(params)
-#     if missing:
-#         raise RuntimeError(
-#             "Wrong fork loaded. Missing PNHard args: "
-#             f"{sorted(missing)}"
-#         )
-#     return cebra, CEBRA
-
-
-# cebra, CEBRA = import_pnhard_cebra()
-class _PNHardSolverImportFix(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """
-    Runtime-only import-order fix for CEBRA-NPHard.
-    No file inside the fork is modified.
-    We only execute solver/__init__.py in memory with
-    single_session loaded before every other solver module.
-    """
-    def __init__(self, fork_root: Path):
-        self.solver_dir = fork_root / "cebra" / "solver"
-        self.init_file = self.solver_dir / "__init__.py"
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname != "cebra.solver":
-            return None
-        return importlib.util.spec_from_file_location(
-            fullname,
-            self.init_file,
-            loader=self,
-            submodule_search_locations=[str(self.solver_dir)],
-        )
-    def create_module(self, spec):
-        return None
-    def exec_module(self, module):
-        source = self.init_file.read_text(encoding="utf-8")
-        lines = source.splitlines()
-        single_stmt = "from cebra.solver.single_session import *"
-        single_idx = None
-        for i, line in enumerate(lines):
-            if line.strip() == single_stmt:
-                single_idx = i
-                break
-        if single_idx is None:
-            raise RuntimeError("Could not find single_session import in " f"{self.init_file}")
-        single_line = lines.pop(single_idx)
-        first_solver_import = None
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("from cebra.solver."):
-                first_solver_import = i
-                break
-        if first_solver_import is None:
-            raise RuntimeError("Could not locate solver imports in " f"{self.init_file}")
-        lines.insert(first_solver_import, single_line)
-        print("\nPNHard solver import order (runtime only):")
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("from cebra.solver."):
-                print("  ", stripped)
-        patched_source = "\n".join(lines) + "\n"
-        exec(compile(patched_source, str(self.init_file), "exec"), module.__dict__)
-     
 def import_pnhard_cebra():
     clear_cebra_modules()
-    for p in (str(PNHARD_CEBRA_DIR), str(ACORN_CEBRA_DIR)):
+    for p in (
+        str(PNHARD_CEBRA_DIR),
+        str(ACORN_CEBRA_DIR),
+    ):
         while p in sys.path:
             sys.path.remove(p)
-    sys.path.insert(0, str(PNHARD_CEBRA_DIR))
-
-    import_fix = _PNHardSolverImportFix(PNHARD_CEBRA_DIR)
-    sys.meta_path.insert(0, import_fix)
-
+    sys.path.insert(
+        0,
+        str(PNHARD_CEBRA_DIR),
+    )
     try:
         import cebra
         from cebra import CEBRA
         import cebra.attribution
-    finally:
-        if import_fix in sys.meta_path:
-            sys.meta_path.remove(import_fix)
+    except Exception as exc:
+        raise SystemExit(
+            f"cannot import CEBRA-NPHard from "
+            f"{PNHARD_CEBRA_DIR}. error: {exc}"
+        )
 
     print("\nUsing CEBRA-NPHard:")
     print(cebra.__file__)
 
-    params = inspect.signature(CEBRA.__init__).parameters
+    params = inspect.signature(
+        CEBRA.__init__
+    ).parameters
     required = {
         "extra_negatives",
         "extra_negative_fraction",
@@ -181,9 +102,11 @@ def import_pnhard_cebra():
     }
     missing = required.difference(params)
     if missing:
-        raise RuntimeError("Wrong fork loaded. Missing PNHard args: " f"{sorted(missing)}")
-
-    print("PNHard runtime import-order fix: OK")
+        raise RuntimeError(
+            "Wrong fork loaded. Missing PNHard args: "
+            f"{sorted(missing)}"
+        )
+    print("PNHard import/API check: OK")
     return cebra, CEBRA
 
 cebra, CEBRA = import_pnhard_cebra()
