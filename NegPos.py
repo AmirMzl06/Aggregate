@@ -1,4 +1,31 @@
+"""
+C-CO12 representation test:
+  1) Vanilla CEBRA
+  2) CEBRA-NegPos = clean CEBRA with a fraction of negatives replaced
+     by neuron-wise-normalized foreign negatives from other C-CO sessions.
+
+Both models are trained with C-CO12 train_data as the target training dataset.
+The NegPos model additionally receives a foreign matrix ONLY for negative
+sampling through `extra_negatives`.
+
+Evaluation (NO further training):
+  TEST 1: C-CO12 valid_data vs FAKE data
+  TEST 2: C-CO12 valid_data vs 86 neurons selected from other C-CO sessions
+
+For every comparison:
+  - comparison data are matched NEURON-BY-NEURON to C-CO12
+  - one PCA is fitted on the UNION of the two embeddings
+  - both 2D and 3D PCA plots are saved
+
+Expected project layout:
+  ~/sam/result/Aggregate/
+      this_script.py
+      CEBRA-NegPos/
+      utils/
+"""
+
 from __future__ import annotations
+
 import csv
 import inspect
 import os
@@ -10,16 +37,15 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 
-# ============================================================
-# USE THE MODIFIED CROSS-SESSION-NEGATIVE CEBRA FORK
-# ============================================================
-
+# ---------------------------------------------------------------------
+# Use the modified fork directly.
+# ---------------------------------------------------------------------
 CEBRA_DIR = Path(__file__).resolve().parent / "CEBRA-NegPos"
 
 if not CEBRA_DIR.exists():
-    raise FileNotFoundError(f"CEBRA fork not found: {CEBRA_DIR}")
+    raise FileNotFoundError(f"CEBRA-NegPos fork not found: {CEBRA_DIR}")
 
-# Remove any previously imported CEBRA package.
+# Avoid accidentally using a cached/imported different CEBRA installation.
 for _m in list(sys.modules):
     if _m == "cebra" or _m.startswith("cebra."):
         del sys.modules[_m]
@@ -29,63 +55,63 @@ sys.path.insert(0, str(CEBRA_DIR))
 import cebra
 from cebra import CEBRA
 
-print("\nUsing CEBRA from:")
-print(cebra.__file__)
-
 from sklearn.decomposition import PCA
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 
 # =====================================================================
 # CONFIG
 # =====================================================================
 
-PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw")
+PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 
 DATASET_NAME = "C-CO"
 TARGET_DAY = 12
 TARGET_SESSION = f"{DATASET_NAME}{TARGET_DAY}"
 
-N_CCO_SESSIONS = 53          # C-CO0 ... C-CO52
-N_NEURONS = 86               # C-CO12 input dimensionality
-N_FOREIGN_NEURONS = 86       # must equal target input dimensionality
+N_NEURONS = 86
+N_CCO_SESSIONS = 53  # C-CO0 ... C-CO52
 
-# None => all C-CO sessions except C-CO12 are candidates.
-# Or e.g. [0, 1, 2, 3, 4, 5]
+# None = use all other C-CO sessions as candidates.
 OTHER_SESSION_IDS = None
 
 SEED = 42
 
-# Same basic CEBRA setup as the previous C-CO12 representation script.
 LATENT_DIM = 64
 HIDDEN = 64
 BATCH_SIZE = 2048
-MAX_ITER = 5000
+MAX_ITER = 3000
 TEMPERATURE = 0.4
 MODEL_ARCH = "offset36-model-more-dropout"
-TIME_OFFSET = 1
 DEVICE = "cuda_if_available"
+OFFSET = 1
 
-# 10% of the negative bank is replaced, NOT appended.
+# Fraction of the normal negative bank replaced by foreign negatives.
 EXTRA_NEGATIVE_FRACTION = 0.10
 
-OUT_DIR = Path("crossneg_experiment")
+OUT_DIR = Path("CEBRA_CCO12_NegPos_Test")
 MODELS_DIR = OUT_DIR / "models"
 EMB_DIR = OUT_DIR / "embeddings"
 PLOTS_DIR = OUT_DIR / "plots"
-FOREIGN_MAP_CSV = OUT_DIR / "foreign_neuron_map.csv"
+FOREIGN_MAP_CSV = OUT_DIR / "foreign_86_mapping.csv"
 
-EPS_STD = 1e-8
+EPS = 1e-8
 
 
 # =====================================================================
-# REPRODUCIBILITY / IO
+# BASIC HELPERS
 # =====================================================================
 
-def seed_all(seed: int = SEED) -> None:
+def ensure_dirs():
+    for d in (OUT_DIR, MODELS_DIR, EMB_DIR, PLOTS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def seed_all(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -93,106 +119,107 @@ def seed_all(seed: int = SEED) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def ensure_dirs() -> None:
-    for p in (OUT_DIR, MODELS_DIR, EMB_DIR, PLOTS_DIR):
-        p.mkdir(parents=True, exist_ok=True)
-
-
 def session_path(session_name: str) -> Path:
     return PERICH_DATA_DIR / f"{session_name}.npz"
 
 
-def load_session(session_name: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Return raw (train_data, valid_data) as float32."""
+def load_session_raw(session_name: str):
+    """Return raw neural train/test arrays."""
     path = session_path(session_name)
     if not path.exists():
         raise FileNotFoundError(path)
 
     data = np.load(path, allow_pickle=True)
-    if "train_data" not in data or "valid_data" not in data:
-        raise KeyError(f"{path} must contain train_data and valid_data")
+    X_train = np.asarray(data["train_data"], dtype=np.float32)
+    X_test = np.asarray(data["valid_data"], dtype=np.float32)
 
-    x_train = np.asarray(data["train_data"], dtype=np.float32)
-    x_test = np.asarray(data["valid_data"], dtype=np.float32)
-
-    if x_train.ndim != 2 or x_test.ndim != 2:
+    if X_train.ndim != 2 or X_test.ndim != 2:
         raise ValueError(
-            f"{session_name}: expected 2D neural arrays, got "
-            f"train={x_train.shape}, test={x_test.shape}"
+            f"{session_name}: expected 2D arrays, got "
+            f"train={X_train.shape}, test={X_test.shape}"
         )
-    if x_train.shape[1] != x_test.shape[1]:
-        raise ValueError(
-            f"{session_name}: train/test neuron counts differ: "
-            f"{x_train.shape[1]} vs {x_test.shape[1]}"
-        )
-    if not np.isfinite(x_train).all() or not np.isfinite(x_test).all():
-        raise ValueError(f"{session_name}: NaN/Inf in neural data")
 
-    return x_train, x_test
+    if X_train.shape[1] != X_test.shape[1]:
+        raise ValueError(
+            f"{session_name}: train/test neuron count mismatch: "
+            f"{X_train.shape[1]} vs {X_test.shape[1]}"
+        )
+
+    if not np.isfinite(X_train).all():
+        raise RuntimeError(f"{session_name}: train_data contains NaN/Inf")
+    if not np.isfinite(X_test).all():
+        raise RuntimeError(f"{session_name}: valid_data contains NaN/Inf")
+
+    return X_train, X_test
 
 
 # =====================================================================
-# NORMALIZATION / MARGINAL MATCHING
+# NEURON-WISE NORMALIZATION
 # =====================================================================
 
-def neuron_stats(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-column mean/std."""
-    mu = x.mean(axis=0, keepdims=True).astype(np.float32)
-    sd = x.std(axis=0, keepdims=True).astype(np.float32)
-    sd = np.maximum(sd, EPS_STD)
+def column_stats(X: np.ndarray):
+    """Per-neuron mean/std."""
+    mu = X.mean(axis=0, keepdims=True).astype(np.float32)
+    sd = X.std(axis=0, keepdims=True).astype(np.float32)
+    sd = np.maximum(sd, EPS)
     return mu, sd
 
 
-def match_neuron_marginals(
+def match_neuron_by_neuron(
     source: np.ndarray,
-    target_reference: np.ndarray,
+    target: np.ndarray,
 ) -> np.ndarray:
     """
-    Match source[:, j] to target_reference[:, j] neuron-by-neuron:
+    Match source neuron j to target neuron j.
 
-        z_j = (source_j - mu_source_j) / sd_source_j
-        mapped_j = z_j * sd_target_j + mu_target_j
+    For every j:
+        source_j <- (source_j - mean(source_j)) / std(source_j)
+        source_j <- source_j * std(target_j) + mean(target_j)
 
-    This makes foreign coordinates live on the same marginal scale/offset as
-    the corresponding C-CO12 coordinates, instead of exposing a trivial
-    session-specific mean/variance cue to the shared encoder.
+    After this transform:
+        mean(source[:, j]) ~= mean(target[:, j])
+        std(source[:, j])  ~= std(target[:, j])
+
+    IMPORTANT:
+    We do NOT globally z-score all neurons together.
     """
-    if source.ndim != 2 or target_reference.ndim != 2:
-        raise ValueError("source and target_reference must both be 2D")
-    if source.shape[1] != target_reference.shape[1]:
+    source = np.asarray(source, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+
+    if source.ndim != 2 or target.ndim != 2:
+        raise ValueError("source and target must be 2D")
+
+    if source.shape[1] != target.shape[1]:
         raise ValueError(
-            f"feature mismatch: source={source.shape}, "
-            f"target_reference={target_reference.shape}"
+            f"Neuron count mismatch: source={source.shape}, target={target.shape}"
         )
 
-    src_mu, src_sd = neuron_stats(source)
-    tgt_mu, tgt_sd = neuron_stats(target_reference)
+    src_mu, src_sd = column_stats(source)
+    tgt_mu, tgt_sd = column_stats(target)
 
-    z = (source - src_mu) / src_sd
-    mapped = z * tgt_sd + tgt_mu
-    return mapped.astype(np.float32)
+    Z = (source - src_mu) / src_sd
+    matched = Z * tgt_sd + tgt_mu
+
+    return matched.astype(np.float32)
 
 
-def print_marginal_match_diagnostics(
-    name: str,
-    x: np.ndarray,
-    target: np.ndarray,
-) -> None:
-    x_mu, x_sd = neuron_stats(x)
-    t_mu, t_sd = neuron_stats(target)
+def print_match_check(name: str, X: np.ndarray, target: np.ndarray):
+    """Report maximum per-neuron mean/std mismatch."""
+    X_mu, X_sd = column_stats(X)
+    T_mu, T_sd = column_stats(target)
 
-    max_mean_diff = float(np.max(np.abs(x_mu - t_mu)))
-    max_std_diff = float(np.max(np.abs(x_sd - t_sd)))
+    mean_err = float(np.max(np.abs(X_mu - T_mu)))
+    std_err = float(np.max(np.abs(X_sd - T_sd)))
 
     print(
-        f"{name}: shape={x.shape} | "
-        f"max neuron mean diff={max_mean_diff:.6g} | "
-        f"max neuron std diff={max_std_diff:.6g}"
+        f"{name}: shape={X.shape} | "
+        f"max |mean_j-target_mean_j|={mean_err:.6f} | "
+        f"max |std_j-target_std_j|={std_err:.6f}"
     )
 
 
 # =====================================================================
-# BUILD ONE 86-D FOREIGN "SESSION" FROM MANY OTHER SESSIONS
+# SELECT 86 RANDOM NEURONS FROM OTHER C-CO SESSIONS
 # =====================================================================
 
 ForeignNeuron = Tuple[int, int]  # (session_day, neuron_index)
@@ -200,19 +227,20 @@ ForeignNeuron = Tuple[int, int]  # (session_day, neuron_index)
 
 def get_other_session_ids() -> List[int]:
     if OTHER_SESSION_IDS is not None:
-        ids = [int(x) for x in OTHER_SESSION_IDS if int(x) != TARGET_DAY]
-    else:
-        ids = [d for d in range(N_CCO_SESSIONS) if d != TARGET_DAY]
+        return [
+            int(day) for day in OTHER_SESSION_IDS
+            if int(day) != TARGET_DAY
+        ]
 
-    return ids
+    return [
+        day for day in range(N_CCO_SESSIONS)
+        if day != TARGET_DAY
+    ]
 
 
-def load_usable_foreign_sessions() -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    """
-    Load all candidate other sessions that have usable train/test arrays.
-    Returns day -> (train_data, valid_data).
-    """
-    usable: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+def load_other_sessions() -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """Load all usable candidate sessions."""
+    sessions = {}
 
     for day in get_other_session_ids():
         name = f"{DATASET_NAME}{day}"
@@ -223,209 +251,203 @@ def load_usable_foreign_sessions() -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
             continue
 
         try:
-            tr, te = load_session(name)
+            X_train, X_test = load_session_raw(name)
         except Exception as e:
             print(f"[SKIP bad] {name}: {e}")
             continue
 
-        if tr.shape[1] < 1:
-            print(f"[SKIP no neurons] {name}")
+        if X_train.shape[1] == 0:
+            print(f"[SKIP no-neurons] {name}")
             continue
 
-        usable[day] = (tr, te)
+        sessions[day] = (X_train, X_test)
         print(
-            f"[FOREIGN OK] {name}: train={tr.shape}, test={te.shape}"
+            f"[OTHER OK] {name}: "
+            f"train={X_train.shape}, test={X_test.shape}"
         )
 
-    if not usable:
-        raise RuntimeError("No usable foreign C-CO sessions found.")
+    if len(sessions) == 0:
+        raise RuntimeError("No usable other C-CO sessions found.")
 
-    return usable
+    return sessions
 
 
-def choose_foreign_neurons(
+def choose_86_random_foreign_neurons(
     sessions: Dict[int, Tuple[np.ndarray, np.ndarray]],
-    n_total: int = N_FOREIGN_NEURONS,
     seed: int = SEED,
 ) -> List[ForeignNeuron]:
     """
-    Select exactly n_total foreign neuron identities.
+    Build a pool of ALL neuron identities from all other sessions,
+    then randomly select exactly 86 unique (session, neuron) pairs.
 
-    Selection is spread across sessions in rounds:
-      - shuffle session order
-      - pick one not-yet-used neuron from each session
-      - repeat until 86 coordinates are collected
-
-    This avoids letting a single high-neuron-count session dominate the
-    86-dimensional foreign matrix.
+    Example:
+        coordinate 0 <- C-CO3 neuron 17
+        coordinate 1 <- C-CO41 neuron 6
+        ...
+        coordinate 85 <- C-CO7 neuron 92
     """
-    rng = np.random.default_rng(seed)
+    pool: List[ForeignNeuron] = []
 
-    days = list(sessions.keys())
-    if not days:
-        raise RuntimeError("No foreign sessions available.")
+    for day, (X_train, _) in sessions.items():
+        for neuron_idx in range(X_train.shape[1]):
+            pool.append((day, neuron_idx))
 
-    available = {
-        day: list(range(sessions[day][0].shape[1]))
-        for day in days
-    }
-    for day in days:
-        rng.shuffle(available[day])
-
-    total_available = sum(len(v) for v in available.values())
-    if total_available < n_total:
+    if len(pool) < N_NEURONS:
         raise RuntimeError(
-            f"Only {total_available} total foreign neurons available; "
-            f"need {n_total}."
+            f"Only {len(pool)} foreign neurons available; need {N_NEURONS}."
         )
 
-    selected: List[ForeignNeuron] = []
+    rng = np.random.default_rng(seed)
+    chosen_idx = rng.choice(
+        len(pool),
+        size=N_NEURONS,
+        replace=False,
+    )
 
-    while len(selected) < n_total:
-        order = days.copy()
-        rng.shuffle(order)
-        made_progress = False
+    mapping = [pool[int(i)] for i in chosen_idx]
 
-        for day in order:
-            if len(selected) >= n_total:
-                break
-            if not available[day]:
-                continue
-
-            neuron_idx = available[day].pop()
-            selected.append((day, int(neuron_idx)))
-            made_progress = True
-
-        if not made_progress:
-            raise RuntimeError(
-                f"Could not select {n_total} unique foreign neurons."
-            )
-
-    assert len(selected) == n_total
-    return selected
+    return mapping
 
 
-def save_foreign_mapping(mapping: Sequence[ForeignNeuron]) -> None:
+def save_foreign_mapping(mapping: Sequence[ForeignNeuron]):
     ensure_dirs()
-    with open(FOREIGN_MAP_CSV, "w", newline="") as f:
+
+    with FOREIGN_MAP_CSV.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            ["input_coordinate", "source_session", "source_neuron_index"]
-        )
-        for coord, (day, neuron_idx) in enumerate(mapping):
-            writer.writerow(
-                [coord, f"{DATASET_NAME}{day}", neuron_idx]
-            )
+        writer.writerow([
+            "cco12_coordinate",
+            "foreign_session",
+            "foreign_neuron_index",
+        ])
+
+        for j, (day, neuron_idx) in enumerate(mapping):
+            writer.writerow([
+                j,
+                f"{DATASET_NAME}{day}",
+                neuron_idx,
+            ])
+
     print("saved foreign mapping:", FOREIGN_MAP_CSV)
 
 
-def assemble_foreign_matrix(
+def build_foreign_matrix(
     sessions: Dict[int, Tuple[np.ndarray, np.ndarray]],
     mapping: Sequence[ForeignNeuron],
     split: str,
 ) -> np.ndarray:
     """
-    Stack the selected neurons as columns.
+    Create a (T_min, 86) matrix from the selected foreign neurons.
 
-    split="train": use train_data
-    split="test":  use valid_data
+    split="train":
+        use train_data from each selected neuron
 
-    Each selected neuron can come from a different session. We therefore use
-    the shortest time length among all contributing sessions and truncate every
-    trace to that T_min before column-stacking.
+    split="test":
+        use valid_data from each selected neuron
+
+    The 86 selected neuron identities are the SAME for train/test.
+    Because different sessions can have different durations, all selected
+    traces are cut to the shortest time length.
     """
     if split not in ("train", "test"):
         raise ValueError("split must be 'train' or 'test'")
 
-    split_idx = 0 if split == "train" else 1
+    arr_idx = 0 if split == "train" else 1
 
-    lengths = []
     traces = []
+    lengths = []
 
     for day, neuron_idx in mapping:
-        x = sessions[day][split_idx]
+        X = sessions[day][arr_idx]
 
-        if neuron_idx >= x.shape[1]:
-            raise IndexError(
-                f"{DATASET_NAME}{day}: neuron {neuron_idx} out of bounds "
-                f"for {split} shape {x.shape}"
+        if neuron_idx >= X.shape[1]:
+            raise RuntimeError(
+                f"C-CO{day}: neuron {neuron_idx} unavailable in {split}."
             )
 
-        lengths.append(x.shape[0])
-        traces.append(x[:, neuron_idx])
+        trace = X[:, neuron_idx].astype(np.float32)
+        traces.append(trace)
+        lengths.append(len(trace))
 
-    min_t = int(min(lengths))
+    T_min = int(min(lengths))
 
-    matrix = np.column_stack(
-        [trace[:min_t] for trace in traces]
+    foreign = np.column_stack(
+        [trace[:T_min] for trace in traces]
     ).astype(np.float32)
 
-    if matrix.shape != (min_t, len(mapping)):
-        raise RuntimeError(
-            f"Unexpected foreign {split} shape: {matrix.shape}"
-        )
+    assert foreign.shape == (T_min, N_NEURONS)
+
+    used_sessions = sorted(set(day for day, _ in mapping))
 
     print(
-        f"foreign_{split}_raw: {matrix.shape} | "
-        f"shortest T={min_t} | "
-        f"contributing sessions={len(set(day for day, _ in mapping))}"
+        f"foreign_{split}_raw: {foreign.shape} | "
+        f"T_min={T_min} | "
+        f"selected neurons from {len(used_sessions)} sessions"
     )
-    return matrix
+
+    return foreign
 
 
 # =====================================================================
 # FAKE DATASET
 # =====================================================================
 
-def build_fake_like_test(
-    x_test: np.ndarray,
-    seed: int = SEED + 1000,
-) -> np.ndarray:
+def build_fake_neuronwise(X_test: np.ndarray, seed=SEED):
     """
-    Independent Gaussian per neuron, with EACH C-CO12 test neuron's own
-    mean/std. No cross-neuron correlation and no temporal structure.
+    Build a structure-destroyed fake dataset and make its finite-sample
+    mean/std match C-CO12 test EXACTLY neuron-by-neuron (up to fp error).
 
-    Shape is exactly the same as C-CO12 test.
+    1) independent Gaussian noise for every neuron/time
+    2) standardize each fake column
+    3) rescale each fake column to C-CO12 test neuron's mean/std
+
+    No cross-neuron or temporal structure is preserved.
     """
     rng = np.random.default_rng(seed)
-    mu, sd = neuron_stats(x_test)
 
-    fake = rng.normal(
-        loc=mu,
-        scale=sd,
-        size=x_test.shape,
+    fake0 = rng.normal(
+        size=X_test.shape
     ).astype(np.float32)
 
-    return fake
+    fake = match_neuron_by_neuron(
+        fake0,
+        X_test,
+    )
+
+    return fake.astype(np.float32)
 
 
 # =====================================================================
-# CEBRA
+# CEBRA MODEL BUILD / SAVE
 # =====================================================================
 
-def verify_modified_cebra() -> None:
-    print("\nUsing CEBRA from:")
+def verify_negpos_fork():
+    print("\nUsing CEBRA:")
     print(cebra.__file__)
 
     params = inspect.signature(CEBRA.__init__).parameters
-    required = {"extra_negatives", "extra_negative_fraction"}
+
+    required = {
+        "extra_negatives",
+        "extra_negative_fraction",
+    }
+
     missing = required.difference(params)
 
     if missing:
         raise RuntimeError(
-            "This is not the modified cross-session-negative CEBRA fork. "
-            f"Missing CEBRA.__init__ arguments: {sorted(missing)}"
+            "Wrong CEBRA fork loaded. Missing modified arguments: "
+            f"{sorted(missing)}"
         )
 
-    print("[OK] modified cross-session-negative CEBRA API detected")
+    print("[OK] CEBRA-NegPos API detected")
 
 
-def common_cebra_kwargs() -> dict:
+def common_cebra_kwargs():
     return dict(
         batch_size=BATCH_SIZE,
         temperature=TEMPERATURE,
         model_architecture=MODEL_ARCH,
-        time_offsets=TIME_OFFSET,
+        time_offsets=OFFSET,
         max_iterations=MAX_ITER,
         output_dimension=LATENT_DIM,
         num_hidden_units=HIDDEN,
@@ -434,7 +456,11 @@ def common_cebra_kwargs() -> dict:
     )
 
 
-def build_vanilla_cebra() -> CEBRA:
+def build_vanilla_cebra():
+    """
+    Same modified fork, but extra_negatives=None.
+    Therefore behavior should be vanilla CEBRA.
+    """
     return CEBRA(
         **common_cebra_kwargs(),
         extra_negatives=None,
@@ -442,302 +468,479 @@ def build_vanilla_cebra() -> CEBRA:
     )
 
 
-def build_crossneg_cebra(foreign_train: np.ndarray) -> CEBRA:
+def build_negpos_cebra(foreign_train_normalized: np.ndarray):
+    """
+    CEBRA trained on C-CO12, with some negative samples replaced
+    by normalized foreign-session negatives.
+    """
     return CEBRA(
         **common_cebra_kwargs(),
-        extra_negatives=foreign_train.astype(np.float32),
+        extra_negatives=foreign_train_normalized,
         extra_negative_fraction=EXTRA_NEGATIVE_FRACTION,
     )
 
 
-def model_path(name: str) -> Path:
+def model_path(name):
     return MODELS_DIR / f"{name}.pt"
 
 
-def save_model(model: CEBRA, name: str) -> None:
-    path = model_path(name)
-    model.save(path)
-    print("saved model:", path)
+def save_model(model, name):
+    ensure_dirs()
+    model.save(model_path(name))
+    print("saved model:", model_path(name))
 
 
-def embed(model: CEBRA, x: np.ndarray) -> np.ndarray:
+# =====================================================================
+# EMBEDDINGS
+# =====================================================================
+
+def emb_path(name):
+    return EMB_DIR / f"{name}.npy"
+
+
+def save_embedding(emb, name):
+    ensure_dirs()
+    arr = np.asarray(emb, dtype=np.float32)
+    np.save(emb_path(name), arr)
+    print("saved embedding:", emb_path(name), arr.shape)
+
+
+def embed(model, X):
     return np.asarray(
-        model.transform(np.asarray(x, dtype=np.float32)),
+        model.transform(X.astype(np.float32)),
         dtype=np.float32,
     )
 
 
-def save_embedding(name: str, x: np.ndarray) -> None:
-    path = EMB_DIR / f"{name}.npy"
-    np.save(path, np.asarray(x, dtype=np.float32))
-    print("saved embedding:", path, x.shape)
-
-
 # =====================================================================
-# PLOTS
+# PCA PLOTTING: ALWAYS SAVE BOTH 2D AND 3D
 # =====================================================================
 
-def plot_pca_pair(
-    emb_a: np.ndarray,
-    label_a: str,
-    emb_b: np.ndarray,
-    label_b: str,
-    title: str,
-    out_path: Path,
-    point_size: float = 7,
-    alpha: float = 0.5,
-) -> None:
+def plot_pca_comparison(
+    emb_a,
+    label_a,
+    color_a,
+    emb_b,
+    label_b,
+    color_b,
+    title,
+    out_2d,
+    out_3d,
+    point_size=6,
+    alpha=0.5,
+):
     """
-    Fit ONE PCA on the union, then project both groups into the SAME axes.
-    """
-    combined = np.concatenate([emb_a, emb_b], axis=0)
-    pca = PCA(n_components=2, random_state=SEED)
-    projected = pca.fit_transform(combined)
+    Fit ONE 3-component PCA on the UNION of emb_a + emb_b.
 
-    n_a = len(emb_a)
-    a = projected[:n_a]
-    b = projected[n_a:]
+    The same PCA basis is used for:
+      - 2D plot: PC1 vs PC2
+      - 3D plot: PC1 vs PC2 vs PC3
+
+    This is necessary so red/blue clouds are directly comparable.
+    """
+    combined = np.concatenate(
+        [emb_a, emb_b],
+        axis=0,
+    )
+
+    pca = PCA(n_components=3)
+    pca.fit(combined)
+
+    proj_a = pca.transform(emb_a)
+    proj_b = pca.transform(emb_b)
 
     var = pca.explained_variance_ratio_
 
-    plt.figure(figsize=(7.2, 6.2))
+    # ---------------- 2D ----------------
+    plt.figure(figsize=(7, 6))
+
     plt.scatter(
-        a[:, 0], a[:, 1],
-        s=point_size, alpha=alpha,
+        proj_a[:, 0],
+        proj_a[:, 1],
+        s=point_size,
+        c=color_a,
+        alpha=alpha,
         label=label_a,
     )
+
     plt.scatter(
-        b[:, 0], b[:, 1],
-        s=point_size, alpha=alpha,
+        proj_b[:, 0],
+        proj_b[:, 1],
+        s=point_size,
+        c=color_b,
+        alpha=alpha,
         label=label_b,
     )
-    plt.xlabel(f"PC1 ({100 * var[0]:.1f}%)")
-    plt.ylabel(f"PC2 ({100 * var[1]:.1f}%)")
-    plt.title(title)
+
+    plt.xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+    plt.ylabel(f"PC2 ({var[1] * 100:.1f}%)")
+    plt.title(title + " -- PCA 2D")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(out_path, dpi=220)
+    plt.savefig(out_2d, dpi=220)
     plt.close()
-    print("saved plot:", out_path)
+
+    print("saved:", out_2d)
+
+    # ---------------- 3D ----------------
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    ax.scatter(
+        proj_a[:, 0],
+        proj_a[:, 1],
+        proj_a[:, 2],
+        s=point_size,
+        c=color_a,
+        alpha=alpha,
+        label=label_a,
+    )
+
+    ax.scatter(
+        proj_b[:, 0],
+        proj_b[:, 1],
+        proj_b[:, 2],
+        s=point_size,
+        c=color_b,
+        alpha=alpha,
+        label=label_b,
+    )
+
+    ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
+    ax.set_zlabel(f"PC3 ({var[2] * 100:.1f}%)")
+
+    ax.set_title(title + " -- PCA 3D")
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(out_3d, dpi=220)
+    plt.close()
+
+    print("saved:", out_3d)
+
+
+# =====================================================================
+# STAGE 1 -- PREPARE DATA + TRAIN BOTH MODELS ON C-CO12
+# =====================================================================
+
+def stage1_train_models():
+    print("\n" + "#" * 100)
+    print("STAGE 1 -- TRAIN VANILLA CEBRA + CEBRA-NEGPOS ON C-CO12")
+    print("#" * 100)
+
+    # ---------------- C-CO12 ----------------
+    X_train, X_test = load_session_raw(TARGET_SESSION)
+
+    print(
+        f"{TARGET_SESSION} neural train: {X_train.shape} | "
+        f"test: {X_test.shape}"
+    )
+
+    if X_train.shape[1] != N_NEURONS:
+        raise RuntimeError(
+            f"Expected {N_NEURONS} neurons for {TARGET_SESSION}, "
+            f"got {X_train.shape[1]}"
+        )
+
+    # ---------------- foreign neurons ----------------
+    other_sessions = load_other_sessions()
+
+    mapping = choose_86_random_foreign_neurons(
+        other_sessions,
+        seed=SEED + 100,
+    )
+
+    save_foreign_mapping(mapping)
+
+    print("\nSelected 86 foreign neurons:")
+    for j, (day, neuron_idx) in enumerate(mapping):
+        print(
+            f"  C-CO12 coordinate {j:02d} <- "
+            f"C-CO{day} neuron {neuron_idx}"
+        )
+
+    foreign_train_raw = build_foreign_matrix(
+        other_sessions,
+        mapping,
+        split="train",
+    )
+
+    foreign_test_raw = build_foreign_matrix(
+        other_sessions,
+        mapping,
+        split="test",
+    )
+
+    # IMPORTANT:
+    # extra negatives used in training are matched to C-CO12 TRAIN.
+    foreign_train_norm = match_neuron_by_neuron(
+        foreign_train_raw,
+        X_train,
+    )
+
+    print("\nNeuron-wise normalization checks:")
+    print_match_check(
+        "foreign_train_norm vs C-CO12 train",
+        foreign_train_norm,
+        X_train,
+    )
+    # Test normalization is intentionally deferred until AFTER equal-time
+    # cropping in TEST 2, so the final plotted arrays match neuron-by-neuron
+    # exactly after truncation.
+
+    # ---------------- model 1 ----------------
+    print("\n" + "=" * 100)
+    print("MODEL 1 -- VANILLA CLEAN CEBRA")
+    print("=" * 100)
+
+    seed_all(SEED)
+
+    vanilla_model = build_vanilla_cebra()
+    vanilla_model.fit(X_train)
+
+    save_model(
+        vanilla_model,
+        "cebra_vanilla",
+    )
+
+    # ---------------- model 2 ----------------
+    print("\n" + "=" * 100)
+    print("MODEL 2 -- CLEAN CEBRA + FOREIGN NEGATIVE PAIRS")
+    print("=" * 100)
+
+    n_foreign = round(
+        EXTRA_NEGATIVE_FRACTION * BATCH_SIZE
+    )
+
+    print(
+        f"batch_size={BATCH_SIZE} | "
+        f"extra_negative_fraction={EXTRA_NEGATIVE_FRACTION} | "
+        f"approximately {n_foreign} foreign negatives per batch"
+    )
+
+    seed_all(SEED)
+
+    negpos_model = build_negpos_cebra(
+        foreign_train_norm,
+    )
+
+    # Main training data are STILL only C-CO12.
+    negpos_model.fit(X_train)
+
+    save_model(
+        negpos_model,
+        "cebra_negpos",
+    )
+
+    return (
+        vanilla_model,
+        negpos_model,
+        X_train,
+        X_test,
+        foreign_test_raw,
+    )
+
+
+# =====================================================================
+# TEST 1 -- C-CO12 TEST vs FAKE
+# =====================================================================
+
+def stage2_test_fake(
+    vanilla_model,
+    negpos_model,
+    X_test,
+):
+    print("\n" + "#" * 100)
+    print("TEST 1 -- C-CO12 TEST vs NEURON-WISE NORMALIZED FAKE")
+    print("#" * 100)
+
+    fake = build_fake_neuronwise(
+        X_test,
+        seed=SEED + 200,
+    )
+
+    print_match_check(
+        "fake vs C-CO12 test",
+        fake,
+        X_test,
+    )
+
+    models = (
+        ("vanilla", vanilla_model),
+        ("negpos", negpos_model),
+    )
+
+    for name, model in models:
+        print(f"\n--- {name.upper()} ---")
+
+        real_emb = embed(
+            model,
+            X_test,
+        )
+
+        fake_emb = embed(
+            model,
+            fake,
+        )
+
+        save_embedding(
+            real_emb,
+            f"{name}_cco12_test",
+        )
+
+        save_embedding(
+            fake_emb,
+            f"{name}_fake",
+        )
+
+        plot_pca_comparison(
+            real_emb,
+            f"{TARGET_SESSION} test",
+            "red",
+            fake_emb,
+            "fake, neuron-wise matched",
+            "blue",
+            title=f"{name.upper()} -- C-CO12 test vs fake",
+            out_2d=PLOTS_DIR / f"{name}_cco12_vs_fake_pca2d.png",
+            out_3d=PLOTS_DIR / f"{name}_cco12_vs_fake_pca3d.png",
+        )
+
+
+# =====================================================================
+# TEST 2 -- C-CO12 TEST vs OTHER-SESSION 86 NEURONS
+# =====================================================================
+
+def stage3_test_other86(
+    vanilla_model,
+    negpos_model,
+    X_test,
+    foreign_test_raw,
+):
+    print("\n" + "#" * 100)
+    print("TEST 2 -- C-CO12 TEST vs OTHER-SESSION 86 NEURONS")
+    print("#" * 100)
+
+    # Equal number of timepoints in the two clouds.
+    T = min(
+        X_test.shape[0],
+        foreign_test_raw.shape[0],
+    )
+
+    X_real = X_test[:T]
+    X_other_raw = foreign_test_raw[:T]
+
+    # CRITICAL: normalize AFTER equal-time cropping.
+    # coordinate j of foreign data is matched to neuron j of C-CO12 test.
+    X_other = match_neuron_by_neuron(
+        X_other_raw,
+        X_real,
+    )
+
+    print(
+        f"comparison length T={T} | "
+        f"C-CO12={X_real.shape} | "
+        f"other86={X_other.shape}"
+    )
+
+    print_match_check(
+        "final other86 vs final C-CO12 test",
+        X_other,
+        X_real,
+    )
+
+    models = (
+        ("vanilla", vanilla_model),
+        ("negpos", negpos_model),
+    )
+
+    for name, model in models:
+        print(f"\n--- {name.upper()} ---")
+
+        real_emb = embed(
+            model,
+            X_real,
+        )
+
+        other_emb = embed(
+            model,
+            X_other,
+        )
+
+        save_embedding(
+            real_emb,
+            f"{name}_cco12_test_other86_equalT",
+        )
+
+        save_embedding(
+            other_emb,
+            f"{name}_other86_test",
+        )
+
+        plot_pca_comparison(
+            real_emb,
+            f"{TARGET_SESSION} test",
+            "red",
+            other_emb,
+            "other-session 86, neuron-wise matched",
+            "blue",
+            title=f"{name.upper()} -- C-CO12 test vs other-session 86",
+            out_2d=PLOTS_DIR / f"{name}_cco12_vs_other86_pca2d.png",
+            out_3d=PLOTS_DIR / f"{name}_cco12_vs_other86_pca3d.png",
+        )
 
 
 # =====================================================================
 # MAIN
 # =====================================================================
 
-def main() -> None:
+def main():
     ensure_dirs()
-    seed_all()
-    verify_modified_cebra()
+    seed_all(SEED)
+    verify_negpos_fork()
 
-    # ---------------------------------------------------------------
-    # 1) TARGET: C-CO12
-    # ---------------------------------------------------------------
-    x_train, x_test = load_session(TARGET_SESSION)
-
-    print("\n" + "=" * 100)
-    print("TARGET SESSION")
-    print("=" * 100)
-    print(f"{TARGET_SESSION} train: {x_train.shape}")
-    print(f"{TARGET_SESSION} test : {x_test.shape}")
-
-    if x_train.shape[1] != N_NEURONS:
-        raise RuntimeError(
-            f"Expected {N_NEURONS} neurons in {TARGET_SESSION}, "
-            f"got {x_train.shape[1]}"
-        )
-
-    # ---------------------------------------------------------------
-    # 2) SAME 86 FOREIGN NEURON IDENTITIES FOR TRAIN AND TEST
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 100)
-    print("BUILD FOREIGN 86-NEURON MATRIX")
-    print("=" * 100)
-
-    foreign_sessions = load_usable_foreign_sessions()
-    foreign_mapping = choose_foreign_neurons(
-        foreign_sessions,
-        n_total=N_FOREIGN_NEURONS,
-        seed=SEED + 2000,
-    )
-    save_foreign_mapping(foreign_mapping)
-
-    print("\nSelected foreign input coordinates:")
-    for coord, (day, neuron_idx) in enumerate(foreign_mapping):
-        print(
-            f"  coord {coord:02d} <- "
-            f"{DATASET_NAME}{day}, neuron {neuron_idx}"
-        )
-
-    foreign_train_raw = assemble_foreign_matrix(
-        foreign_sessions,
-        foreign_mapping,
-        split="train",
-    )
-    foreign_test_raw = assemble_foreign_matrix(
-        foreign_sessions,
-        foreign_mapping,
-        split="test",
-    )
-
-    # ---------------------------------------------------------------
-    # 3) CRITICAL NEURON-BY-NEURON SCALE MATCHING
-    # ---------------------------------------------------------------
-    # Training foreign negatives are matched ONLY using training splits.
-    foreign_train = match_neuron_marginals(
-        foreign_train_raw,
-        target_reference=x_train,
-    )
-
-    # For the requested test visualization, foreign valid_data is matched
-    # neuron-by-neuron to the C-CO12 test distribution.
-    foreign_test = match_neuron_marginals(
+    (
+        vanilla_model,
+        negpos_model,
+        X_train,
+        X_test,
         foreign_test_raw,
-        target_reference=x_test,
+    ) = stage1_train_models()
+
+    # From here onward: TEST ONLY. No fit() calls.
+    stage2_test_fake(
+        vanilla_model,
+        negpos_model,
+        X_test,
     )
 
-    print("\nMarginal matching diagnostics:")
-    print_marginal_match_diagnostics(
-        "foreign_train matched to C-CO12 train",
-        foreign_train,
-        x_train,
+    stage3_test_other86(
+        vanilla_model,
+        negpos_model,
+        X_test,
+        foreign_test_raw,
     )
-    print_marginal_match_diagnostics(
-        "foreign_test matched to C-CO12 test",
-        foreign_test,
-        x_test,
-    )
-
-    # ---------------------------------------------------------------
-    # 4) TRAIN TWO CLEAN MODELS
-    # ---------------------------------------------------------------
-    print("\n" + "#" * 100)
-    print("MODEL A -- VANILLA CLEAN CEBRA")
-    print("#" * 100)
-
-    seed_all(SEED)
-    vanilla = build_vanilla_cebra()
-    vanilla.fit(x_train)
-    save_model(vanilla, "cebra_vanilla")
 
     print("\n" + "#" * 100)
-    print("MODEL B -- CLEAN CEBRA + CROSS-SESSION NEGATIVES")
-    print("#" * 100)
-    k_expected = int(round(EXTRA_NEGATIVE_FRACTION * BATCH_SIZE))
-    k_expected = max(0, min(k_expected, BATCH_SIZE - 1))
-    print(
-        f"extra_negative_fraction={EXTRA_NEGATIVE_FRACTION} | "
-        f"batch_size={BATCH_SIZE} | expected foreign negatives/step={k_expected}"
-    )
-    print("foreign training matrix:", foreign_train.shape)
-
-    seed_all(SEED)
-    crossneg = build_crossneg_cebra(foreign_train)
-    crossneg.fit(x_train)
-    save_model(crossneg, "cebra_cross_session_negatives")
-
-    models = [
-        ("vanilla", vanilla),
-        ("crossneg", crossneg),
-    ]
-
-    # ---------------------------------------------------------------
-    # 5) TEST CONDITION 1:
-    #    C-CO12 test vs neuron-wise marginal-matched fake
-    # ---------------------------------------------------------------
-    print("\n" + "#" * 100)
-    print("TEST 1 -- C-CO12 TEST vs FAKE TEST")
+    print("ALL DONE")
     print("#" * 100)
 
-    fake_test = build_fake_like_test(x_test)
-
-    print_marginal_match_diagnostics(
-        "fake_test matched to C-CO12 test",
-        fake_test,
-        x_test,
-    )
-
-    for model_name, model in models:
-        real_emb = embed(model, x_test)
-        fake_emb = embed(model, fake_test)
-
-        save_embedding(
-            f"{model_name}_cco12_test",
-            real_emb,
-        )
-        save_embedding(
-            f"{model_name}_fake_test",
-            fake_emb,
-        )
-
-        plot_pca_pair(
-            real_emb,
-            f"{TARGET_SESSION} test",
-            fake_emb,
-            "fake test (per-neuron marginal matched)",
-            title=f"{model_name.upper()} | C-CO12 test vs fake",
-            out_path=PLOTS_DIR / f"{model_name}_test_vs_fake.png",
-        )
-
-    # ---------------------------------------------------------------
-    # 6) TEST CONDITION 2:
-    #    C-CO12 test vs 86 neurons from other sessions' VALID sets.
-    #
-    #    The foreign matrix already uses the minimum time length among
-    #    contributing sessions. For a perfectly balanced PCA comparison,
-    #    also crop C-CO12 test to the same number of rows.
-    # ---------------------------------------------------------------
-    print("\n" + "#" * 100)
-    print("TEST 2 -- C-CO12 TEST vs OTHER-SESSIONS 86 NEURONS")
-    print("#" * 100)
-
-    eval_t = min(x_test.shape[0], foreign_test.shape[0])
-    x_test_equal = x_test[:eval_t]
-    foreign_test_equal = foreign_test[:eval_t]
-
-    print(
-        f"equalized test length: {eval_t} | "
-        f"C-CO12={x_test_equal.shape} | foreign={foreign_test_equal.shape}"
-    )
-
-    for model_name, model in models:
-        real_emb = embed(model, x_test_equal)
-        foreign_emb = embed(model, foreign_test_equal)
-
-        save_embedding(
-            f"{model_name}_cco12_test_equalT",
-            real_emb,
-        )
-        save_embedding(
-            f"{model_name}_foreign86_test_equalT",
-            foreign_emb,
-        )
-
-        plot_pca_pair(
-            real_emb,
-            f"{TARGET_SESSION} test",
-            foreign_emb,
-            "86 foreign neurons (other-session valid sets)",
-            title=f"{model_name.upper()} | C-CO12 test vs foreign 86",
-            out_path=PLOTS_DIR / f"{model_name}_test_vs_foreign86.png",
-        )
-
-    # ---------------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 100)
-    print("DONE")
-    print("=" * 100)
-    print("Models:")
+    print("models:")
     print(" ", model_path("cebra_vanilla"))
-    print(" ", model_path("cebra_cross_session_negatives"))
-    print("Foreign neuron mapping:")
+    print(" ", model_path("cebra_negpos"))
+
+    print("\nplots:")
+    print(" ", PLOTS_DIR / "vanilla_cco12_vs_fake_pca2d.png")
+    print(" ", PLOTS_DIR / "vanilla_cco12_vs_fake_pca3d.png")
+    print(" ", PLOTS_DIR / "negpos_cco12_vs_fake_pca2d.png")
+    print(" ", PLOTS_DIR / "negpos_cco12_vs_fake_pca3d.png")
+    print(" ", PLOTS_DIR / "vanilla_cco12_vs_other86_pca2d.png")
+    print(" ", PLOTS_DIR / "vanilla_cco12_vs_other86_pca3d.png")
+    print(" ", PLOTS_DIR / "negpos_cco12_vs_other86_pca2d.png")
+    print(" ", PLOTS_DIR / "negpos_cco12_vs_other86_pca3d.png")
+
+    print("\nforeign mapping:")
     print(" ", FOREIGN_MAP_CSV)
-    print("Plots:")
-    print(" ", PLOTS_DIR / "vanilla_test_vs_fake.png")
-    print(" ", PLOTS_DIR / "crossneg_test_vs_fake.png")
-    print(" ", PLOTS_DIR / "vanilla_test_vs_foreign86.png")
-    print(" ", PLOTS_DIR / "crossneg_test_vs_foreign86.png")
 
 
 if __name__ == "__main__":
