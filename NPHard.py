@@ -51,7 +51,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 # =============================================================================
 
 ROOT = Path(__file__).resolve().parent
-PNHARD_CEBRA_DIR = ROOT / "CEBRA-PNHard"
+PNHARD_CEBRA_DIR = ROOT / "CEBRA-NPHard"
 
 if not PNHARD_CEBRA_DIR.exists():
     raise FileNotFoundError(f"CEBRA-PNHard fork not found: {PNHARD_CEBRA_DIR}")
