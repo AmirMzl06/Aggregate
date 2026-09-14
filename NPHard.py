@@ -24,6 +24,9 @@ Final line section prints R2 for all three models side by side.
 
 from __future__ import annotations
 
+import importlib.abc
+import importlib.util
+
 import csv
 import gc
 import importlib
@@ -67,6 +70,77 @@ def clear_cebra_modules():
     importlib.invalidate_caches()
 
 
+# def import_pnhard_cebra():
+#     clear_cebra_modules()
+#     for p in (str(PNHARD_CEBRA_DIR), str(ACORN_CEBRA_DIR)):
+#         while p in sys.path:
+#             sys.path.remove(p)
+#     sys.path.insert(0, str(PNHARD_CEBRA_DIR))
+
+#     import cebra
+#     from cebra import CEBRA
+#     import cebra.attribution
+
+#     print("\nUsing CEBRA-PNHard:")
+#     print(cebra.__file__)
+
+#     params = inspect.signature(CEBRA.__init__).parameters
+#     required = {
+#         "extra_negatives",
+#         "extra_negative_fraction",
+#         "extra_negative_candidate_multiplier",
+#         "extra_negative_normalize",
+#     }
+#     missing = required.difference(params)
+#     if missing:
+#         raise RuntimeError(
+#             "Wrong fork loaded. Missing PNHard args: "
+#             f"{sorted(missing)}"
+#         )
+#     return cebra, CEBRA
+
+
+# cebra, CEBRA = import_pnhard_cebra()
+class _PNHardSolverImportFix(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """
+    Runtime-only fix for CEBRA-NPHard import order.
+    Does NOT modify any file inside CEBRA-NPHard.
+    It only executes cebra/solver/__init__.py in memory with
+    single_session imported before multiobjective.
+    """
+    def __init__(self, fork_root: Path):
+        self.solver_dir = fork_root / "cebra" / "solver"
+        self.init_file = self.solver_dir / "__init__.py"
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "cebra.solver":
+            return None
+        return importlib.util.spec_from_file_location(
+            fullname,
+            self.init_file,
+            loader=self,
+            submodule_search_locations=[str(self.solver_dir)],
+        )
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        source = self.init_file.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        single_line = "from cebra.solver.single_session import *"
+        multiobjective_line = "from cebra.solver.multiobjective import *"
+        def find_line(target):
+            for i, line in enumerate(lines):
+                if line.strip() == target:
+                    return i
+            raise RuntimeError(f"Could not find this line in {self.init_file}:\n{target}")
+        single_idx = find_line(single_line)
+        multi_idx = find_line(multiobjective_line)
+        if single_idx > multi_idx:
+            line = lines.pop(single_idx)
+            multi_idx = find_line(multiobjective_line)
+            lines.insert(multi_idx, line)
+        patched_source = "\n".join(lines) + "\n"
+        exec(compile(patched_source, str(self.init_file), "exec"), module.__dict__)
+
 def import_pnhard_cebra():
     clear_cebra_modules()
     for p in (str(PNHARD_CEBRA_DIR), str(ACORN_CEBRA_DIR)):
@@ -74,11 +148,18 @@ def import_pnhard_cebra():
             sys.path.remove(p)
     sys.path.insert(0, str(PNHARD_CEBRA_DIR))
 
-    import cebra
-    from cebra import CEBRA
-    import cebra.attribution
+    import_fix = _PNHardSolverImportFix(PNHARD_CEBRA_DIR)
+    sys.meta_path.insert(0, import_fix)
 
-    print("\nUsing CEBRA-PNHard:")
+    try:
+        import cebra
+        from cebra import CEBRA
+        import cebra.attribution
+    finally:
+        if import_fix in sys.meta_path:
+            sys.meta_path.remove(import_fix)
+
+    print("\nUsing CEBRA-NPHard:")
     print(cebra.__file__)
 
     params = inspect.signature(CEBRA.__init__).parameters
@@ -90,15 +171,12 @@ def import_pnhard_cebra():
     }
     missing = required.difference(params)
     if missing:
-        raise RuntimeError(
-            "Wrong fork loaded. Missing PNHard args: "
-            f"{sorted(missing)}"
-        )
+        raise RuntimeError("Wrong fork loaded. Missing PNHard args: " f"{sorted(missing)}")
+
+    print("PNHard runtime import-order fix: OK")
     return cebra, CEBRA
 
-
 cebra, CEBRA = import_pnhard_cebra()
-
 
 # =============================================================================
 # CONFIG
