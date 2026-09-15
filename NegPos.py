@@ -53,7 +53,7 @@ if missing:
     raise RuntimeError("Wrong CEBRA fork loaded. Missing NegPos arguments: " f"{sorted(missing)}")
 
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
-DATASET_NAME = "C-CO"
+DATASET_NAME = "T-RT"
 TARGET_DAY = 0
 TARGET_SESSION = f"{DATASET_NAME}{TARGET_DAY}"
 N_NEURONS = None
