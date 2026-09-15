@@ -137,6 +137,11 @@ def load_target_session():
     # print("Detected neurons:", N_NEURONS)
     if X_train.ndim != 2 or X_test.ndim != 2:
         raise ValueError(f"Expected 2D neural arrays; got {X_train.shape=} and {X_test.shape=}")
+    
+    global N_NEURONS
+    N_NEURONS = X_train.shape[1]
+    print("Detected neurons:", N_NEURONS)
+    
     if Y_train.ndim == 1:
         Y_train = Y_train[:, None]
     if Y_test.ndim == 1:
@@ -155,9 +160,9 @@ def load_target_session():
     print("X_test :", X_test.shape)
     print("Y_train:", Y_train.shape)
     print("Y_test :", Y_test.shape)
-    global N_NEURONS
-    N_NEURONS = X_train.shape[1]
-    print("Detected neurons:", N_NEURONS)
+    # global N_NEURONS
+    # N_NEURONS = X_train.shape[1]
+    # print("Detected neurons:", N_NEURONS)
     return X_train, X_test, Y_train, Y_test
 
 def load_other_session_neural(session_name: str):
