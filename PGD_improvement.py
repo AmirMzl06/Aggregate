@@ -185,7 +185,11 @@ def compute_jacobian(model,X,name):
     np.save(OUT/f"{name}_JF.npy",jf)
 
     plt.figure(figsize=(10,6))
-    plt.imshow(jf.squeeze(),aspect="auto")
+    # plt.imshow(jf.squeeze(),aspect="auto")
+    jf_plot = jf
+    while jf_plot.ndim > 2:
+        jf_plot = np.mean(jf_plot, axis=0)
+    plt.imshow(jf_plot, aspect="auto")
     plt.colorbar()
     plt.title(name)
     plt.savefig(OUT/f"{name}_JF.png",dpi=300,bbox_inches="tight")
