@@ -139,7 +139,7 @@ PERICH_DAYS = {
     "M-RT": range(6),
 }
 
-N_TARGETS_PER_GROUP = 5       # capped to len(group) if the group is smaller
+N_TARGETS_PER_GROUP = 2       # capped to len(group) if the group is smaller
 FOREIGN_POOL_NEURONS = 860    # target; capped to whatever's available, with a warning
 
 SEED = 42
