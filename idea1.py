@@ -1,8 +1,7 @@
-#idea no.1
 """C-CO12: adversarial baseline versus negative-branch gradient scaling.
 
 Run this file next to the CEBRA-idea1 folder:
-    python compare_idea1_gamma.py
+    python idea1.py
 
 Both arms: reference only, one restart, last iterate, epsilon=0.2.
 Each arm trains a fresh CEBRA encoder and a separate, identically initialized
