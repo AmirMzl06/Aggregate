@@ -62,7 +62,7 @@ OUT.mkdir(exist_ok=True, parents=True)
 
 RESULTS_CSV = OUT / "all_sessions_r2.csv"
 
-EPSILON = 0.2
+EPSILON = 0.5
 EPS_STEPS = 10
 
 LATENT_DIM = 64
@@ -165,7 +165,7 @@ def build_adv(cfg):
         adv_epsilon=EPSILON,
         adv_alpha=EPSILON/5,
         adv_steps=EPS_STEPS,
-        attack_norm="linf",
+        attack_norm="l2",
         device=DEVICE,
         verbose=True,
         **cfg
