@@ -1,5 +1,15 @@
-#idea no.2
+"""C-CO12: adversarial baseline versus PGD on a subset of input neurons.
 
+Run this file next to the CEBRA-idea2 folder:
+    python idea2.py
+
+Both arms: reference only, one restart, last iterate, epsilon=0.2.
+Each arm trains a fresh CEBRA encoder and a separate, identically initialized
+MLP decoder. Data stay in their original scale. Evaluation uses valid_data /
+valid_label from the NPZ: the reported R2 is VALIDATION R2, not held-out test R2.
+No Jacobian computation or CLEAN arm is included in this two-arm comparison.
+The default runs one paired seed; add seeds below to assess run variability.
+"""
 from pathlib import Path
 from datetime import datetime, timezone
 import csv
