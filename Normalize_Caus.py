@@ -53,7 +53,7 @@ def build_acorn():
         adv_epsilon=EPSILON,
         adv_alpha=EPSILON / 5,
         adv_steps=10,
-        attack_norm='linf',
+        attack_norm='l2',
         device=DEVICE,
         verbose=True,
     )
