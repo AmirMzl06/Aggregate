@@ -17,7 +17,7 @@ from cebra import CEBRA
 
 print('Using:', cebra.__file__)
 
-DATA_DIR = Path('/mnt/data/hossein/mm_project/perich_data_valid_final_raw/')
+DATA_DIR = Path('/data/hossein/mm_project/perich_data_valid_final_raw/')
 SESSION = 'C-CO12'
 EPSILON = 0.2
 LATENT_DIM = 64
