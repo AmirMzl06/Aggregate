@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 ROOT = Path(__file__).resolve().parent
-CEBRA_DIR = ROOT / "CEBRA-NegPos"
+CEBRA_DIR = ROOT / "CEBRA-NegPosDetach"
 
 if not CEBRA_DIR.exists():
     raise FileNotFoundError(f"CEBRA-NegPos fork not found: {CEBRA_DIR}")
@@ -53,11 +53,11 @@ if missing:
     raise RuntimeError("Wrong CEBRA fork loaded. Missing NegPos arguments: " f"{sorted(missing)}")
 
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
-DATASET_NAME = "T-RT"
-TARGET_DAY = 0
+DATASET_NAME = "M-CO"
+TARGET_DAY = 16
 TARGET_SESSION = f"{DATASET_NAME}{TARGET_DAY}"
 N_NEURONS = None
-N_CCO_SESSIONS = 53
+N_CCO_SESSIONS = 22
 OTHER_SESSION_IDS = None
 SEED = 42
 
@@ -298,6 +298,7 @@ def build_normal_cebra():
         **common_cebra_kwargs(),
         extra_negatives=None,
         extra_negative_fraction=EXTRA_NEGATIVE_FRACTION,
+        extra_negatives_detach=False,
     )
 
 def build_negpos_cebra(foreign_train_norm):
@@ -305,6 +306,7 @@ def build_negpos_cebra(foreign_train_norm):
         **common_cebra_kwargs(),
         extra_negatives=foreign_train_norm,
         extra_negative_fraction=EXTRA_NEGATIVE_FRACTION,
+        extra_negatives_detach=True,
     )
 
 def save_cebra_model(model, filename):
