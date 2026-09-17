@@ -32,7 +32,7 @@ from sklearn.metrics import r2_score
 ROOT = Path(__file__).resolve().parent
 CEBRA_DIR = ROOT / "CEBRA-idea2"
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
-SESSION = "C-CO12"
+SESSION = "C-CO0"
 NPZ_PATH = PERICH_DATA_DIR / f"{SESSION}.npz"
 OUT_ROOT = ROOT / "ACORN_IDEA2_CCO12_COMPARE"
 
