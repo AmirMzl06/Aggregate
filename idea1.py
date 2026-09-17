@@ -127,7 +127,7 @@ def common_encoder_config():
         time_offsets=1, max_iterations=MAX_ITER, output_dimension=LATENT_DIM,
         num_hidden_units=HIDDEN, learning_rate=3e-4, temperature_mode="constant",
         training_mode="adversarial", adv_epsilon=EPSILON,
-        adv_alpha=EPSILON / 5, adv_steps=EPS_STEPS, attack_norm="linf",
+        adv_alpha=EPSILON / 5, adv_steps=EPS_STEPS, attack_norm="l2",
         attack_target="reference", adv_restarts=1, adv_best_iterate=False,
         adv_random_start=True, adv_eval_mode=False, adv_budget_mode="per_view",
         adv_clip_min=None, adv_clip_max=None, device=DEVICE, verbose=True,
