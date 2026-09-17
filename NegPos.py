@@ -70,7 +70,7 @@ MODEL_ARCH = "offset36-model-more-dropout"
 DEVICE = "cuda_if_available"
 OFFSET = 1
 CONDITIONAL = "time_delta"
-EXTRA_NEGATIVE_FRACTION = 0.9
+EXTRA_NEGATIVE_FRACTION = 0.7
 
 ACORN_EPSILON = 0.2
 ACORN_ALPHA = ACORN_EPSILON / 5.0
