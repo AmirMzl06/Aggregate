@@ -41,7 +41,7 @@ OUT_ROOT = ROOT / f"PUZZLE_{SESSION}_RESULTS"
 SEED = 42
 
 # Puzzle: full 10-bin windows, four shuffled slots with fixed spacing delta.
-WINDOW_SIZE = 10
+WINDOW_SIZE = 20
 DELTA = 1
 LATENT_DIM = 64
 ENCODER_HIDDEN = 64
@@ -50,7 +50,7 @@ PUZZLE_BATCH_SIZE = 256
 PUZZLE_EPOCHS = 15000
 PUZZLE_LR = 3e-4
 PUZZLE_DROPOUT = 0.0
-PERMUTATIONS_PER_WINDOW = 1  # 24 processes all permutations; much higher memory/cost.
+PERMUTATIONS_PER_WINDOW = 4  # 24 processes all permutations; much higher memory/cost.
 DEVICE = "cuda_if_available"
 
 # True: one embedding per input bin, with edge padding per split.
