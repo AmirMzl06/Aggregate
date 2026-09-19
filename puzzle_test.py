@@ -48,13 +48,13 @@ OUT_ROOT = ROOT / f"PUZZLE_{SESSION}_RESULTS"
 SEED = 42
 
 # Puzzle: full WINDOW_SIZE-bin windows; four shuffled slots at fixed spacing delta.
-WINDOW_SIZE = 10
+WINDOW_SIZE = 4
 DELTA = 1
 LATENT_DIM = 64
 ENCODER_HIDDEN = 64
 HEAD_HIDDEN = 128
 PUZZLE_BATCH_SIZE = 256
-PUZZLE_EPOCHS = 15
+PUZZLE_EPOCHS = 4000
 PUZZLE_LR = 3e-4
 PUZZLE_DROPOUT = 0.0
 PERMUTATIONS_PER_WINDOW = 1  # 24 processes all permutations; much higher memory/cost.
