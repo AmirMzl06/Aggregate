@@ -1,0 +1,5 @@
+# Install into your existing working PyTorch/CEBRA environment.
+# This is the exact TorchBrain commit used by the official nerdslab/poyo repo.
+torch_brain @ git+https://github.com/neuro-galaxy/torch_brain@ca3cfb691e01764577c3e62a7d5092539f79519a
+temporaldata==0.1.4
+scikit-learn
