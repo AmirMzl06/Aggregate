@@ -57,7 +57,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from jigsaw_cebra import JigsawCEBRA, _ridge_r2  # _ridge_r2: chronological-split ridge
+from Neural_Jigsaw import JigsawCEBRA, _ridge_r2  # _ridge_r2: chronological-split ridge
 
 ROOT = Path(__file__).resolve().parent
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
