@@ -1,511 +1,573 @@
-# import os
-# import gc
-# import numpy as np
-# import torch
-# import scipy.io as sio
-# import matplotlib.pyplot as plt
-
-# from utils.constants import CEBRA_DIR
-# from utils.min_distance import min_l2_distance
-
-# import sys
-# sys.path.insert(0, str(CEBRA_DIR))
-
-# import cebra
-# import cebra.attribution
-# from cebra import CEBRA
-
-
-# # =====================================================
-# # Config
-# # =====================================================
-# DATA_PATH = "./data/spk/M021519_spk.mat"
-# OUT_DIR = "./outputs"
-# IMG_DIR = "./image"
-
-# os.makedirs(OUT_DIR, exist_ok=True)
-# os.makedirs(IMG_DIR, exist_ok=True)
-
-# BATCH_SIZE = 256
-# MAX_ITER = 2500
-# OUTPUT_DIM = 16
-
-# PRE_MS = 500
-# POST_MS = 1000
-# BIN_MS = 10
-
-# EVENT_NAME = "stim_on"   # alignment event
-# TRIAL_LIMIT = None       # e.g. 20 for debugging, None = all valid trials
-# N_RANDOM_TRIALS = 20 
-
-# torch.manual_seed(42)
-# np.random.seed(42)
-
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# # =====================================================
-# # Load data
-# # =====================================================
-# mat = sio.loadmat(DATA_PATH, simplify_cells=True, squeeze_me=True)
-# unit = mat["unit"]
-# t_evt = mat["t_evt"]
-
-# print("neurons:", len(unit))
-# print("events:", t_evt.keys())
-
-
-# # =====================================================
-# # Helpers
-# # =====================================================
-# def make_trial_matrix(unit, event_time, pre_ms, post_ms, bin_ms):
-#     """
-#     Returns:
-#         X_trial: [time_bins, neurons]
-#     """
-#     n_neurons = len(unit)
-#     n_bins = int((pre_ms + post_ms) / bin_ms)
-#     X = np.zeros((n_bins, n_neurons), dtype=np.float32)
-
-#     start = event_time - pre_ms / 1000.0
-#     end = event_time + post_ms / 1000.0
-
-#     for n in range(n_neurons):
-#         spikes = unit[n]["timestamps"]
-#         spikes = np.asarray(spikes, dtype=np.float32).reshape(-1)
-
-#         spikes = spikes[(spikes >= start) & (spikes <= end)]
-#         spikes_ms = (spikes - event_time) * 1000.0
-#         bins = ((spikes_ms + pre_ms) / bin_ms).astype(int)
-#         bins = bins[(bins >= 0) & (bins < n_bins)]
-
-#         for b in bins:
-#             X[b, n] += 1.0
-
-#     return X
-
-
-# def build_all_trials(unit, event_times, pre_ms, post_ms, bin_ms, trial_limit=None):
-#     """
-#     Returns:
-#         trials: [n_trials, time_bins, neurons]
-#         used_event_times: valid event times used
-#     """
-#     event_times = np.asarray(event_times, dtype=np.float32).reshape(-1)
-#     event_times = event_times[np.isfinite(event_times)]
-
-#     if trial_limit is not None:
-#         event_times = event_times[:trial_limit]
-
-#     trials = []
-#     used = []
-
-#     for evt in event_times:
-#         X_trial = make_trial_matrix(unit, evt, pre_ms, post_ms, bin_ms)
-#         trials.append(X_trial)
-#         used.append(evt)
-
-#     trials = np.stack(trials, axis=0).astype(np.float32)
-#     return trials, np.asarray(used, dtype=np.float32)
-
-
-# def normalize_trial(X):
-#     """
-#     z-score each trial neuron-wise.
-#     X: [time_bins, neurons]
-#     """
-#     mu = X.mean(axis=0, keepdims=True)
-#     sigma = X.std(axis=0, keepdims=True) + 1e-8
-#     return ((X - mu) / sigma).astype(np.float32), mu.astype(np.float32), sigma.astype(np.float32)
-
-
-# def save_heatmap(arr, path, title):
-#     if torch.is_tensor(arr):
-#         arr = arr.detach().cpu().numpy()
-#     else:
-#         arr = np.asarray(arr)
-
-#     # Average over sample dimension if present
-#     if arr.ndim == 3:
-#         arr = np.abs(arr).mean(axis=0)
-#     else:
-#         arr = np.abs(arr)
-
-#     plt.figure(figsize=(10, 6))
-#     plt.imshow(arr, aspect="auto")
-#     plt.colorbar(label="absolute attribution")
-#     plt.xlabel("Neuron")
-#     plt.ylabel("Latent dimension")
-#     plt.title(title)
-#     plt.tight_layout()
-#     plt.savefig(path, dpi=300, bbox_inches="tight")
-#     plt.close()
-
-
-# def reduce_attr_map(arr):
-#     """
-#     Convert attribution output to [latent_dim, neurons].
-#     """
-#     if torch.is_tensor(arr):
-#         arr = arr.detach().cpu().numpy()
-#     else:
-#         arr = np.asarray(arr)
-
-#     arr = np.abs(arr)
-
-#     if arr.ndim == 3:
-#         arr = arr.mean(axis=0)
-#     elif arr.ndim == 2:
-#         pass
-#     elif arr.ndim == 1:
-#         arr = arr[None, :]
-#     else:
-#         raise ValueError(f"Unsupported attribution shape: {arr.shape}")
-
-#     return arr.astype(np.float32)
-
-
-# def train_cebra_on_trial(X_trial, adv=False):
-#     """
-#     Train one model on one trial.
-#     """
-#     mode = "adversarial" if adv else "clean"
-
-#     x_torch = torch.tensor(X_trial, dtype=torch.float32)
-#     eps = float(min_l2_distance(x_torch)) / 2.0
-#     eps = max(eps, 1e-6)
-
-#     print("\nTraining", mode, "epsilon:", eps)
-
-#     model = CEBRA(
-#         batch_size=BATCH_SIZE,
-#         temperature=0.4,
-#         model_architecture="offset10-model",
-#         time_offsets=10,
-#         max_iterations=MAX_ITER,
-#         output_dimension=OUTPUT_DIM,
-#         verbose=True,
-#         training_mode="adversarial" if adv else "clean",
-#         adv_alpha=eps / 5 if adv else 0,
-#         adv_epsilon=eps if adv else 0,
-#         adv_steps=10 if adv else 0,
-#         attack_norm="linf",
-#         num_hidden_units=32,
-#         device="cuda_if_available",
-#     )
-
-#     labels = np.arange(len(X_trial), dtype=np.float32)
-#     model.fit(X_trial.astype(np.float32), labels)
-
-#     return model, eps
-
-
-# def compute_trial_attribution(model, X_trial, tag, trial_idx):
-#     """
-#     Compute JF and JF-inv for one trial.
-#     """
-#     encoder = model.solver_.model.to(device)
-#     if hasattr(encoder, "split_outputs"):
-#         encoder.split_outputs = False
-#     encoder.eval()
-
-#     x_tensor = torch.tensor(
-#         X_trial,
-#         dtype=torch.float32,
-#         device=device,
-#         requires_grad=True
-#     )
-
-#     method = cebra.attribution.init(
-#         name="jacobian-based-batched",
-#         model=encoder,
-#         input_data=x_tensor,
-#         output_dimension=OUTPUT_DIM,
-#     )
-
-#     result = method.compute_attribution_map(batch_size=min(128, len(X_trial)))
-#     print(f"[{tag} | trial {trial_idx}] attribution keys:", result.keys())
-
-#     jf_key = "jf"
-#     if "jf-inv-svd" in result:
-#         jfinv_key = "jf-inv-svd"
-#     elif "jf-inv-lsq" in result:
-#         jfinv_key = "jf-inv-lsq"
-#     elif "jf-inv" in result:
-#         jfinv_key = "jf-inv"
-#     else:
-#         raise KeyError(f"No inverse attribution key found. Available: {list(result.keys())}")
-
-#     jf = reduce_attr_map(result[jf_key])
-#     jfinv = reduce_attr_map(result[jfinv_key])
-
-#     # save per-trial raw arrays
-#     np.save(os.path.join(OUT_DIR, f"{tag}_trial{trial_idx}_jf.npy"), jf)
-#     np.save(os.path.join(OUT_DIR, f"{tag}_trial{trial_idx}_jfinv.npy"), jfinv)
-
-#     # save per-trial plots
-#     save_heatmap(jf, os.path.join(IMG_DIR, f"{tag}_trial{trial_idx}_jf.png"), f"{tag} | trial {trial_idx} | JF")
-#     save_heatmap(jfinv, os.path.join(IMG_DIR, f"{tag}_trial{trial_idx}_jfinv.png"), f"{tag} | trial {trial_idx} | JF-INV")
-
-#     del encoder, x_tensor, method, result
-#     gc.collect()
-#     if torch.cuda.is_available():
-#         torch.cuda.empty_cache()
-#         torch.cuda.ipc_collect()
-
-#     return jf, jfinv
-
-
-# # =====================================================
-# # Build trials
-# # =====================================================
-# stim_times = np.asarray(t_evt[EVENT_NAME], dtype=np.float32).reshape(-1)
-# stim_times = stim_times[np.isfinite(stim_times)]
-
-# if TRIAL_LIMIT is not None:
-#     stim_times = stim_times[:TRIAL_LIMIT]
-
-# print("number of valid trials:", len(stim_times))
-
-# all_trials, used_event_times = build_all_trials(
-#     unit=unit,
-#     event_times=stim_times,
-#     pre_ms=PRE_MS,
-#     post_ms=POST_MS,
-#     bin_ms=BIN_MS,
-#     trial_limit=TRIAL_LIMIT,
-# )
-
-# print("all_trials shape:", all_trials.shape)   # [n_trials, time_bins, neurons]
-
-
-# # =====================================================
-# # =====================================================
-# total_trials = all_trials.shape[0]
-# if total_trials > N_RANDOM_TRIALS:
-#     random_indices = np.random.choice(total_trials, size=N_RANDOM_TRIALS, replace=False)
-#     random_indices.sort() 
-# else:
-#     random_indices = np.arange(total_trials)
-
-# print(f"\n--- Randomly selected {len(random_indices)} trials out of {total_trials} ---")
-
-
-# # =====================================================
-# # Loop over trials:
-# # train separately on each trial -> compute JF/JF-inv -> average later
-# # =====================================================
-# cebra_jf_sum = None
-# cebra_jfinv_sum = None
-# acorn_jf_sum = None
-# acorn_jfinv_sum = None
-
-# n_trials_used = 0
-
-# for step, trial_idx in enumerate(random_indices):
-#     print("\n" + "=" * 80)
-#     print(f"Processing randomly selected trial {step + 1}/{len(random_indices)} (Original Trial ID: {trial_idx})")
-#     print("=" * 80)
-
-#     X_trial = all_trials[trial_idx]
-#     X_trial, mu, sigma = normalize_trial(X_trial)
-
-#     # -----------------------
-#     # CEBRA
-#     # -----------------------
-#     cebra_model, _ = train_cebra_on_trial(X_trial, adv=False)
-#     cebra_jf, cebra_jfinv = compute_trial_attribution(
-#         cebra_model, X_trial, "CEBRA", trial_idx
-#     )
-
-#     del cebra_model
-#     gc.collect()
-#     if torch.cuda.is_available():
-#         torch.cuda.empty_cache()
-#         torch.cuda.ipc_collect()
-
-#     # -----------------------
-#     # ACORN
-#     # -----------------------
-#     acorn_model, _ = train_cebra_on_trial(X_trial, adv=True)
-#     acorn_jf, acorn_jfinv = compute_trial_attribution(
-#         acorn_model, X_trial, "ACORN", trial_idx
-#     )
-
-#     del acorn_model
-#     gc.collect()
-#     if torch.cuda.is_available():
-#         torch.cuda.empty_cache()
-#         torch.cuda.ipc_collect()
-
-#     # -----------------------
-#     # accumulate means
-#     # -----------------------
-#     if cebra_jf_sum is None:
-#         cebra_jf_sum = np.zeros_like(cebra_jf, dtype=np.float64)
-#         cebra_jfinv_sum = np.zeros_like(cebra_jfinv, dtype=np.float64)
-#         acorn_jf_sum = np.zeros_like(acorn_jf, dtype=np.float64)
-#         acorn_jfinv_sum = np.zeros_like(acorn_jfinv, dtype=np.float64)
-
-#     cebra_jf_sum += cebra_jf
-#     cebra_jfinv_sum += cebra_jfinv
-#     acorn_jf_sum += acorn_jf
-#     acorn_jfinv_sum += acorn_jfinv
-
-#     n_trials_used += 1
-
-#     # free trial arrays
-#     del X_trial, cebra_jf, cebra_jfinv, acorn_jf, acorn_jfinv
-#     gc.collect()
-#     if torch.cuda.is_available():
-#         torch.cuda.empty_cache()
-#         torch.cuda.ipc_collect()
-
-
-# # =====================================================
-# # Final mean maps
-# # =====================================================
-# cebra_jf_mean = (cebra_jf_sum / max(n_trials_used, 1)).astype(np.float32)
-# cebra_jfinv_mean = (cebra_jfinv_sum / max(n_trials_used, 1)).astype(np.float32)
-
-# acorn_jf_mean = (acorn_jf_sum / max(n_trials_used, 1)).astype(np.float32)
-# acorn_jfinv_mean = (acorn_jfinv_sum / max(n_trials_used, 1)).astype(np.float32)
-
-# np.save(os.path.join(OUT_DIR, "CEBRA_mean_jf.npy"), cebra_jf_mean)
-# np.save(os.path.join(OUT_DIR, "CEBRA_mean_jfinv.npy"), cebra_jfinv_mean)
-# np.save(os.path.join(OUT_DIR, "ACORN_mean_jf.npy"), acorn_jf_mean)
-# np.save(os.path.join(OUT_DIR, "ACORN_mean_jfinv.npy"), acorn_jfinv_mean)
-
-# save_heatmap(cebra_jf_mean, os.path.join(IMG_DIR, "CEBRA_jf_mean.png"), "CEBRA | mean JF over 20 random trials")
-# save_heatmap(cebra_jfinv_mean, os.path.join(IMG_DIR, "CEBRA_jfinv_mean.png"), "CEBRA | mean JF-INV over 20 random trials")
-# save_heatmap(acorn_jf_mean, os.path.join(IMG_DIR, "ACORN_jf_mean.png"), "ACORN | mean JF over 20 random trials")
-# save_heatmap(acorn_jfinv_mean, os.path.join(IMG_DIR, "ACORN_jfinv_mean.png"), "ACORN | mean JF-INV over 20 random trials")
-
-# print("\nDONE")
-# print("trials used:", n_trials_used)
-# print("saved plots in:", IMG_DIR)
-# print("saved mean arrays in:", OUT_DIR)
-
-import os
+"""
+Label-ablation experiment: behavior-conditioned CEBRA vs a simple MSE encoder.
+
+For one Perich session, run four experiments:
+1) CEBRA trained with all labels -> same post-hoc decoder -> R2 all labels.
+2) CEBRA trained with first N_SUBSET_LABELS -> same post-hoc decoder -> R2 subset labels.
+3) Simple MSE encoder + same decoder trained end-to-end with all labels.
+4) Simple MSE encoder + same decoder trained end-to-end with first N_SUBSET_LABELS.
+
+Outputs:
+- model/decoder checkpoints
+- r2_summary.csv
+- r2_per_label_long.csv
+"""
+
+from __future__ import annotations
+
+import csv
 import gc
+import random
+import sys
+from pathlib import Path
+from typing import Tuple
+
 import numpy as np
 import torch
-import scipy.io as sio
-import matplotlib.pyplot as plt
-from utils.constants import CEBRA_DIR
-from utils.min_distance import min_l2_distance
-import sys
+import torch.nn as nn
+from sklearn.metrics import r2_score
+from torch.utils.data import DataLoader, TensorDataset
+
+
+# =============================================================================
+# PATHS / ORIGINAL CEBRA IMPORT
+# =============================================================================
+
+ROOT = Path(__file__).resolve().parent
+
+# User said the fork folder is CEBRA-orginal. Fallback supports the common spelling.
+_CEBRA_CANDIDATES = [ROOT / "CEBRA-orginal", ROOT / "CEBRA-original"]
+CEBRA_DIR = next((p for p in _CEBRA_CANDIDATES if p.exists()), _CEBRA_CANDIDATES[0])
+
+if not CEBRA_DIR.exists():
+    raise FileNotFoundError(
+        "Original CEBRA checkout not found. Tried:\n"
+        + "\n".join(str(p) for p in _CEBRA_CANDIDATES)
+    )
+
+for module_name in list(sys.modules):
+    if module_name == "cebra" or module_name.startswith("cebra."):
+        del sys.modules[module_name]
+
+for p in [str(x) for x in _CEBRA_CANDIDATES]:
+    while p in sys.path:
+        sys.path.remove(p)
+
 sys.path.insert(0, str(CEBRA_DIR))
+
 import cebra
 from cebra import CEBRA
 
-DATA_PATH = "./data/spk/M021519_spk.mat"
-OUT_DIR = "./outputs"
-IMG_DIR = "./image"
-os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(IMG_DIR, exist_ok=True)
-BATCH_SIZE = 256
-MAX_ITER = 10000
-OUTPUT_DIM = 16
-TRIAL_ID = 499
-PRE_MS = 500
-POST_MS = 1000
-BIN_MS = 10
+print("\nUsing ORIGINAL CEBRA:")
+print(cebra.__file__)
 
-mat = sio.loadmat(DATA_PATH, simplify_cells=True, squeeze_me=True)
-unit = mat["unit"]
-t_evt = mat["t_evt"]
-print("neurons:", len(unit))
-print("events:", t_evt.keys())
 
-def make_trial_matrix(unit, event_time, pre_ms, post_ms, bin_ms):
-    n_neurons = len(unit)
-    n_bins = int((pre_ms + post_ms) / bin_ms)
-    X = np.zeros((n_bins, n_neurons), dtype=np.float32)
-    start = event_time - pre_ms / 1000
-    end = event_time + post_ms / 1000
-    for n in range(n_neurons):
-        spikes = unit[n]["timestamps"]
-        spikes = spikes[(spikes >= start) & (spikes <= end)]
-        spikes_ms = (spikes - event_time) * 1000
-        bins = ((spikes_ms + pre_ms) / bin_ms).astype(int)
-        bins = bins[(bins >= 0) & (bins < n_bins)]
-        for b in bins:
-            X[b, n] += 1
-    return X
+# =============================================================================
+# CONFIG
+# =============================================================================
 
-stim_times = np.asarray(t_evt["stim_on"])
-trial_time = stim_times[TRIAL_ID]
-X = make_trial_matrix(unit, trial_time, PRE_MS, POST_MS, BIN_MS)
-print("X:", X.shape)
-X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
-X = X.astype(np.float32)
+PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
+TARGET_SESSION = "C-CO12"  # change this only to test another session
+N_SUBSET_LABELS = 2
+SEED = 42
 
-def train_cebra(X, adv=False):
-    mode = "adversarial" if adv else "clean"
-    eps = float(min_l2_distance(X)) / 2
-    eps = max(eps, 1e-6)
-    print("\nTraining", mode, "epsilon:", eps)
-    model = CEBRA(
-        batch_size=BATCH_SIZE,
-        temperature=0.4,
-        model_architecture="offset10-model",
-        time_offsets=10,
-        max_iterations=MAX_ITER,
-        output_dimension=OUTPUT_DIM,
-        verbose=True,
-        training_mode="adversarial" if adv else "clean",
-        adv_alpha=eps / 5 if adv else 0,
-        adv_epsilon=eps if adv else 0,
-        adv_steps=10 if adv else 0,
-        attack_norm="linf",
-        num_hidden_units=32,
-    )
-    labels = np.arange(len(X)).astype(np.float32)
-    model.fit(X, labels)
-    return model, eps
+# CEBRA
+LATENT_DIM = 64
+HIDDEN = 64
+BATCH_SIZE = 2048
+CEBRA_MAX_ITER = 3000
+TEMPERATURE = 0.4
+MODEL_ARCH = "offset36-model-more-dropout"
+DEVICE = "cuda_if_available"
+OFFSET = 1
+CONDITIONAL = "time_delta"
 
-def get_attribution(model, name):
-    encoder = model.solver_.model.to("cuda")
-    x_tensor = torch.tensor(X, dtype=torch.float32, device="cuda", requires_grad=True)
-    method = cebra.attribution.init(name="jacobian-based-batched", model=encoder, input_data=x_tensor, output_dimension=OUTPUT_DIM)
-    result = method.compute_attribution_map(batch_size=128)
-    print(result.keys())
-    jf = result["jf"]
-    jf_inv = result["jf-inv-svd"]
-    torch.save(jf, f"{OUT_DIR}/M021519_trial{TRIAL_ID}_{name}_jf.pt")
-    torch.save(jf_inv, f"{OUT_DIR}/M021519_trial{TRIAL_ID}_{name}_jf_inv.pt")
-    save_heatmap(jf, name + "_jacobian")
-    save_heatmap(jf_inv, name + "_inverse_jacobian")
-    del encoder, x_tensor
+# Shared decoder: EXACT SAME architecture in all conditions.
+DECODER_HIDDEN_DIM = 64
+DECODER_DROPOUT = 0.4
+DECODER_EPOCHS = 2500
+DECODER_BATCH_SIZE = 256
+DECODER_LR = 1e-3
+DECODER_WEIGHT_DECAY = 1e-4
+DECODER_PRINT_EVERY = 500
+
+# Simple MSE encoder.
+MSE_ENCODER_HIDDEN = 128
+MSE_ENCODER_DROPOUT = 0.2
+MSE_EPOCHS = 2500
+MSE_BATCH_SIZE = 256
+MSE_LR = 1e-3
+MSE_WEIGHT_DECAY = 1e-4
+MSE_PRINT_EVERY = 500
+
+TORCH_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+OUT_DIR = ROOT / f"LabelAblation_CEBRA_vs_MSE_{TARGET_SESSION}"
+MODELS_DIR = OUT_DIR / "models"
+CSV_SUMMARY = OUT_DIR / "r2_summary.csv"
+CSV_LONG = OUT_DIR / "r2_per_label_long.csv"
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def ensure_dirs():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def seed_all(seed: int = SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def cleanup():
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-def save_heatmap(tensor, name):
-    if torch.is_tensor(tensor):
-        arr = tensor.detach().cpu().numpy()
-    else:
-        arr = np.asarray(tensor)
-    if arr.ndim == 3:
-        arr = np.abs(arr).mean(axis=0)
-    else:
-        arr = np.abs(arr)
-    plt.figure(figsize=(10,6))
-    plt.imshow(arr, aspect="auto")
-    plt.colorbar(label="absolute attribution")
-    plt.xlabel("Neuron")
-    plt.ylabel("Latent dimension")
-    plt.title(name)
-    plt.tight_layout()
-    plt.savefig(f"{IMG_DIR}/{name}.png", dpi=300)
-    plt.close()
 
-cebra_model, eps = train_cebra(X, adv=False)
-get_attribution(cebra_model, "CEBRA")
-del cebra_model
-gc.collect()
-torch.cuda.empty_cache()
+def load_target_session():
+    path = PERICH_DATA_DIR / f"{TARGET_SESSION}.npz"
+    if not path.exists():
+        raise FileNotFoundError(path)
 
-acorn_model, eps = train_cebra(X, adv=True)
-get_attribution(acorn_model, "ACORN")
-print("\nDONE")
+    d = np.load(path, allow_pickle=True)
+    X_train = np.asarray(d["train_data"], dtype=np.float32)
+    X_test = np.asarray(d["valid_data"], dtype=np.float32)
+    Y_train = np.asarray(d["train_label"], dtype=np.float32)
+    Y_test = np.asarray(d["valid_label"], dtype=np.float32)
+
+    if X_train.ndim != 2 or X_test.ndim != 2:
+        raise ValueError(f"Expected 2D neural arrays, got {X_train.shape=} {X_test.shape=}")
+    if X_train.shape[1] != X_test.shape[1]:
+        raise ValueError("Train/test neuron count differs.")
+
+    if Y_train.ndim == 1:
+        Y_train = Y_train[:, None]
+    if Y_test.ndim == 1:
+        Y_test = Y_test[:, None]
+    if Y_train.ndim != 2 or Y_test.ndim != 2:
+        raise ValueError(f"Expected 2D labels, got {Y_train.shape=} {Y_test.shape=}")
+    if Y_train.shape[1] != Y_test.shape[1]:
+        raise ValueError("Train/test label count differs.")
+
+    if len(X_train) != len(Y_train) or len(X_test) != len(Y_test):
+        raise ValueError("Neural/label length mismatch.")
+
+    for name, arr in (("X_train", X_train), ("X_test", X_test),
+                      ("Y_train", Y_train), ("Y_test", Y_test)):
+        if not np.isfinite(arr).all():
+            raise RuntimeError(f"{name} contains NaN/Inf.")
+
+    if Y_train.shape[1] < N_SUBSET_LABELS:
+        raise ValueError(
+            f"Dataset has {Y_train.shape[1]} labels but N_SUBSET_LABELS={N_SUBSET_LABELS}."
+        )
+
+    print("\n" + "=" * 90)
+    print("DATA")
+    print("=" * 90)
+    print("session :", TARGET_SESSION)
+    print("X_train :", X_train.shape)
+    print("X_test  :", X_test.shape)
+    print("Y_train :", Y_train.shape)
+    print("Y_test  :", Y_test.shape)
+    print("subset labels:", list(range(N_SUBSET_LABELS)))
+
+    return X_train, X_test, Y_train, Y_test
+
+
+def align_embedding_and_labels(Z: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    n = min(len(Z), len(Y))
+    return Z[:n], Y[:n]
+
+
+def compute_r2(Y_true: np.ndarray, Y_pred: np.ndarray):
+    r2_each = np.asarray(
+        r2_score(Y_true, Y_pred, multioutput="raw_values"),
+        dtype=float,
+    )
+    return r2_each, float(np.mean(r2_each))
+
+
+# =============================================================================
+# SAME DECODER FOR EVERY CONDITION
+# =============================================================================
+
+class TwoLayerMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def train_shared_decoder(display_name, Z_train, Z_test, Y_train, Y_test, save_path):
+    Z_train, Ytr = align_embedding_and_labels(Z_train, Y_train)
+    Z_test, Yte = align_embedding_and_labels(Z_test, Y_test)
+
+    seed_all(SEED)
+    decoder = TwoLayerMLP(
+        input_dim=Z_train.shape[1],
+        hidden_dim=DECODER_HIDDEN_DIM,
+        output_dim=Ytr.shape[1],
+        dropout_rate=DECODER_DROPOUT,
+    ).to(TORCH_DEVICE)
+
+    ds = TensorDataset(
+        torch.from_numpy(Z_train.astype(np.float32)),
+        torch.from_numpy(Ytr.astype(np.float32)),
+    )
+    g = torch.Generator().manual_seed(SEED)
+    loader = DataLoader(
+        ds,
+        batch_size=DECODER_BATCH_SIZE,
+        shuffle=True,
+        drop_last=False,
+        num_workers=0,
+        generator=g,
+    )
+
+    opt = torch.optim.Adam(
+        decoder.parameters(),
+        lr=DECODER_LR,
+        weight_decay=DECODER_WEIGHT_DECAY,
+    )
+    loss_fn = nn.MSELoss()
+
+    print(f"\nDecoder {display_name}: {DECODER_EPOCHS} epochs")
+    for epoch in range(1, DECODER_EPOCHS + 1):
+        decoder.train()
+        for xb, yb in loader:
+            xb = xb.to(TORCH_DEVICE)
+            yb = yb.to(TORCH_DEVICE)
+            opt.zero_grad(set_to_none=True)
+            loss = loss_fn(decoder(xb), yb)
+            loss.backward()
+            opt.step()
+        if epoch == 1 or epoch % DECODER_PRINT_EVERY == 0 or epoch == DECODER_EPOCHS:
+            print(f"{display_name}: decoder epoch {epoch}/{DECODER_EPOCHS}")
+
+    decoder.eval()
+    with torch.no_grad():
+        pred = decoder(torch.from_numpy(Z_test.astype(np.float32)).to(TORCH_DEVICE)).cpu().numpy()
+
+    r2_each, mean_r2 = compute_r2(Yte, pred)
+    torch.save(decoder.state_dict(), save_path)
+
+    print(f"{display_name} R2 per label:", r2_each)
+    print(f"{display_name} Mean R2 = {mean_r2:.6f}")
+
+    del decoder, opt
+    cleanup()
+    return r2_each, mean_r2
+
+
+# =============================================================================
+# CEBRA CONDITIONS
+# =============================================================================
+
+def build_cebra():
+    return CEBRA(
+        batch_size=BATCH_SIZE,
+        temperature=TEMPERATURE,
+        model_architecture=MODEL_ARCH,
+        time_offsets=OFFSET,
+        conditional=CONDITIONAL,
+        max_iterations=CEBRA_MAX_ITER,
+        output_dimension=LATENT_DIM,
+        num_hidden_units=HIDDEN,
+        device=DEVICE,
+        verbose=True,
+    )
+
+
+def run_cebra(condition_name, X_train, X_test, Y_train_cond, Y_test_cond):
+    print("\n" + "#" * 100)
+    print(f"CEBRA -- {condition_name}")
+    print("#" * 100)
+    print("labels used during CEBRA training:", Y_train_cond.shape[1])
+
+    seed_all(SEED)
+    model = build_cebra()
+    model.fit(X_train, Y_train_cond)
+
+    model_path = MODELS_DIR / f"cebra_{condition_name}.pt"
+    model.save(str(model_path))
+
+    Z_train = np.asarray(model.transform(X_train.astype(np.float32)), dtype=np.float32)
+    Z_test = np.asarray(model.transform(X_test.astype(np.float32)), dtype=np.float32)
+
+    r2_each, mean_r2 = train_shared_decoder(
+        f"CEBRA {condition_name}",
+        Z_train,
+        Z_test,
+        Y_train_cond,
+        Y_test_cond,
+        MODELS_DIR / f"cebra_{condition_name}_decoder.pt",
+    )
+
+    del model
+    cleanup()
+    return {
+        "method": "CEBRA",
+        "condition": condition_name,
+        "n_train_labels": int(Y_train_cond.shape[1]),
+        "r2_each": r2_each,
+        "mean_r2": mean_r2,
+    }
+
+
+# =============================================================================
+# SIMPLE MSE ENCODER + SAME DECODER
+# =============================================================================
+
+class SimpleEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim, dropout_rate):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MSEEncoderWithDecoder(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.encoder = SimpleEncoder(
+            input_dim=input_dim,
+            hidden_dim=MSE_ENCODER_HIDDEN,
+            latent_dim=LATENT_DIM,
+            dropout_rate=MSE_ENCODER_DROPOUT,
+        )
+        # SAME decoder class/architecture as CEBRA uses.
+        self.decoder = TwoLayerMLP(
+            input_dim=LATENT_DIM,
+            hidden_dim=DECODER_HIDDEN_DIM,
+            output_dim=output_dim,
+            dropout_rate=DECODER_DROPOUT,
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
+def run_mse(condition_name, X_train, X_test, Y_train_cond, Y_test_cond):
+    print("\n" + "#" * 100)
+    print(f"SIMPLE MSE ENCODER -- {condition_name}")
+    print("#" * 100)
+    print("labels used during MSE training:", Y_train_cond.shape[1])
+
+    seed_all(SEED)
+    model = MSEEncoderWithDecoder(
+        input_dim=X_train.shape[1],
+        output_dim=Y_train_cond.shape[1],
+    ).to(TORCH_DEVICE)
+
+    ds = TensorDataset(
+        torch.from_numpy(X_train.astype(np.float32)),
+        torch.from_numpy(Y_train_cond.astype(np.float32)),
+    )
+    g = torch.Generator().manual_seed(SEED)
+    loader = DataLoader(
+        ds,
+        batch_size=MSE_BATCH_SIZE,
+        shuffle=True,
+        drop_last=False,
+        num_workers=0,
+        generator=g,
+    )
+
+    opt = torch.optim.Adam(
+        model.parameters(),
+        lr=MSE_LR,
+        weight_decay=MSE_WEIGHT_DECAY,
+    )
+    loss_fn = nn.MSELoss()
+
+    for epoch in range(1, MSE_EPOCHS + 1):
+        model.train()
+        for xb, yb in loader:
+            xb = xb.to(TORCH_DEVICE)
+            yb = yb.to(TORCH_DEVICE)
+            opt.zero_grad(set_to_none=True)
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            opt.step()
+        if epoch == 1 or epoch % MSE_PRINT_EVERY == 0 or epoch == MSE_EPOCHS:
+            print(f"MSE {condition_name}: epoch {epoch}/{MSE_EPOCHS}")
+
+    model.eval()
+    with torch.no_grad():
+        pred = model(torch.from_numpy(X_test.astype(np.float32)).to(TORCH_DEVICE)).cpu().numpy()
+
+    r2_each, mean_r2 = compute_r2(Y_test_cond, pred)
+
+    torch.save(model.encoder.state_dict(), MODELS_DIR / f"mse_{condition_name}_encoder.pt")
+    torch.save(model.decoder.state_dict(), MODELS_DIR / f"mse_{condition_name}_decoder.pt")
+
+    print(f"MSE {condition_name} R2 per label:", r2_each)
+    print(f"MSE {condition_name} Mean R2 = {mean_r2:.6f}")
+
+    del model, opt
+    cleanup()
+    return {
+        "method": "MSE_ENCODER",
+        "condition": condition_name,
+        "n_train_labels": int(Y_train_cond.shape[1]),
+        "r2_each": r2_each,
+        "mean_r2": mean_r2,
+    }
+
+
+# =============================================================================
+# RESULTS
+# =============================================================================
+
+def save_results(results):
+    max_labels = max(len(r["r2_each"]) for r in results)
+
+    with CSV_SUMMARY.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            ["session", "method", "condition", "n_train_labels", "mean_r2"]
+            + [f"r2_label_{i}" for i in range(max_labels)]
+        )
+        for r in results:
+            vals = r["r2_each"].tolist() + [""] * (max_labels - len(r["r2_each"]))
+            w.writerow([
+                TARGET_SESSION,
+                r["method"],
+                r["condition"],
+                r["n_train_labels"],
+                r["mean_r2"],
+            ] + vals)
+
+    with CSV_LONG.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["session", "method", "condition", "n_train_labels", "label_index", "r2"])
+        for r in results:
+            for i, value in enumerate(r["r2_each"]):
+                w.writerow([
+                    TARGET_SESSION,
+                    r["method"],
+                    r["condition"],
+                    r["n_train_labels"],
+                    i,
+                    float(value),
+                ])
+
+    print("\nsaved:", CSV_SUMMARY)
+    print("saved:", CSV_LONG)
+
+
+def print_final(results):
+    print("\n" + "=" * 115)
+    print("FINAL TEST R2")
+    print("=" * 115)
+    for r in results:
+        print(
+            f"{r['method']:<12} | {r['condition']:<12} | "
+            f"n_labels={r['n_train_labels']:<3} | mean={r['mean_r2']:.6f} | "
+            f"per-label={np.array2string(r['r2_each'], precision=4)}"
+        )
+    print("=" * 115)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    ensure_dirs()
+    seed_all(SEED)
+
+    X_train, X_test, Y_train, Y_test = load_target_session()
+
+    Y_train_2 = Y_train[:, :N_SUBSET_LABELS].copy().astype(np.float32)
+    Y_test_2 = Y_test[:, :N_SUBSET_LABELS].copy().astype(np.float32)
+    Y_train_all = Y_train.copy().astype(np.float32)
+    Y_test_all = Y_test.copy().astype(np.float32)
+
+    print("\nConditions:")
+    print(f"first_{N_SUBSET_LABELS}: {N_SUBSET_LABELS} labels")
+    print(f"all_labels: {Y_train.shape[1]} labels")
+
+    results = []
+
+    # CEBRA with first 2 labels.
+    results.append(run_cebra(
+        f"first_{N_SUBSET_LABELS}",
+        X_train,
+        X_test,
+        Y_train_2,
+        Y_test_2,
+    ))
+
+    # CEBRA with all labels.
+    results.append(run_cebra(
+        "all_labels",
+        X_train,
+        X_test,
+        Y_train_all,
+        Y_test_all,
+    ))
+
+    # Simple MSE encoder with first 2 labels.
+    results.append(run_mse(
+        f"first_{N_SUBSET_LABELS}",
+        X_train,
+        X_test,
+        Y_train_2,
+        Y_test_2,
+    ))
+
+    # Simple MSE encoder with all labels.
+    results.append(run_mse(
+        "all_labels",
+        X_train,
+        X_test,
+        Y_train_all,
+        Y_test_all,
+    ))
+
+    save_results(results)
+    print_final(results)
+
+
+if __name__ == "__main__":
+    main()
