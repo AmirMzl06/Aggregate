@@ -378,8 +378,10 @@ class NeuralJigsaw:
         rng = np.random.default_rng(self.random_state)
         generator = torch.Generator().manual_seed(self.random_state)
         # self._augment_generator_ = torch.Generator().manual_seed(self.random_state + 1)
-        self._augment_generator_ = torch.Generator(device=self.device_).manual_seed(self.random_state + 1)
+        self._augment_generator_ = None
         self._build(sequences[0].shape[1])
+        self._augment_generator_ = torch.Generator(device=self.device_).manual_seed(self.random_state + 1)
+       
         # Per-channel std of the TRAINING data only, used to scale augmentation
         # noise in physically meaningful (relative) units; never touches test data.
         concatenated = np.concatenate(sequences, axis=0)
