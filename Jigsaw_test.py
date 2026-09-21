@@ -559,7 +559,7 @@ def print_table(summary, baseline):
 
 # --------------------------------------------------------------------------- #
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+    parser = argparse.ArgumentParser(description="JigsawCEBRA experiments",
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--session", default="C-CO16")
     parser.add_argument("--data-dir", default=str(PERICH_DATA_DIR))
