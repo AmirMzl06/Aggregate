@@ -65,7 +65,7 @@ PUZZLE_DROPOUT = 0.1
 AUGMENT_GAIN_JITTER = 0.1
 AUGMENT_NOISE_STD = 0.05
 PERMUTATIONS_PER_WINDOW = 1
-DEVICE = "cuda_if_available"
+DEVICE = "cuda"
 
 # --- monitor_fn: closed-form ridge probe on held-out validation embeddings, ---
 # --- called periodically during fit() so the CHECKPOINT is picked by       ---
