@@ -68,7 +68,7 @@ print(cebra.__file__)
 
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 TARGET_SESSION = "C-CO12"  # change this only to test another session
-N_SUBSET_LABELS = 2
+N_SUBSET_LABELS = 1
 SEED = 42
 
 # CEBRA
