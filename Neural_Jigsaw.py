@@ -1,107 +1,78 @@
-"""Jigsaw-CEBRA: temporal order as a NUISANCE-CARVING side task, not a representation.
+"""JigsawNet: a self-supervised neural encoder trained ONLY with cross-entropy.
 
-Requires NumPy and PyTorch >= 2.0 (nn.Dropout1d needs torch >= 1.12; set
-dropout=0.0 if you are stuck on something older). Inputs are (time, neurons)
-float arrays.
+No contrastive learning. No InfoNCE. No positive/negative pairs. No temperature.
+No dependency on, and no objective borrowed from, time-contrastive embedding
+methods. Every loss in this file is torch cross_entropy or
+binary_cross_entropy_with_logits on a task with a hard, known-correct label.
 
-    from jigsaw_cebra import JigsawCEBRA
-    model = JigsawCEBRA(window_size=10, n_tiles=4, tile_gap=(1, 8),
-                        behavior_dim=32, puzzle_dim=16, max_epochs=30)
+    from jigsaw_net import JigsawNet
+    model = JigsawNet(window_size=10, n_tiles=4, max_epochs=60)
     model.fit(X_train, X_valid=X_valid)
-    Z = model.transform(X_valid, block="behavior")      # use THIS for decoding
-    print(model.evaluate_puzzle(X_valid))
+    Z = model.transform(X_valid)                    # decode THIS
+    print(model.evaluate_pretext(X_valid))
     print(model.evaluate_decoding(X_train, Y_train, X_valid, Y_valid))
 
-WHY THIS DIFFERS FROM A PLAIN TEMPORAL JIGSAW
----------------------------------------------
-A pure temporal-jigsaw objective tends to make downstream decoding WORSE than a
-random encoder. Three mechanisms, and the structural answer to each:
+THE TWO TASKS (both cross-entropy)
+----------------------------------
+1. ORDER (the jigsaw). K intact, chronological, nonoverlapping tiles are cut
+   from one span. Two readouts share a permutation-equivariant DeepSets token:
+     - position CE : K-way softmax per tile, "which slot in time is this?".
+       Chance 1/K. Scales to any K, unlike a K!-way label which explodes and is
+       memorizable (24 classes is a lookup table; 4 classes x 4 tiles is not).
+     - pair BCE    : for every ordered pair, "did i come before j?". Chance 50%,
+       which is a far higher-powered test than 1/24 = 4.17%.
+2. FORECAST (why this one exists). From each tile's embedding, predict the
+   QUANTIZED activity of the bin immediately AFTER that tile, per neuron, with
+   cross-entropy over count bins. The target bin is always inside the discarded
+   gap, so it never leaks into another tile.
 
-1. Objective conflict. Time-contrastive learning wants the latent INVARIANT to
-   small temporal shifts; a jigsaw head wants it EQUIVARIANT to exact temporal
-   position. On a continuous neural trajectory these are the same information,
-   so the two objectives fight over one latent. Answer: the latent is SPLIT into
-   z_behavior and z_puzzle, produced by two projectors on one shared trunk. Only
-   z_puzzle feeds the puzzle head; only z_behavior feeds the contrastive loss and
-   is the default output of transform. A cross-block decorrelation penalty pushes
-   order/phase nuisance OUT of z_behavior. The jigsaw stops being the
-   representation objective and becomes a place to PUT nuisance.
-2. Shortcuts. Tile order is recoverable from slow drift in overall level, so the
-   head learns a nonstationarity detector that does not transfer. Answer: the
-   puzzle branch sees per-tile normalized tiles (tile_norm), independent
-   per-tile augmentation (neuron dropout / gain jitter / noise), random gaps,
-   and an optional shortcut filter that down-weights quartets whose order the
-   trivial "sort by mean activity" baseline already gets right. evaluate_puzzle
-   always reports that baseline next to the model.
-3. Train/test input mismatch. Heads that classify a permutation from a SHUFFLED
-   input train the encoder almost exclusively on non-physical inputs, while
-   transform only ever sees natural windows. Answer: tiles are always intact and
-   chronological; the head is permutation-EQUIVARIANT, so shuffling is provably
-   unnecessary (shuffle_tiles=True is kept only as a parity check, and the
-   self-test proves the loss is invariant to it).
+Task 2 is load-bearing. A pure order task gives the encoder no reason to keep
+absolute firing rate, and absolute rate is usually the dominant behavior-coding
+feature; that is how pretext training ends up BELOW a random encoder. Forecasting
+quantized counts cannot be solved without representing level, so it pins rate
+information into the trunk while the order task carves temporal structure.
 
-THE HEAD
---------
-Each tile's z_puzzle plus a mean-pooled set context (DeepSets, permutation
-invariant) becomes a token. Two low-capacity relational readouts share it:
-  - "assign": token . position_embedding -> (K,K) logits, log-domain Sinkhorn
-    normalization, NLL of the true slot->position assignment. Soft bijection.
-  - "rank":   token -> one scalar time score, Bradley-Terry / RankNet pairwise
-    logistic loss over all tile pairs. Gives an interpretable 1-D time axis.
-Both are equivariant in the slot index and agnostic to n_tiles, so K=6 or 8 is a
-strictly harder pretext at no code change. Neither can memorize a 24-way label.
+NO L2 NORMALIZATION BY DEFAULT. normalize=True projects the embedding onto a
+hypersphere and throws away magnitude. If ridge on the raw window beats your
+embedding, this is the first thing to check. Left available as an ablation only.
 
-THE TRUNK
----------
-trunk_block="residual" is a plain valid-convolution residual stack.
-trunk_block="separable" is a MobileNetV2-style inverted residual: 1x1 expand,
-GELU, DEPTHWISE 3-tap temporal convolution, GELU, 1x1 linear projection. On
-population recordings that factorization is the useful part of MobileNet: each
-channel gets its own temporal filter and mixing across neurons happens only in
-the pointwise layers (the same decomposition EEGNet uses). It is NOT a
-robustness fix by itself -- a shortcut that is linearly available stays
-available -- but it is cheaper per parameter and a fair ablation to run. Both
-blocks consume exactly two bins, so the receptive field stays window_size.
+SHORTCUTS. Tile order is recoverable from slow drift in overall level, so the
+order head can become a nonstationarity detector that does not transfer. The
+order branch therefore sees per-tile normalized tiles (tile_norm) plus
+independent per-tile augmentation and random gaps. The forecast branch sees the
+RAW view, because it is supposed to see level. evaluate_pretext always reports
+the trivial "sort by mean activity" baseline next to the model.
 
-DIAGNOSTIC CONTROLS BUILT IN (all reachable from the constructor)
-  lambda_puzzle=0.0     -> pure time-contrastive CEBRA-style baseline
-  lambda_infonce=0.0    -> pure jigsaw (reproduces the failure mode on purpose)
-  max_epochs=0          -> frozen random-encoder control
-  puzzle_grad_scale=0.0 -> puzzle head trained on a trunk it cannot influence;
-                           a probe for "is order even decodable from behavior
-                           features", with zero risk to R2
-  puzzle_warmup_fraction / lambda_puzzle -> the InfoNCE head start and the
-                           side-task weight; anneal these before anything else
-Report puzzle accuracy AND the mean-sort baseline AND decoding R2 together.
-InfoNCE accuracy is logged every epoch: if it is near 100% the positive pair is
-solvable from window identity and the embedding will carry no behavior. Tiles
-are separated by at least one discarded bin, so anchor and positive windows can
-never overlap - the usual cause of that failure.
+TRUNK. trunk_block="residual" is a valid-convolution residual stack with
+receptive field exactly window_size. trunk_block="separable" is a
+MobileNetV2-style inverted residual (1x1 expand, GELU, DEPTHWISE 3-tap temporal
+conv, GELU, 1x1 project): each neuron gets its own temporal filter and mixing
+across neurons happens only in the pointwise layers, the decomposition EEGNet
+uses. It is not a shortcut fix -- a linearly available shortcut stays available
+-- but it is cheap and a fair ablation. Both blocks consume exactly two bins.
 
-Time alignment. transform runs the trunk on natural windows with NO augmentation
-and NO tile normalization. pad=False aligns the window starting at j with label
-j + window_size//2; pad=True edge-pads per sequence and returns one row per
-input bin. Contexts are noncausal and centered.
+CONTROLS (all from the constructor)
+  max_epochs=0        -> frozen random-encoder control. Your embedding must beat
+                         this or training is destroying information.
+  lambda_order=0.0    -> forecast only
+  lambda_forecast=0.0 -> pure jigsaw (reproduces the known failure mode)
+  order_grad_scale=0  -> order head trains on a trunk it cannot influence; asks
+                         "is order decodable?" with zero risk to R2
+  normalize=True      -> the sphere ablation
+Always report pretext accuracy AND the mean-sort baseline AND decoding R2 AND
+ridge on the raw window. Pretext accuracy alone proves nothing.
 
-Split recordings BEFORE fit. A single 2D array is one continuous recording; pass
-a list of trial arrays to avoid crossing trials. fit always resets weights. One
-epoch visits every valid span start once in random order with fresh gaps.
-Each fit/evaluate sequence needs at least training_span bins; transform needs
-window_size (or 1 with pad=True).
+ALIGNMENT. transform uses natural windows, no augmentation, no tile
+normalization, no masking. pad=False aligns the window starting at j with label
+j + window_size//2. pad=True edge-pads and returns one row per input bin.
 
-Save/load stores weights and config, not optimizer state, so runs cannot resume.
-Puzzle accuracy is not evidence of behavioral usefulness: the only claim this
-module supports is the one you get from evaluate_decoding against the
-lambda_puzzle=0 and max_epochs=0 arms on the SAME split.
+Split recordings BEFORE fit: a 2D array is one continuous recording; pass a list
+of trial arrays to avoid crossing trials. fit always resets weights.
 
-Inspired by Noroozi & Favaro (2016), arXiv:1603.09246, and by the multiobjective
-block structure of xCEBRA. Sinkhorn assignment follows Mena et al. (2018),
-arXiv:1802.08665.
-
-Self-test:  python jigsaw_cebra.py --self-test
-Ablation demo on synthetic data with a known latent:  python jigsaw_cebra.py --demo
+Self-test:  python jigsaw_net.py --self-test
+Demo:       python jigsaw_net.py --demo
 """
-from itertools import permutations
+import argparse
 import copy
 import math
 import numbers
@@ -113,14 +84,12 @@ from torch import nn
 from torch.nn import functional as F
 
 _EPS = 1e-8
-
 TILE_NORMS = ("none", "mean", "zscore", "global_mean")
-PUZZLE_HEADS = ("assign", "rank", "both")
 TRUNK_BLOCKS = ("residual", "separable")
 
 
 # --------------------------------------------------------------------------- #
-# validation helpers
+# validation
 # --------------------------------------------------------------------------- #
 def _integer(name, value, minimum=1, maximum=None):
     if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < minimum:
@@ -134,8 +103,7 @@ def _real(name, value, minimum, maximum=None, strict_min=False):
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError(f"{name} must be a real number; got {value!r}.")
     value = float(value)
-    if (not math.isfinite(value) or value < minimum
-            or (strict_min and value == minimum)
+    if (not math.isfinite(value) or value < minimum or (strict_min and value == minimum)
             or (maximum is not None and value > maximum)):
         raise ValueError(f"Invalid {name}: {value}.")
     return value
@@ -147,47 +115,38 @@ def _boolean(name, value):
     return value
 
 
-def _sequences(X, min_length, n_features=None):
-    """Accept one (T,C) array, or a list of (T_i,C) arrays, without joining trials."""
-    def array(value):
-        if torch.is_tensor(value):
-            value = value.detach().to(device="cpu", dtype=torch.float32).numpy()
-        return np.asarray(value, dtype=np.float32)
-
-    is_list = (isinstance(X, (list, tuple)) and len(X) > 0 and array(X[0]).ndim == 2)
-    values = list(X) if is_list else [X]
-    result = []
-    for index, value in enumerate(values):
-        x = array(value)
-        if x.ndim != 2 or x.shape[0] < min_length or x.shape[1] < 1:
-            raise ValueError(
-                f"Sequence {index}: expected (T,C) with T >= {min_length}, C >= 1; got {x.shape}.")
-        if not np.isfinite(x).all():
-            raise ValueError(f"Sequence {index} contains NaN or infinite values.")
-        if n_features is None:
-            n_features = x.shape[1]
-        if x.shape[1] != n_features:
-            raise ValueError(f"Sequence {index}: expected {n_features} channels, got {x.shape[1]}.")
-        # Own the storage: training must never modify the caller's data.
-        result.append(np.array(x, dtype=np.float32, order="C", copy=True))
-    return result, is_list
-
-
-def _permutation_table(n_tiles):
-    """All permutations for small K, else None (greedy assignment fallback)."""
-    return np.asarray(list(permutations(range(n_tiles))), dtype=np.int64) if n_tiles <= 7 else None
+def _sequences(X, minimum_length, n_features=None):
+    is_list = isinstance(X, (list, tuple))
+    items = list(X) if is_list else [X]
+    if not items:
+        raise ValueError("X is empty.")
+    out = []
+    for i, item in enumerate(items):
+        array = np.ascontiguousarray(np.asarray(item, dtype=np.float32))
+        if array.ndim != 2:
+            raise ValueError(f"Sequence {i} must be 2D (time, neurons); got {array.shape}.")
+        if not np.isfinite(array).all():
+            raise ValueError(f"Sequence {i} contains NaN or Inf.")
+        if len(array) < minimum_length:
+            raise ValueError(f"Sequence {i} has {len(array)} bins; needs >= {minimum_length}.")
+        if n_features is not None and array.shape[1] != n_features:
+            raise ValueError(f"Sequence {i} has {array.shape[1]} neurons; expected {n_features}.")
+        out.append(array)
+    if n_features is None and len({a.shape[1] for a in out}) != 1:
+        raise ValueError("All sequences must have the same number of neurons.")
+    return out, is_list
 
 
 # --------------------------------------------------------------------------- #
 # modules
 # --------------------------------------------------------------------------- #
 class _GradScale(torch.autograd.Function):
-    """Identity forward, gradient multiplied by `scale` on the way back."""
+    """Straight-through forward, scaled gradient backward."""
 
     @staticmethod
     def forward(ctx, x, scale):
         ctx.scale = float(scale)
-        return x.view_as(x)
+        return x
 
     @staticmethod
     def backward(ctx, grad):
@@ -195,9 +154,15 @@ class _GradScale(torch.autograd.Function):
 
 
 class _Residual(nn.Module):
+    """Valid 3-tap residual block; consumes exactly two bins."""
+
     def __init__(self, width, dropout):
         super().__init__()
-        self.net = nn.Sequential(nn.Dropout1d(dropout), nn.Conv1d(width, width, 3), nn.GELU())
+        self.net = nn.Sequential(
+            nn.Dropout1d(dropout) if dropout > 0 else nn.Identity(),
+            nn.Conv1d(width, width, 3), nn.GELU(),
+            nn.Conv1d(width, width, 1),
+        )
 
     def forward(self, x):
         return x[..., 1:-1] + self.net(x)
@@ -207,16 +172,14 @@ class _Separable(nn.Module):
     """MobileNetV2-style inverted residual with a VALID depthwise 3-tap conv.
 
     1x1 expand -> GELU -> depthwise temporal conv -> GELU -> 1x1 linear project.
-    Temporal filtering is per channel, cross-neuron mixing happens only in the
-    pointwise layers. Consumes exactly two bins, like _Residual, so the trunk's
-    receptive-field arithmetic is unchanged.
+    Consumes exactly two bins, like _Residual, so trunk arithmetic is unchanged.
     """
 
     def __init__(self, width, dropout, expansion=4):
         super().__init__()
-        hidden = max(width, width * expansion)
+        hidden = width * expansion
         self.net = nn.Sequential(
-            nn.Dropout1d(dropout),
+            nn.Dropout1d(dropout) if dropout > 0 else nn.Identity(),
             nn.Conv1d(width, hidden, 1), nn.GELU(),
             nn.Conv1d(hidden, hidden, 3, groups=hidden), nn.GELU(),
             nn.Conv1d(hidden, width, 1),
@@ -227,18 +190,18 @@ class _Separable(nn.Module):
 
 
 class _Trunk(nn.Module):
-    """Valid-convolution stack with receptive field exactly window_size."""
+    """Valid-convolution stack whose receptive field is exactly window_size."""
 
     def __init__(self, channels, window_size, width, dropout, block="residual"):
         super().__init__()
         if block not in TRUNK_BLOCKS:
             raise ValueError(f"trunk_block must be one of {TRUNK_BLOCKS}.")
-        # Sum(kernel - 1) = W - 1, hence W input bins -> exactly one output bin.
         first_kernel = 2 if window_size % 2 == 0 else 3
         blocks = (window_size - first_kernel - 2) // 2
         make = _Residual if block == "residual" else _Separable
         self.layers = nn.Sequential(
-            nn.Conv1d(channels, width, first_kernel), nn.Dropout1d(dropout), nn.GELU(),
+            nn.Conv1d(channels, width, first_kernel),
+            nn.Dropout1d(dropout) if dropout > 0 else nn.Identity(), nn.GELU(),
             *[make(width, dropout) for _ in range(blocks)],
             nn.Conv1d(width, width, 3), nn.GELU(),
         )
@@ -251,156 +214,109 @@ class _Trunk(nn.Module):
 
 
 class _Encoder(nn.Module):
-    """Shared trunk, two projectors: z_behavior and z_puzzle, normalized per block."""
-
-    def __init__(self, channels, window_size, width, behavior_dim, puzzle_dim,
-                 dropout, normalize, trunk_block="residual"):
+    def __init__(self, channels, window_size, width, output_dimension, dropout,
+                 normalize, trunk_block):
         super().__init__()
         self.trunk = _Trunk(channels, window_size, width, dropout, trunk_block)
-        self.project_behavior = nn.Linear(width, behavior_dim)
-        self.project_puzzle = nn.Linear(width, puzzle_dim)
+        self.project = nn.Linear(width, output_dimension)
         self.normalize = normalize
 
-    def _maybe_normalize(self, z):
-        return F.normalize(z, p=2, dim=-1, eps=_EPS) if self.normalize else z
-
-    def features(self, x):
-        return self.trunk(x)
-
-    def behavior(self, features):
-        return self._maybe_normalize(self.project_behavior(features))
-
-    def puzzle(self, features):
-        return self._maybe_normalize(self.project_puzzle(features))
-
     def forward(self, x):
-        features = self.features(x)
-        return self.behavior(features), self.puzzle(features)
+        z = self.project(self.trunk(x))
+        return F.normalize(z, dim=-1) if self.normalize else z
 
 
-class _PuzzleHead(nn.Module):
-    """Permutation-equivariant relational head over K tile latents.
+class _OrderHead(nn.Module):
+    """Permutation-equivariant DeepSets head. Two cross-entropy readouts.
 
-    Token i = MLP([z_i, mean_j z_j]). The context is mean-pooled, hence
-    permutation invariant, so permuting the tile axis permutes exactly the rows
-    of `logits` and the entries of `scores`, and nothing else.
+    position : K-way logits per tile, "which time slot is this tile?"
+    pair     : one scalar per tile; their difference is the before/after logit.
     """
 
     def __init__(self, dimension, hidden, n_tiles):
         super().__init__()
-        self.hidden = hidden
-        self.token = nn.Sequential(nn.Linear(2 * dimension, hidden), nn.GELU(),
-                                   nn.Linear(hidden, hidden))
-        self.position = nn.Parameter(torch.randn(n_tiles, hidden) / math.sqrt(hidden))
+        self.body = nn.Sequential(nn.Linear(2 * dimension, hidden), nn.GELU(),
+                                  nn.Linear(hidden, hidden), nn.GELU())
+        self.position = nn.Linear(hidden, n_tiles)
         self.score = nn.Linear(hidden, 1)
 
     def forward(self, z):
-        if z.ndim != 3:
-            raise ValueError("Puzzle head expects (batch, n_tiles, dimension).")
         context = z.mean(dim=1, keepdim=True).expand_as(z)
-        tokens = self.token(torch.cat((z, context), dim=2))
-        logits = tokens @ self.position.t() / math.sqrt(self.hidden)
-        return logits, self.score(tokens).squeeze(-1)
+        tokens = self.body(torch.cat((z, context), dim=-1))
+        return self.position(tokens), self.score(tokens).squeeze(-1)
+
+
+class _ForecastHead(nn.Module):
+    """Per-neuron cross-entropy over quantized activity of the next bin."""
+
+    def __init__(self, dimension, hidden, channels, levels):
+        super().__init__()
+        self.channels, self.levels = channels, levels
+        self.net = nn.Sequential(nn.Linear(dimension, hidden), nn.GELU(),
+                                 nn.Linear(hidden, channels * levels))
+
+    def forward(self, z):
+        return self.net(z).reshape(-1, self.channels, self.levels)
 
 
 # --------------------------------------------------------------------------- #
-# tile construction, augmentation, normalization
+# functional pieces
 # --------------------------------------------------------------------------- #
 def _gather_tiles(data, starts, gaps, window_size):
-    """data (T,N) -> (B,K,N,W). gaps counts DISCARDED bins between tiles."""
-    zero = torch.zeros((starts.shape[0], 1), dtype=torch.long, device=data.device)
-    offsets = torch.cat((zero, torch.cumsum(gaps + window_size, dim=1)), dim=1)
-    index = (starts[:, None] + offsets)[:, :, None] + torch.arange(window_size, device=data.device)
-    return data[index].permute(0, 1, 3, 2).contiguous()
+    """(B,K,N,W) tiles plus the index of the bin right after each tile."""
+    offsets = torch.cat((torch.zeros_like(gaps[:, :1]),
+                         torch.cumsum(gaps + window_size, dim=1)), dim=1)
+    tile_starts = starts[:, None] + offsets
+    index = tile_starts[:, :, None] + torch.arange(window_size, device=data.device)
+    return data[index].permute(0, 1, 3, 2), tile_starts + window_size
 
 
-def _augment(tiles, neuron_dropout, gain_jitter, noise, generator):
-    """Independent per (sample, tile): whole-neuron dropout, gain, additive noise."""
-    shape = tiles.shape[:3]
-    out = tiles
+def _augment(tiles, neuron_dropout, gain_jitter, generator):
     if neuron_dropout > 0:
-        keep = torch.rand(shape, device=tiles.device, generator=generator) >= neuron_dropout
-        out = out * keep.to(tiles.dtype)[..., None]
+        keep = (torch.rand(tiles.shape[:3], device=tiles.device, generator=generator)
+                >= neuron_dropout).to(tiles.dtype)
+        tiles = tiles * keep[..., None]
     if gain_jitter > 0:
-        gain = 1 + (2 * torch.rand(shape, device=tiles.device, generator=generator) - 1) * gain_jitter
-        out = out * gain[..., None]
-    if noise > 0:
-        out = out + noise * torch.randn(tiles.shape, device=tiles.device, generator=generator)
-    return out
+        gain = 1.0 + gain_jitter * (2 * torch.rand(tiles.shape[:3], device=tiles.device,
+                                                   generator=generator) - 1)
+        tiles = tiles * gain[..., None]
+    return tiles
 
 
 def _tile_normalize(tiles, mode):
-    """Remove the per-tile level so tile order is not recoverable from drift."""
     if mode == "none":
         return tiles
+    if mode == "mean":
+        return tiles - tiles.mean(dim=3, keepdim=True)
     if mode == "global_mean":
         return tiles - tiles.mean(dim=(2, 3), keepdim=True)
-    centered = tiles - tiles.mean(dim=3, keepdim=True)
-    if mode == "mean":
-        return centered
     if mode == "zscore":
-        return centered / (tiles.std(dim=3, keepdim=True, unbiased=False) + 1e-5)
-    raise ValueError(f"Unknown tile_norm {mode!r}; expected one of {TILE_NORMS}.")
+        return (tiles - tiles.mean(dim=3, keepdim=True)) / (tiles.std(dim=3, keepdim=True) + 1e-5)
+    raise ValueError(f"tile_norm must be one of {TILE_NORMS}.")
 
 
-# --------------------------------------------------------------------------- #
-# losses and metrics
-# --------------------------------------------------------------------------- #
-def _log_sinkhorn(logits, iterations):
-    """Log-domain doubly-stochastic normalization; rows end as log-probabilities."""
-    log_alpha = logits
-    for _ in range(iterations):
-        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=2, keepdim=True)
-        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=1, keepdim=True)
-    return log_alpha - torch.logsumexp(log_alpha, dim=2, keepdim=True)
+def _pair_targets(positions):
+    """Upper-triangular before/after labels and the mask of valid pairs."""
+    difference = positions[:, :, None] - positions[:, None, :]
+    mask = torch.triu(torch.ones_like(difference, dtype=torch.bool), diagonal=1)
+    return (difference < 0).to(torch.float32), mask
 
 
-def _weighted_mean(per_sample, weight):
-    return (per_sample * weight).sum() / weight.sum().clamp_min(_EPS)
-
-
-def _assignment_loss(logits, positions, iterations, weight):
-    log_p = _log_sinkhorn(logits, iterations)
-    nll = -log_p.gather(2, positions[:, :, None]).squeeze(-1)
-    return _weighted_mean(nll.mean(dim=1), weight)
-
-
-def _rank_loss(scores, positions, weight):
-    """Bradley-Terry over all tile pairs: later tiles must score higher."""
+def _order_losses(position_logits, scores, positions):
+    """Both readouts, pure cross-entropy."""
+    n_tiles = position_logits.shape[1]
+    position_loss = F.cross_entropy(position_logits.reshape(-1, n_tiles), positions.reshape(-1))
+    target, mask = _pair_targets(positions)
     difference = scores[:, :, None] - scores[:, None, :]
-    sign = torch.sign(positions[:, :, None] - positions[:, None, :]).to(difference.dtype)
-    mask = (sign != 0).to(difference.dtype)
-    per_sample = (F.softplus(-sign * difference) * mask).sum((1, 2)) / mask.sum((1, 2)).clamp_min(1)
-    return _weighted_mean(per_sample, weight)
+    pair_loss = F.binary_cross_entropy_with_logits(difference[mask], target[mask])
+    return position_loss, pair_loss
 
 
 def _ranks(values):
-    """(B,K) values -> (B,K) integer ranks, i.e. predicted chronological position."""
     return values.argsort(dim=1).argsort(dim=1)
 
 
-def _best_assignment(logits, table):
-    """Highest-scoring bijective slot -> position map. Exact for n_tiles <= 7."""
-    n_tiles = logits.shape[1]
-    if table is not None:
-        candidates = torch.as_tensor(table, dtype=torch.long, device=logits.device)
-        rows = torch.arange(n_tiles, device=logits.device).expand(len(candidates), n_tiles)
-        scores = logits[:, rows, candidates].sum(-1)
-        return candidates[scores.argmax(dim=1)]
-    # Greedy fallback for large K: repeatedly take the best remaining (slot, position).
-    work = logits.clone()
-    result = torch.zeros(logits.shape[:2], dtype=torch.long, device=logits.device)
-    for _ in range(n_tiles):
-        flat = work.reshape(len(work), -1).argmax(dim=1)
-        slot, position = flat // n_tiles, flat % n_tiles
-        result[torch.arange(len(work), device=logits.device), slot] = position
-        work[torch.arange(len(work), device=logits.device), slot, :] = -math.inf
-        work[torch.arange(len(work), device=logits.device), :, position] = -math.inf
-    return result
-
-
 def _order_metrics(predicted, positions):
-    """Exact-permutation and pairwise-order accuracy for integer position maps."""
     exact = (predicted == positions).all(dim=1).to(torch.float32)
     truth = torch.sign(positions[:, :, None] - positions[:, None, :])
     guess = torch.sign(predicted[:, :, None] - predicted[:, None, :])
@@ -409,68 +325,30 @@ def _order_metrics(predicted, positions):
     return exact, pair
 
 
-def _infonce(z, temperature, generator):
-    """Time-contrastive InfoNCE on z_behavior (B,K,D), in-batch negatives.
-
-    Positive pair = two DIFFERENT tiles of the same span, so anchor and positive
-    windows are separated by at least one discarded bin and can never overlap.
-    Negatives = every tile of every OTHER span in the batch.
-    """
-    batch, n_tiles, dimension = z.shape
-    if batch < 2:
-        raise ValueError("InfoNCE needs at least two spans per batch.")
-    device = z.device
-    index = torch.arange(batch, device=device)
-    anchor = torch.randint(n_tiles, (batch,), device=device, generator=generator)
-    step = torch.randint(n_tiles - 1, (batch,), device=device, generator=generator)
-    positive = (anchor + 1 + step) % n_tiles
-    reference = z[index, anchor]
-    pair = z[index, positive]
-    pool = z.reshape(batch * n_tiles, dimension)
-    logits = reference @ pool.t() / temperature
-    same_span = (torch.arange(batch * n_tiles, device=device) // n_tiles)[None, :] == index[:, None]
-    logits = logits.masked_fill(same_span, -float("inf"))
-    positive_logit = (reference * pair).sum(-1, keepdim=True) / temperature
-    full = torch.cat((positive_logit, logits), dim=1)
-    loss = (-positive_logit.squeeze(1) + torch.logsumexp(full, dim=1)).mean()
-    accuracy = (full.argmax(dim=1) == 0).to(torch.float32).mean()
-    return loss, accuracy
-
-
-def _decorrelation(a, b):
-    """Mean squared cross-correlation between the two latent blocks."""
-    a = a - a.mean(0, keepdim=True)
-    b = b - b.mean(0, keepdim=True)
-    a = a / (a.std(0, unbiased=False, keepdim=True) + 1e-5)
-    b = b / (b.std(0, unbiased=False, keepdim=True) + 1e-5)
-    return ((a.t() @ b) / a.shape[0]).pow(2).mean()
-
-
 def _participation_ratio(features):
-    """(sum s)^2 / sum s^2 over covariance eigenvalues: effective dimensionality."""
     centered = features - features.mean(0, keepdims=True)
-    eigenvalues = np.linalg.eigvalsh(np.cov(centered, rowvar=False) + 1e-12 * np.eye(centered.shape[1]))
-    eigenvalues = np.clip(eigenvalues, 0, None)
-    total = eigenvalues.sum()
-    return float(total ** 2 / np.square(eigenvalues).sum()) if total > 0 else 0.0
+    values = np.linalg.eigvalsh(np.cov(centered, rowvar=False)
+                                + 1e-12 * np.eye(centered.shape[1]))
+    values = np.clip(values, 0, None)
+    total = values.sum()
+    return float(total ** 2 / np.square(values).sum()) if total > 0 else 0.0
 
 
 def _ridge_r2(train_features, train_targets, test_features, test_targets, alphas):
     """Closed-form ridge with a CHRONOLOGICAL internal split for alpha selection."""
     mean = train_features.mean(0, keepdims=True)
-    scale = train_features.std(0, keepdims=True) + 1e-8
+    scale = train_features.std(0, keepdims=True) + _EPS
     a_train = (train_features - mean) / scale
     a_test = (test_features - mean) / scale
     cut = max(1, int(0.8 * len(a_train)))
-    inner_x, inner_y = a_train[:cut], train_targets[:cut]
-    hold_x, hold_y = a_train[cut:], train_targets[cut:]
+    inner_x, inner_y, hold_x, hold_y = a_train[:cut], train_targets[:cut], \
+        a_train[cut:], train_targets[cut:]
     if len(hold_x) < 2:
         inner_x, inner_y, hold_x, hold_y = a_train, train_targets, a_train, train_targets
 
     def solve(x, y, alpha):
         offset = y.mean(0, keepdims=True)
-        gram = x.T @ x + alpha * np.eye(x.shape[1])
-        return np.linalg.solve(gram, x.T @ (y - offset)), offset
+        return np.linalg.solve(x.T @ x + alpha * np.eye(x.shape[1]), x.T @ (y - offset)), offset
 
     def r2(y_true, y_hat):
         residual = np.square(y_true - y_hat).sum(0)
@@ -479,966 +357,643 @@ def _ridge_r2(train_features, train_targets, test_features, test_targets, alphas
 
     scored = [(float(np.mean(r2(hold_y, hold_x @ w + b))), alpha)
               for alpha in alphas for w, b in [solve(inner_x, inner_y, alpha)]]
-    best_alpha = max(scored)[1]
-    weights, offset = solve(a_train, train_targets, best_alpha)
+    best = max(scored)[1]
+    weights, offset = solve(a_train, train_targets, best)
     per_dimension = r2(test_targets, a_test @ weights + offset)
     return dict(r2=float(np.mean(per_dimension)), r2_per_dimension=per_dimension.tolist(),
-                alpha=float(best_alpha), n_train=int(len(a_train)), n_test=int(len(a_test)),
-                participation_ratio=_participation_ratio(train_features))
+                alpha=float(best), participation_ratio=_participation_ratio(train_features))
 
 
 # --------------------------------------------------------------------------- #
 # estimator
 # --------------------------------------------------------------------------- #
-class JigsawCEBRA:
-    """Shared trunk, split latent, time-contrastive z_behavior + jigsaw z_puzzle.
-
-    window_size is the receptive field used for decoding. n_tiles intact,
-    chronological, nonoverlapping tiles of that length are cut from one span,
-    separated by tile_gap=(minimum, maximum) DISCARDED bins resampled at every
-    visit. Larger n_tiles is a strictly harder pretext at no extra code.
-
-    transform(block="behavior") is what you decode. block="all" returns
-    [z_behavior, z_puzzle] as two separately L2-normalized blocks, mirroring
-    xCEBRA's multiobjective layout.
-    """
+class JigsawNet:
+    """Cross-entropy-only self-supervised encoder: temporal order + forecasting."""
 
     def __init__(self, window_size=10, n_tiles=4, tile_gap=(1, 8),
-                 behavior_dim=32, puzzle_dim=16, num_hidden_units=64,
-                 head_hidden_units=64, dropout=0.0, normalize=True,
-                 trunk_block="residual",
-                 temperature=1.0, lambda_infonce=1.0, lambda_puzzle=0.3,
-                 puzzle_warmup_fraction=0.1, lambda_decorrelation=1.0,
-                 puzzle_grad_scale=1.0, puzzle_head="both", rank_weight=0.5,
-                 sinkhorn_iterations=5, tile_norm="mean", neuron_dropout=0.1,
-                 gain_jitter=0.1, noise_std=0.0, shortcut_reject=0.0,
-                 separate_puzzle_view=None, shuffle_tiles=False,
-                 batch_size=512, max_epochs=30, learning_rate=3e-4,
-                 weight_decay=0.0, device="cuda_if_available", random_state=42,
-                 verbose=True, log_every=1):
+                 output_dimension=64, num_hidden_units=64, head_hidden_units=64,
+                 dropout=0.0, normalize=False, trunk_block="residual",
+                 lambda_order=1.0, lambda_pair=0.5, lambda_forecast=1.0,
+                 forecast_levels=8, order_grad_scale=1.0,
+                 tile_norm="mean", neuron_dropout=0.1, gain_jitter=0.1,
+                 batch_size=512, max_epochs=60, learning_rate=1e-3, weight_decay=0.0,
+                 device="cuda_if_available", random_state=42, verbose=True, log_every=1):
         self.window_size = _integer("window_size", window_size, 4)
-        self.n_tiles = _integer("n_tiles", n_tiles, 2, 12)
-        gaps = tile_gap if isinstance(tile_gap, (tuple, list)) else (tile_gap, tile_gap)
-        if len(gaps) != 2:
-            raise ValueError("tile_gap must be an integer or a (minimum, maximum) pair.")
-        self.tile_gap = tuple(_integer("tile_gap", value, 0) for value in gaps)
-        if self.tile_gap[0] > self.tile_gap[1]:
-            raise ValueError("tile_gap minimum exceeds maximum.")
-        self.behavior_dim = _integer("behavior_dim", behavior_dim)
-        self.puzzle_dim = _integer("puzzle_dim", puzzle_dim)
-        self.num_hidden_units = _integer("num_hidden_units", num_hidden_units)
-        self.head_hidden_units = _integer("head_hidden_units", head_hidden_units)
+        self.n_tiles = _integer("n_tiles", n_tiles, 2, 8)
+        if not (isinstance(tile_gap, (tuple, list)) and len(tile_gap) == 2):
+            raise ValueError("tile_gap must be a (minimum, maximum) pair.")
+        low = _integer("tile_gap[0]", tile_gap[0], 1)
+        high = _integer("tile_gap[1]", tile_gap[1], low)
+        self.tile_gap = (low, high)
+        self.output_dimension = _integer("output_dimension", output_dimension, 2)
+        self.num_hidden_units = _integer("num_hidden_units", num_hidden_units, 2)
+        self.head_hidden_units = _integer("head_hidden_units", head_hidden_units, 2)
         self.dropout = _real("dropout", dropout, 0, 1)
         self.normalize = _boolean("normalize", normalize)
         if trunk_block not in TRUNK_BLOCKS:
             raise ValueError(f"trunk_block must be one of {TRUNK_BLOCKS}.")
         self.trunk_block = trunk_block
-        self.temperature = _real("temperature", temperature, 0, strict_min=True)
-        self.lambda_infonce = _real("lambda_infonce", lambda_infonce, 0)
-        self.lambda_puzzle = _real("lambda_puzzle", lambda_puzzle, 0)
-        self.puzzle_warmup_fraction = _real("puzzle_warmup_fraction", puzzle_warmup_fraction, 0, 1)
-        self.lambda_decorrelation = _real("lambda_decorrelation", lambda_decorrelation, 0)
-        self.puzzle_grad_scale = _real("puzzle_grad_scale", puzzle_grad_scale, 0)
-        if puzzle_head not in PUZZLE_HEADS:
-            raise ValueError(f"puzzle_head must be one of {PUZZLE_HEADS}.")
-        self.puzzle_head = puzzle_head
-        self.rank_weight = _real("rank_weight", rank_weight, 0, 1)
-        self.sinkhorn_iterations = _integer("sinkhorn_iterations", sinkhorn_iterations, 0)
+        self.lambda_order = _real("lambda_order", lambda_order, 0)
+        self.lambda_pair = _real("lambda_pair", lambda_pair, 0)
+        self.lambda_forecast = _real("lambda_forecast", lambda_forecast, 0)
+        self.forecast_levels = _integer("forecast_levels", forecast_levels, 2, 64)
+        self.order_grad_scale = _real("order_grad_scale", order_grad_scale, 0)
         if tile_norm not in TILE_NORMS:
             raise ValueError(f"tile_norm must be one of {TILE_NORMS}.")
         self.tile_norm = tile_norm
         self.neuron_dropout = _real("neuron_dropout", neuron_dropout, 0, 1)
         self.gain_jitter = _real("gain_jitter", gain_jitter, 0)
-        self.noise_std = _real("noise_std", noise_std, 0)
-        self.shortcut_reject = _real("shortcut_reject", shortcut_reject, 0, 1)
-        if separate_puzzle_view is None:
-            separate_puzzle_view = tile_norm != "none"
-        self.separate_puzzle_view = _boolean("separate_puzzle_view", separate_puzzle_view)
-        if self.tile_norm != "none" and not self.separate_puzzle_view:
-            raise ValueError("tile_norm != 'none' requires separate_puzzle_view=True, otherwise "
-                             "transform would see a different input distribution than training.")
-        self.shuffle_tiles = _boolean("shuffle_tiles", shuffle_tiles)
         self.batch_size = _integer("batch_size", batch_size, 2)
         self.max_epochs = _integer("max_epochs", max_epochs, 0)
         self.learning_rate = _real("learning_rate", learning_rate, 0, strict_min=True)
         self.weight_decay = _real("weight_decay", weight_decay, 0)
-        self.device = str(device)
+        self.device = device
         self.random_state = _integer("random_state", random_state, 0)
         self.verbose = _boolean("verbose", verbose)
-        self.log_every = _integer("log_every", log_every)
+        self.log_every = _integer("log_every", log_every, 1)
+        if self.lambda_order == 0 and self.lambda_pair == 0 and self.lambda_forecast == 0 \
+                and self.max_epochs > 0:
+            raise ValueError("All loss weights are zero; set max_epochs=0 for a random encoder.")
+        self.is_fitted_ = False
 
-    # -- configuration ----------------------------------------------------- #
+    # -- properties -------------------------------------------------------- #
     @property
     def training_span(self):
-        """Raw bins needed to cut one puzzle; the receptive field stays window_size."""
-        return self.n_tiles * self.window_size + (self.n_tiles - 1) * self.tile_gap[1]
-
-    @property
-    def output_dimension(self):
-        return self.behavior_dim + self.puzzle_dim
-
-    def _block_dimension(self, block):
-        if block == "behavior":
-            return self.behavior_dim
-        if block == "puzzle":
-            return self.puzzle_dim
-        if block == "all":
-            return self.output_dimension
-        raise ValueError("block must be 'behavior', 'puzzle' or 'all'.")
+        """Bins consumed by one training example (+1 for the forecast target)."""
+        return self.n_tiles * self.window_size + (self.n_tiles - 1) * self.tile_gap[1] + 1
 
     def get_params(self):
-        names = ("window_size", "n_tiles", "tile_gap", "behavior_dim", "puzzle_dim",
+        return {name: getattr(self, name) for name in
+                ("window_size", "n_tiles", "tile_gap", "output_dimension",
                  "num_hidden_units", "head_hidden_units", "dropout", "normalize",
-                 "trunk_block",
-                 "temperature", "lambda_infonce", "lambda_puzzle", "puzzle_warmup_fraction",
-                 "lambda_decorrelation", "puzzle_grad_scale", "puzzle_head", "rank_weight",
-                 "sinkhorn_iterations", "tile_norm", "neuron_dropout", "gain_jitter",
-                 "noise_std", "shortcut_reject", "separate_puzzle_view", "shuffle_tiles",
-                 "batch_size", "max_epochs", "learning_rate", "weight_decay", "device",
-                 "random_state", "verbose", "log_every")
-        return {name: getattr(self, name) for name in names}
+                 "trunk_block", "lambda_order", "lambda_pair", "lambda_forecast",
+                 "forecast_levels", "order_grad_scale", "tile_norm", "neuron_dropout",
+                 "gain_jitter", "batch_size", "max_epochs", "learning_rate",
+                 "weight_decay", "device", "random_state", "verbose", "log_every")}
 
-    def _build(self, channels):
+    def _check_fitted(self):
+        if not self.is_fitted_:
+            raise RuntimeError("Call fit before using this model.")
+
+    # -- setup ------------------------------------------------------------- #
+    def _resolve_device(self):
         name = self.device
         if name == "cuda_if_available":
             name = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device_ = torch.device(name)
-        self.n_features_in_ = int(channels)
-        self.permutation_table_ = _permutation_table(self.n_tiles)
-        self.encoder_ = _Encoder(channels, self.window_size, self.num_hidden_units,
-                                 self.behavior_dim, self.puzzle_dim, self.dropout,
-                                 self.normalize, self.trunk_block).to(self.device_)
-        self.head_ = _PuzzleHead(self.puzzle_dim, self.head_hidden_units,
-                                 self.n_tiles).to(self.device_)
-        self._generator = torch.Generator(device=self.device_).manual_seed(self.random_state)
+        return torch.device(name)
 
-    def _check_fitted(self):
-        if not getattr(self, "is_fitted_", False):
-            raise RuntimeError("Call fit(X_train) first; max_epochs=0 gives a random-encoder control.")
-
-    def _modules(self):
-        return self.encoder_, self.head_
-
-    # -- span bookkeeping -------------------------------------------------- #
-    def _spans(self, X, n_features=None):
-        """Concatenate sequences and list every span start that stays inside one."""
-        sequences, _ = _sequences(X, self.training_span, n_features)
-        lengths = [len(sequence) for sequence in sequences]
-        offsets = np.concatenate(([0], np.cumsum(lengths)))
-        starts = np.concatenate([offsets[index] + np.arange(length - self.training_span + 1)
-                                 for index, length in enumerate(lengths)])
-        return np.concatenate(sequences, axis=0), starts.astype(np.int64), offsets
-
-    def _draw_gaps(self, batch, rng):
-        low, high = self.tile_gap
-        return rng.integers(low, high + 1, size=(batch, self.n_tiles - 1)).astype(np.int64)
-
-    def _tiles(self, data, starts, gaps):
-        return _gather_tiles(data,
-                             torch.as_tensor(starts, dtype=torch.long, device=data.device),
-                             torch.as_tensor(gaps, dtype=torch.long, device=data.device),
-                             self.window_size)
-
-    def _puzzle_terms(self, logits, scores, positions, weight):
-        zero = logits.new_zeros(())
-        assignment = (_assignment_loss(logits, positions, self.sinkhorn_iterations, weight)
-                      if self.puzzle_head in ("assign", "both") else zero)
-        rank = (_rank_loss(scores, positions, weight)
-                if self.puzzle_head in ("rank", "both") else zero)
-        if self.puzzle_head == "both":
-            combined = self.rank_weight * rank + (1 - self.rank_weight) * assignment
-        else:
-            combined = rank if self.puzzle_head == "rank" else assignment
-        return combined, assignment, rank
-
-    def _predicted_positions(self, logits, scores):
-        if self.puzzle_head == "rank":
-            return _ranks(scores)
-        return _best_assignment(logits, self.permutation_table_)
-
-    # -- training ---------------------------------------------------------- #
-    def _training_step(self, tiles_raw, chronological):
-        batch = tiles_raw.shape[0]
-        noise = self.noise_std * self.data_scale_
-        view_a = _augment(tiles_raw, self.neuron_dropout, self.gain_jitter, noise, self._generator)
-        features_a = self.encoder_.features(
-            view_a.reshape(-1, self.n_features_in_, self.window_size))
-        z_behavior = self.encoder_.behavior(features_a).reshape(batch, self.n_tiles, self.behavior_dim)
-        z_puzzle_a = self.encoder_.puzzle(features_a).reshape(batch, self.n_tiles, self.puzzle_dim)
-
-        if self.separate_puzzle_view:
-            view_b = _tile_normalize(
-                _augment(tiles_raw, self.neuron_dropout, self.gain_jitter, noise, self._generator),
-                self.tile_norm)
-            features_b = self.encoder_.features(
-                view_b.reshape(-1, self.n_features_in_, self.window_size))
-        else:
-            features_b = features_a
-        z_puzzle_b = self.encoder_.puzzle(
-            _GradScale.apply(features_b, self.puzzle_grad_scale)
-        ).reshape(batch, self.n_tiles, self.puzzle_dim)
-
-        weight = torch.ones(batch, device=tiles_raw.device)
-        if self.shortcut_reject > 0:
-            trivial = (_ranks(tiles_raw.mean(dim=(2, 3))) == chronological).all(dim=1)
-            drawn = torch.rand(batch, device=tiles_raw.device, generator=self._generator)
-            weight = weight.masked_fill(trivial & (drawn < self.shortcut_reject), 0.0)
-
-        positions = chronological
-        if self.shuffle_tiles:
-            noise_keys = torch.rand((batch, self.n_tiles), device=tiles_raw.device,
-                                    generator=self._generator)
-            positions = noise_keys.argsort(dim=1)
-            z_puzzle_b = z_puzzle_b.gather(
-                1, positions[:, :, None].expand(-1, -1, self.puzzle_dim))
-
-        logits, scores = self.head_(z_puzzle_b)
-        puzzle, assignment, rank = self._puzzle_terms(logits, scores, positions, weight)
-        contrastive, contrastive_accuracy = _infonce(z_behavior, self.temperature, self._generator)
-        decorrelation = _decorrelation(z_behavior.reshape(-1, self.behavior_dim),
-                                       z_puzzle_a.reshape(-1, self.puzzle_dim))
-        with torch.no_grad():
-            exact, pair = _order_metrics(self._predicted_positions(logits.detach(), scores.detach()),
-                                         positions)
-        return dict(puzzle=puzzle, assignment=assignment, rank=rank, contrastive=contrastive,
-                    decorrelation=decorrelation, contrastive_accuracy=contrastive_accuracy,
-                    exact=exact.mean(), pair=pair.mean(), kept=weight.mean())
-
-    def fit(self, X, X_valid=None, *, validate_every=1, early_stopping_patience=None):
-        """Train both objectives. X_valid is used for MONITORING only (and, if
-        early_stopping_patience is set, for restoring the best puzzle checkpoint).
-
-        Model selection should ultimately use evaluate_decoding, not puzzle loss.
-        """
-        validate_every = _integer("validate_every", validate_every)
-        if early_stopping_patience is not None:
-            early_stopping_patience = _integer("early_stopping_patience", early_stopping_patience)
-        data, starts, _ = self._spans(X)
-        self.is_fitted_ = False
+    def _build(self, channels):
         torch.manual_seed(self.random_state)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.random_state)
-        self._build(data.shape[1])
-        scale = float(np.std(data))
-        self.data_scale_ = scale if scale > 0 else 1.0
-        rng = np.random.default_rng(self.random_state)
-        tensor = torch.from_numpy(data).to(self.device_)
-        chronological = torch.arange(self.n_tiles, device=self.device_).expand(self.batch_size, -1)
+        self.device_ = self._resolve_device()
+        self.n_features_in_ = channels
+        self.encoder_ = _Encoder(channels, self.window_size, self.num_hidden_units,
+                                 self.output_dimension, self.dropout, self.normalize,
+                                 self.trunk_block).to(self.device_)
+        self.order_head_ = _OrderHead(self.output_dimension, self.head_hidden_units,
+                                      self.n_tiles).to(self.device_)
+        self.forecast_head_ = _ForecastHead(self.output_dimension, self.head_hidden_units,
+                                            channels, self.forecast_levels).to(self.device_)
+        self._generator = torch.Generator(device=self.device_)
+        self._generator.manual_seed(self.random_state + 1)
+
+    def _quantize_edges(self, data):
+        """Per-neuron quantile edges for the forecast target.
+
+        Quantiles, not equal-width bins: spike counts are heavily skewed, and
+        equal-width bins would put almost every target in class 0, making the
+        cross-entropy trivially minimized by predicting the mode.
+        """
+        probabilities = np.linspace(0, 1, self.forecast_levels + 1)[1:-1]
+        edges = np.quantile(data, probabilities, axis=0).astype(np.float32)
+        edges = np.maximum.accumulate(edges, axis=0)  # keep monotone under ties
+        return torch.from_numpy(np.ascontiguousarray(edges)).to(self.device_)
+
+    def _spans(self, X, n_features=None):
+        sequences, _ = _sequences(X, self.training_span, n_features)
+        lengths = [len(s) for s in sequences]
+        offsets = np.concatenate([[0], np.cumsum(lengths)])
+        starts = np.concatenate([offsets[i] + np.arange(n - self.training_span + 1)
+                                 for i, n in enumerate(lengths)]) if lengths else np.empty(0, int)
+        data = torch.from_numpy(np.concatenate(sequences, axis=0)).to(self.device_)
+        return data, starts.astype(np.int64), sequences[0].shape[1]
+
+    def _draw(self, count):
+        low, high = self.tile_gap
+        return torch.randint(low, high + 1, (count, self.n_tiles - 1),
+                             device=self.device_, generator=self._generator)
+
+    # -- one step ---------------------------------------------------------- #
+    def _step(self, data, starts):
+        batch = len(starts)
+        tiles, next_index = _gather_tiles(data, starts, self._draw(batch), self.window_size)
+        positions = torch.arange(self.n_tiles, device=self.device_).expand(batch, -1)
+        parts = {}
+        total = torch.zeros((), device=self.device_)
+
+        # FORECAST: raw view, so the trunk must represent absolute level.
+        raw = _augment(tiles, self.neuron_dropout, self.gain_jitter, self._generator)
+        z_raw = self.encoder_(raw.reshape(-1, self.n_features_in_, self.window_size))
+        if self.lambda_forecast > 0:
+            target = self._bucketize(data[next_index.reshape(-1)])
+            logits = self.forecast_head_(z_raw)
+            forecast = F.cross_entropy(logits.reshape(-1, self.forecast_levels),
+                                       target.reshape(-1))
+            with torch.no_grad():
+                parts["forecast_accuracy"] = (logits.argmax(-1) == target).to(
+                    torch.float32).mean()
+            parts["forecast"] = forecast
+            total = total + self.lambda_forecast * forecast
+        else:
+            parts["forecast"] = torch.zeros((), device=self.device_)
+            parts["forecast_accuracy"] = torch.zeros((), device=self.device_)
+
+        # ORDER: normalized view, so level drift cannot give the answer away.
+        if self.lambda_order > 0 or self.lambda_pair > 0:
+            view = _tile_normalize(
+                _augment(tiles, self.neuron_dropout, self.gain_jitter, self._generator),
+                self.tile_norm)
+            z_order = self.encoder_(view.reshape(-1, self.n_features_in_, self.window_size))
+            z_order = _GradScale.apply(z_order, self.order_grad_scale)
+            position_logits, scores = self.order_head_(
+                z_order.reshape(batch, self.n_tiles, self.output_dimension))
+            position_loss, pair_loss = _order_losses(position_logits, scores, positions)
+            parts["position"], parts["pair"] = position_loss, pair_loss
+            total = total + self.lambda_order * position_loss + self.lambda_pair * pair_loss
+            with torch.no_grad():
+                predicted = _ranks(scores) if self.lambda_order == 0 \
+                    else position_logits.argmax(-1)
+                exact, pair_accuracy = _order_metrics(predicted, positions)
+                parts["exact"], parts["pair_accuracy"] = exact.mean(), pair_accuracy.mean()
+        else:
+            for key in ("position", "pair", "exact", "pair_accuracy"):
+                parts[key] = torch.zeros((), device=self.device_)
+        parts["total"] = total
+        return parts
+
+    def _bucketize(self, values):
+        """(M,N) activity -> (M,N) integer class per neuron, using stored edges."""
+        out = torch.zeros(values.shape, dtype=torch.long, device=values.device)
+        for level in range(self.forecast_levels - 1):
+            out = out + (values > self.forecast_edges_[level][None, :]).to(torch.long)
+        return out
+
+    # -- fit --------------------------------------------------------------- #
+    def fit(self, X, X_valid=None, *, validate_every=1):
+        validate_every = _integer("validate_every", validate_every)
+        first, _ = _sequences(X, self.training_span)
+        self._build(first[0].shape[1])
+        data, starts, channels = self._spans(X, first[0].shape[1])
+        self.forecast_edges_ = self._quantize_edges(
+            np.concatenate(first, axis=0)) if self.forecast_levels > 1 else None
         self.n_spans_ = int(len(starts))
         if self.n_spans_ < 2 and self.max_epochs > 0:
             raise ValueError(
-                f"Only {self.n_spans_} valid span start(s): every training batch would hold "
-                f"fewer than two spans and InfoNCE would have no negatives. Each sequence needs "
-                f"at least training_span+1={self.training_span + 1} bins, or reduce window_size / "
+                f"Only {self.n_spans_} valid span start(s). Each sequence needs at least "
+                f"training_span+1={self.training_span + 1} bins, or reduce window_size / "
                 f"n_tiles / tile_gap.")
-        self.history_, self.validation_history_, self.n_steps_ = [], [], 0
-        steps_per_epoch = max(1, math.ceil(self.n_spans_ / self.batch_size))
-        warmup = int(self.puzzle_warmup_fraction * max(1, self.max_epochs) * steps_per_epoch)
-        optimizer = torch.optim.Adam(
-            list(self.encoder_.parameters()) + list(self.head_.parameters()),
-            lr=self.learning_rate, weight_decay=self.weight_decay)
+        self.is_fitted_ = True
+        self.history_, self.validation_history_ = [], []
+        if self.max_epochs == 0:
+            if self.verbose:
+                print(f"JigsawNet: max_epochs=0 -> frozen random encoder "
+                      f"({self.n_spans_} spans, {channels} neurons).", flush=True)
+            return self
 
+        parameters = list(self.encoder_.parameters()) + list(self.order_head_.parameters()) \
+            + list(self.forecast_head_.parameters())
+        optimizer = torch.optim.AdamW(parameters, lr=self.learning_rate,
+                                      weight_decay=self.weight_decay)
         if self.verbose:
-            print(f"JigsawCEBRA: {self.n_spans_} spans, window={self.window_size}, "
-                  f"n_tiles={self.n_tiles}, tile_gap={self.tile_gap}, "
-                  f"training_span={self.training_span}, latent={self.behavior_dim}+{self.puzzle_dim}, "
-                  f"trunk={self.trunk_block}, head={self.puzzle_head}, tile_norm={self.tile_norm}, "
-                  f"lambda_infonce={self.lambda_infonce}, lambda_puzzle={self.lambda_puzzle}, "
+            print(f"JigsawNet: {self.n_spans_} spans, window={self.window_size}, "
+                  f"K={self.n_tiles}, dim={self.output_dimension}, trunk={self.trunk_block}, "
+                  f"normalize={self.normalize}, tile_norm={self.tile_norm}, "
+                  f"lambda(order,pair,forecast)="
+                  f"({self.lambda_order},{self.lambda_pair},{self.lambda_forecast}), "
                   f"device={self.device_}", flush=True)
-            if self.max_epochs == 0:
-                print("Random-encoder control: zero optimizer steps.", flush=True)
 
-        best = dict(value=math.inf, epoch=0, state=None, waited=0)
+        index = torch.from_numpy(starts).to(self.device_)
         for epoch in range(self.max_epochs):
-            self.encoder_.train()
-            self.head_.train()
-            order = rng.permutation(self.n_spans_)
+            order = torch.randperm(self.n_spans_, device=self.device_, generator=self._generator)
             totals, seen = {}, 0
+            self.encoder_.train(); self.order_head_.train(); self.forecast_head_.train()
             for begin in range(0, self.n_spans_, self.batch_size):
-                chunk = starts[order[begin:begin + self.batch_size]]
-                if len(chunk) < 2:  # InfoNCE needs at least two distinct spans.
+                chunk = index[order[begin:begin + self.batch_size]]
+                if len(chunk) < 2:
                     continue
-                tiles = self._tiles(tensor, chunk, self._draw_gaps(len(chunk), rng))
+                parts = self._step(data, chunk)
+                if not torch.isfinite(parts["total"]):
+                    raise FloatingPointError(f"Nonfinite loss at epoch {epoch + 1}.")
                 optimizer.zero_grad(set_to_none=True)
-                parts = self._training_step(tiles, chronological[:len(chunk)])
-                weight_puzzle = self.lambda_puzzle * (1.0 if warmup == 0
-                                                      else min(1.0, (self.n_steps_ + 1) / warmup))
-                loss = (self.lambda_infonce * parts["contrastive"]
-                        + weight_puzzle * parts["puzzle"]
-                        + self.lambda_decorrelation * parts["decorrelation"])
-                if not torch.isfinite(loss).item():
-                    raise FloatingPointError(f"Nonfinite loss at optimizer step {self.n_steps_}.")
-                loss.backward()
+                parts["total"].backward()
+                nn.utils.clip_grad_norm_(parameters, 5.0)
                 optimizer.step()
-                self.n_steps_ += 1
-                seen += len(chunk)
-                totals["loss"] = totals.get("loss", 0.0) + loss.item() * len(chunk)
-                totals["lambda_puzzle"] = weight_puzzle
                 for key, value in parts.items():
                     totals[key] = totals.get(key, 0.0) + float(value.detach()) * len(chunk)
-            row = {key: (value / max(seen, 1) if key != "lambda_puzzle" else value)
-                   for key, value in totals.items()}
-            row.update(epoch=epoch + 1, steps=self.n_steps_, n_spans=seen)
+                seen += len(chunk)
+            row = {"epoch": epoch + 1, **{k: v / max(seen, 1) for k, v in totals.items()}}
             self.history_.append(row)
             if self.verbose and ((epoch + 1) % self.log_every == 0 or epoch + 1 == self.max_epochs):
-                print(f"Epoch {epoch + 1}/{self.max_epochs}: loss={row['loss']:.5f} "
-                      f"| infonce={row['contrastive']:.4f} (acc {100 * row['contrastive_accuracy']:.1f}%) "
-                      f"| puzzle={row['puzzle']:.4f} (pair {100 * row['pair']:.1f}%, "
-                      f"exact {100 * row['exact']:.1f}%) "
-                      f"| decorr={row['decorrelation']:.5f} | lam={row['lambda_puzzle']:.3f}", flush=True)
-
-            if X_valid is not None and (epoch + 1) % validate_every == 0:
-                self.is_fitted_ = True  # allow the evaluator to run mid-training
-                metrics = self.evaluate_puzzle(X_valid, max_spans=512, verbose=False)
-                self.is_fitted_ = False
+                print(f"  epoch {epoch + 1}/{self.max_epochs} loss={row['total']:.4f} "
+                      f"| position CE={row['position']:.4f} pair BCE={row['pair']:.4f} "
+                      f"forecast CE={row['forecast']:.4f} "
+                      f"| train exact={100 * row['exact']:.1f}% "
+                      f"pair={100 * row['pair_accuracy']:.1f}% "
+                      f"forecast acc={100 * row['forecast_accuracy']:.1f}%", flush=True)
+            if X_valid is not None and ((epoch + 1) % validate_every == 0
+                                        or epoch + 1 == self.max_epochs):
+                metrics = self.evaluate_pretext(X_valid, max_spans=512, verbose=False)
                 metrics["epoch"] = epoch + 1
                 self.validation_history_.append(metrics)
-                monitored = (metrics["rank_loss"] if self.puzzle_head == "rank"
-                             else metrics["assignment_cross_entropy"])
                 if self.verbose:
-                    print(f"           valid: monitored={monitored:.4f}, "
-                          f"pair={metrics['pair_accuracy_percent']:.1f}% "
-                          f"(mean-sort baseline {metrics['baseline_mean_sort_pair_percent']:.1f}%), "
-                          f"exact={metrics['exact_accuracy_percent']:.1f}%", flush=True)
-                if early_stopping_patience is not None:
-                    if monitored < best["value"] - 1e-6:
-                        best.update(value=monitored, epoch=epoch + 1, waited=0, state=(
-                            copy.deepcopy(self.encoder_.state_dict()),
-                            copy.deepcopy(self.head_.state_dict())))
-                    else:
-                        best["waited"] += 1
-                        if best["waited"] >= early_stopping_patience:
-                            if best["state"] is not None:
-                                self.encoder_.load_state_dict(best["state"][0])
-                                self.head_.load_state_dict(best["state"][1])
-                            if self.verbose:
-                                print(f"Early stop at epoch {epoch + 1}; restored epoch "
-                                      f"{best['epoch']}.", flush=True)
-                            break
-        self.best_epoch_ = best["epoch"] if best["state"] is not None else self.max_epochs
-        self.encoder_.eval()
-        self.head_.eval()
-        self.is_fitted_ = True
+                    print(f"      valid: exact={metrics['exact_accuracy_percent']:.2f}% "
+                          f"(chance {metrics['chance_exact_percent']:.2f}%) "
+                          f"pair={metrics['pair_accuracy_percent']:.2f}% "
+                          f"| mean-sort baseline pair={metrics['baseline_mean_sort_pair_percent']:.2f}%",
+                          flush=True)
         return self
 
     # -- inference --------------------------------------------------------- #
-    def transform(self, X, *, block="behavior", pad=True, batch_size=None, return_indices=False):
-        """Natural, unshuffled, unnormalized, unaugmented windows. No puzzle head.
-
-        block='behavior' (default) is the representation to decode. 'all' returns
-        [z_behavior, z_puzzle]; 'puzzle' returns the nuisance block alone, which
-        is useful to confirm that order information really moved there.
-        """
+    def transform(self, X, *, pad=True, batch_size=None, return_indices=False):
+        """Natural windows. No augmentation, no tile normalization, no heads."""
         self._check_fitted()
         _boolean("pad", pad)
-        dimension = self._block_dimension(block)
         size = self.batch_size if batch_size is None else _integer("batch_size", batch_size)
         sequences, is_list = _sequences(X, 1 if pad else self.window_size, self.n_features_in_)
         left = self.window_size // 2
         right = self.window_size - left - 1
-        result, indices = [], []
-        modes = self.encoder_.training, self.head_.training
+        values, times = [], []
         self.encoder_.eval()
-        self.head_.eval()
-        try:
-            with torch.inference_mode():
-                for sequence in sequences:
-                    if pad:
-                        centers = np.arange(len(sequence), dtype=np.int64)
-                        sequence = np.pad(sequence, ((left, right), (0, 0)), mode="edge")
-                    else:
-                        centers = np.arange(left, len(sequence) - right, dtype=np.int64)
-                    embedding = np.empty((len(centers), dimension), dtype=np.float32)
-                    for start in range(0, len(centers), size):
-                        end = min(start + size, len(centers))
-                        locations = np.arange(start, end)[:, None] + np.arange(self.window_size)
-                        windows = np.ascontiguousarray(sequence[locations].transpose(0, 2, 1))
-                        features = self.encoder_.features(
-                            torch.from_numpy(windows).to(self.device_))
-                        if block == "behavior":
-                            output = self.encoder_.behavior(features)
-                        elif block == "puzzle":
-                            output = self.encoder_.puzzle(features)
-                        else:
-                            output = torch.cat((self.encoder_.behavior(features),
-                                                self.encoder_.puzzle(features)), dim=1)
-                        embedding[start:end] = output.cpu().numpy()
-                    result.append(embedding)
-                    indices.append(centers)
-        finally:
-            self.encoder_.train(modes[0])
-            self.head_.train(modes[1])
-        values = result if is_list else result[0]
-        times = indices if is_list else indices[0]
-        return (values, times) if return_indices else values
+        with torch.inference_mode():
+            for sequence in sequences:
+                if pad:
+                    centers = np.arange(len(sequence), dtype=np.int64)
+                    sequence = np.pad(sequence, ((left, right), (0, 0)), mode="edge")
+                else:
+                    centers = np.arange(left, len(sequence) - right, dtype=np.int64)
+                out = np.empty((len(centers), self.output_dimension), dtype=np.float32)
+                for begin in range(0, len(centers), size):
+                    end = min(begin + size, len(centers))
+                    locations = np.arange(begin, end)[:, None] + np.arange(self.window_size)
+                    windows = np.ascontiguousarray(sequence[locations].transpose(0, 2, 1))
+                    out[begin:end] = self.encoder_(
+                        torch.from_numpy(windows).to(self.device_)).cpu().numpy()
+                values.append(out)
+                times.append(centers)
+        self.encoder_.train()
+        result = values if is_list else values[0]
+        index = times if is_list else times[0]
+        return (result, index) if return_indices else result
 
-    def fit_transform(self, X, **transform_kwargs):
-        return self.fit(X).transform(X, **transform_kwargs)
+    def fit_transform(self, X, **kwargs):
+        return self.fit(X).transform(X, **kwargs)
 
     # -- evaluation -------------------------------------------------------- #
-    def evaluate_puzzle(self, X, *, max_spans=1024, batch_size=256, random_state=200042,
-                        verbose=None, return_details=False):
-        """Fixed-weight puzzle metrics next to the trivial shortcut baselines.
-
-        Uses tile_norm (as in training) but NO augmentation. Overlapping spans
-        are correlated observations, not independent replicates. If the model's
-        pair accuracy is not clearly above baseline_mean_sort_pair_percent, the
-        pretext is being solved by level drift and nothing has been learned.
-        """
+    def evaluate_pretext(self, X, *, max_spans=1024, batch_size=256, random_state=200042,
+                         verbose=None):
+        """Held-out order accuracy next to the trivial shortcut baselines."""
         self._check_fitted()
-        maximum = _integer("max_spans", max_spans)
-        size = _integer("batch_size", batch_size)
-        seed = _integer("random_state", random_state, 0)
+        verbose = self.verbose if verbose is None else verbose
         data, starts, _ = self._spans(X, self.n_features_in_)
-        rng = np.random.default_rng(seed)
-        count = min(maximum, len(starts))
-        chosen = np.sort(rng.choice(len(starts), size=count, replace=False))
-        selected = starts[chosen]
-        gaps = self._draw_gaps(count, rng)
-        tensor = torch.from_numpy(data).to(self.device_)
-        chronological = torch.arange(self.n_tiles, device=self.device_)
-        collected = {key: [] for key in ("assignment", "rank", "exact", "pair", "mean_exact",
-                                         "mean_pair", "norm_exact", "norm_pair", "score_exact",
-                                         "score_pair")}
-        predictions = []
-        modes = self.encoder_.training, self.head_.training
-        self.encoder_.eval()
-        self.head_.eval()
-        try:
-            with torch.inference_mode():
-                for begin in range(0, count, size):
-                    end = min(begin + size, count)
-                    tiles = self._tiles(tensor, selected[begin:end], gaps[begin:end])
-                    batch = tiles.shape[0]
-                    positions = chronological.expand(batch, -1)
-                    view = _tile_normalize(tiles, self.tile_norm)
-                    features = self.encoder_.features(
-                        view.reshape(-1, self.n_features_in_, self.window_size))
-                    z = self.encoder_.puzzle(features).reshape(batch, self.n_tiles, self.puzzle_dim)
-                    logits, scores = self.head_(z)
-                    if not torch.isfinite(logits).all().item():
-                        raise FloatingPointError("Nonfinite puzzle logits during evaluation.")
-                    ones = torch.ones(batch, device=tiles.device)
-                    _, assignment, rank = self._puzzle_terms(logits, scores, positions, ones)
-                    predicted = self._predicted_positions(logits, scores)
-                    exact, pair = _order_metrics(predicted, positions)
-                    score_exact, score_pair = _order_metrics(_ranks(scores), positions)
-                    level = _ranks(tiles.mean(dim=(2, 3)))
-                    norm = _ranks(tiles.flatten(2).norm(dim=2))
-                    mean_exact, mean_pair = _order_metrics(level, positions)
-                    norm_exact, norm_pair = _order_metrics(norm, positions)
-                    collected["assignment"].append(float(assignment) * batch)
-                    collected["rank"].append(float(rank) * batch)
-                    for key, value in (("exact", exact), ("pair", pair),
-                                       ("mean_exact", mean_exact), ("mean_pair", mean_pair),
-                                       ("norm_exact", norm_exact), ("norm_pair", norm_pair),
-                                       ("score_exact", score_exact), ("score_pair", score_pair)):
-                        collected[key].append(float(value.sum()))
-                    predictions.append(predicted.cpu().numpy())
-        finally:
-            self.encoder_.train(modes[0])
-            self.head_.train(modes[1])
-        total = float(count)
-        summed = {key: sum(values) / total for key, values in collected.items()}
-        metrics = dict(
-            objective=f"{self.puzzle_head} head, {self.n_tiles} tiles, relational and equivariant",
-            window_size=self.window_size, n_tiles=self.n_tiles, tile_gap=list(self.tile_gap),
-            tile_norm=self.tile_norm, training_span=self.training_span,
-            assignment_cross_entropy=summed["assignment"], rank_loss=summed["rank"],
-            uniform_assignment_cross_entropy=float(np.log(self.n_tiles)),
-            uniform_rank_loss=float(np.log(2)),
-            exact_accuracy_percent=100 * summed["exact"], pair_accuracy_percent=100 * summed["pair"],
-            rank_score_exact_percent=100 * summed["score_exact"],
-            rank_score_pair_percent=100 * summed["score_pair"],
-            baseline_mean_sort_exact_percent=100 * summed["mean_exact"],
-            baseline_mean_sort_pair_percent=100 * summed["mean_pair"],
-            baseline_norm_sort_exact_percent=100 * summed["norm_exact"],
-            baseline_norm_sort_pair_percent=100 * summed["norm_pair"],
-            chance_exact_accuracy_percent=100 / math.factorial(self.n_tiles),
-            chance_pair_accuracy_percent=50.0,
-            n_spans=count, available_spans=int(len(starts)), random_state=seed,
-            sampling="Distinct span starts, fresh gaps, no augmentation, no padding.",
-        )
-        if verbose or (verbose is None and self.verbose):
-            print(f"Puzzle: pair={metrics['pair_accuracy_percent']:.1f}% vs mean-sort "
-                  f"{metrics['baseline_mean_sort_pair_percent']:.1f}% | exact="
-                  f"{metrics['exact_accuracy_percent']:.1f}% vs chance "
-                  f"{metrics['chance_exact_accuracy_percent']:.2f}%", flush=True)
-        if not return_details:
-            return metrics
-        return metrics, dict(span_starts=selected, gaps=gaps,
-                             predicted_positions=np.concatenate(predictions, axis=0))
+        if len(starts) == 0:
+            raise ValueError("No valid spans in X.")
+        rng = np.random.default_rng(random_state)
+        chosen = starts if len(starts) <= max_spans else rng.choice(starts, max_spans, False)
+        chosen = torch.from_numpy(np.sort(chosen)).to(self.device_)
+        generator = torch.Generator(device=self.device_).manual_seed(random_state)
+        low, high = self.tile_gap
+        totals = {k: 0.0 for k in ("exact", "pair", "mean_exact", "mean_pair",
+                                   "norm_exact", "norm_pair", "position_ce")}
+        count = 0
+        self.encoder_.eval(); self.order_head_.eval()
+        with torch.inference_mode():
+            for begin in range(0, len(chosen), batch_size):
+                block = chosen[begin:begin + batch_size]
+                gaps = torch.randint(low, high + 1, (len(block), self.n_tiles - 1),
+                                     device=self.device_, generator=generator)
+                tiles, _ = _gather_tiles(data, block, gaps, self.window_size)
+                positions = torch.arange(self.n_tiles, device=self.device_).expand(len(block), -1)
+                view = _tile_normalize(tiles, self.tile_norm)
+                z = self.encoder_(view.reshape(-1, self.n_features_in_, self.window_size))
+                position_logits, scores = self.order_head_(
+                    z.reshape(len(block), self.n_tiles, self.output_dimension))
+                predicted = position_logits.argmax(-1) if self.lambda_order > 0 else _ranks(scores)
+                exact, pair = _order_metrics(predicted, positions)
+                mean_exact, mean_pair = _order_metrics(_ranks(tiles.mean(dim=(2, 3))), positions)
+                norm_exact, norm_pair = _order_metrics(
+                    _ranks(tiles.reshape(len(block), self.n_tiles, -1).norm(dim=2)), positions)
+                weight = len(block)
+                totals["exact"] += float(exact.mean()) * weight
+                totals["pair"] += float(pair.mean()) * weight
+                totals["mean_exact"] += float(mean_exact.mean()) * weight
+                totals["mean_pair"] += float(mean_pair.mean()) * weight
+                totals["norm_exact"] += float(norm_exact.mean()) * weight
+                totals["norm_pair"] += float(norm_pair.mean()) * weight
+                totals["position_ce"] += float(F.cross_entropy(
+                    position_logits.reshape(-1, self.n_tiles), positions.reshape(-1))) * weight
+                count += weight
+        self.encoder_.train(); self.order_head_.train()
+        scale = 100.0 / max(count, 1)
+        result = dict(
+            exact_accuracy_percent=totals["exact"] * scale,
+            pair_accuracy_percent=totals["pair"] * scale,
+            baseline_mean_sort_exact_percent=totals["mean_exact"] * scale,
+            baseline_mean_sort_pair_percent=totals["mean_pair"] * scale,
+            baseline_norm_sort_exact_percent=totals["norm_exact"] * scale,
+            baseline_norm_sort_pair_percent=totals["norm_pair"] * scale,
+            position_cross_entropy=totals["position_ce"] / max(count, 1),
+            uniform_cross_entropy=math.log(self.n_tiles),
+            chance_exact_percent=100.0 / math.factorial(self.n_tiles),
+            chance_pair_percent=50.0, n_spans=int(count))
+        if verbose:
+            print(f"  pretext: exact={result['exact_accuracy_percent']:.2f}% "
+                  f"(chance {result['chance_exact_percent']:.2f}%) "
+                  f"pair={result['pair_accuracy_percent']:.2f}% (chance 50%) "
+                  f"| mean-sort pair={result['baseline_mean_sort_pair_percent']:.2f}%", flush=True)
+        return result
 
-    def evaluate_decoding(self, X_train, y_train, X_test, y_test, *,
-                          blocks=("behavior", "puzzle", "all"),
-                          alphas=(1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0)):
-        """Frozen-encoder ridge decoding R2 per latent block. THE metric that matters.
+    def evaluate_decoding(self, X_train, y_train, X_test, y_test,
+                          *, alphas=(1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1e3, 1e4)):
+        """Ridge R2 from the embedding AND from the raw window, side by side.
 
-        y must be aligned row-for-row with X (pad=True embedding, one row per bin).
-        Ridge alpha is picked on a chronological 80/20 split of the training part,
-        never on the test part. Compare against lambda_puzzle=0 and max_epochs=0
-        runs on the SAME split before claiming the puzzle helped.
+        The raw-window number is not decoration. If the embedding does not beat
+        it, the encoder is removing information and that is the finding.
         """
         self._check_fitted()
-
-        def stack(values):
-            if isinstance(values, (list, tuple)):
-                return np.concatenate([np.asarray(v, dtype=np.float64) for v in values], axis=0)
-            return np.asarray(values, dtype=np.float64)
-
-        targets_train, targets_test = stack(y_train), stack(y_test)
-        if targets_train.ndim == 1:
-            targets_train = targets_train[:, None]
-        if targets_test.ndim == 1:
-            targets_test = targets_test[:, None]
-        result = {}
-        for block in blocks:
-            features_train = stack(self.transform(X_train, block=block, pad=True))
-            features_test = stack(self.transform(X_test, block=block, pad=True))
-            if len(features_train) != len(targets_train) or len(features_test) != len(targets_test):
-                raise ValueError(f"Label/embedding length mismatch: "
-                                 f"{len(features_train)} vs {len(targets_train)} (train), "
-                                 f"{len(features_test)} vs {len(targets_test)} (test).")
-            result[block] = _ridge_r2(features_train.astype(np.float64), targets_train,
-                                      features_test.astype(np.float64), targets_test, alphas)
-        return result
+        out = {}
+        z_train, index_train = self.transform(X_train, pad=False, return_indices=True)
+        z_test, index_test = self.transform(X_test, pad=False, return_indices=True)
+        target_train = np.asarray(y_train, dtype=np.float64)[index_train]
+        target_test = np.asarray(y_test, dtype=np.float64)[index_test]
+        out["embedding"] = _ridge_r2(z_train.astype(np.float64), target_train,
+                                     z_test.astype(np.float64), target_test, alphas)
+        raw_train = np.lib.stride_tricks.sliding_window_view(
+            np.asarray(X_train, dtype=np.float64), self.window_size, axis=0)
+        raw_test = np.lib.stride_tricks.sliding_window_view(
+            np.asarray(X_test, dtype=np.float64), self.window_size, axis=0)
+        out["raw_window"] = _ridge_r2(raw_train.reshape(len(raw_train), -1), target_train,
+                                      raw_test.reshape(len(raw_test), -1), target_test, alphas)
+        out["embedding_minus_raw"] = out["embedding"]["r2"] - out["raw_window"]["r2"]
+        return out
 
     # -- persistence ------------------------------------------------------- #
     def save(self, path):
-        """Weights and config only; no data and no optimizer state."""
         self._check_fitted()
-        torch.save(dict(
-            model_type="jigsaw_cebra", format_version=1, params=self.get_params(),
-            n_features=self.n_features_in_, data_scale=self.data_scale_,
-            encoder={k: v.detach().cpu() for k, v in self.encoder_.state_dict().items()},
-            head={k: v.detach().cpu() for k, v in self.head_.state_dict().items()},
-            history=self.history_, validation_history=self.validation_history_,
-            n_steps=self.n_steps_, n_spans=self.n_spans_,
-        ), Path(path))
+        torch.save(dict(model_type="jigsaw_net", format_version=1, params=self.get_params(),
+                        n_features_in=self.n_features_in_,
+                        encoder=self.encoder_.state_dict(),
+                        order_head=self.order_head_.state_dict(),
+                        forecast_head=self.forecast_head_.state_dict(),
+                        forecast_edges=None if self.forecast_edges_ is None
+                        else self.forecast_edges_.cpu(),
+                        history=self.history_, validation_history=self.validation_history_),
+                   Path(path))
+        return self
 
     @classmethod
     def load(cls, path, device="cuda_if_available"):
         try:
-            data = torch.load(Path(path), map_location="cpu", weights_only=True)
-        except TypeError:  # torch < 1.13 has no weights_only argument
+            data = torch.load(Path(path), map_location="cpu", weights_only=False)
+        except TypeError:
             data = torch.load(Path(path), map_location="cpu")
-        if data.get("model_type") != "jigsaw_cebra" or data.get("format_version") != 1:
-            raise ValueError("Expected a jigsaw_cebra checkpoint.")
-        model = cls(**dict(data["params"], device=device))
-        model._build(data["n_features"])
+        if data.get("model_type") != "jigsaw_net" or data.get("format_version") != 1:
+            raise ValueError("Expected a jigsaw_net checkpoint.")
+        params = dict(data["params"]); params["device"] = device
+        model = cls(**params)
+        model._build(data["n_features_in"])
         model.encoder_.load_state_dict(data["encoder"])
-        model.head_.load_state_dict(data["head"])
-        model.data_scale_ = data["data_scale"]
+        model.order_head_.load_state_dict(data["order_head"])
+        model.forecast_head_.load_state_dict(data["forecast_head"])
+        edges = data.get("forecast_edges")
+        model.forecast_edges_ = None if edges is None else edges.to(model.device_)
         model.history_ = data["history"]
         model.validation_history_ = data["validation_history"]
-        model.n_steps_ = data["n_steps"]
-        model.n_spans_ = data["n_spans"]
-        model.encoder_.eval()
-        model.head_.eval()
         model.is_fitted_ = True
         return model
 
 
-Jigsaw = JigsawCEBRA
-puzzle = JigsawCEBRA
+Jigsaw = JigsawNet
 
 
 # --------------------------------------------------------------------------- #
-# self test
+# self-test
 # --------------------------------------------------------------------------- #
 def _check(condition, message):
     if not condition:
         raise AssertionError(message)
+    print(f"  ok  {message}")
 
 
-def _self_test(device="cpu"):
-    """Verify the pieces that are easy to get silently wrong. Run this first."""
-    torch.manual_seed(0)
-    dev = torch.device(device)
+def _synthetic(n=6000, channels=24, seed=0):
+    """Latent circle -> Poisson-ish rates. Behavior is linearly decodable."""
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 60 * np.pi, n)
+    latent = np.stack([np.sin(t), np.cos(t)], axis=1)
+    weights = rng.normal(size=(2, channels))
+    rates = np.exp(0.8 * latent @ weights + 0.4 * rng.normal(size=(n, channels)) - 0.5)
+    return rng.poisson(rates).astype(np.float32), latent.astype(np.float32)
 
-    # 1. Tile arithmetic: gaps are DISCARDED bins, tiles never overlap.
-    ramp = torch.arange(200, dtype=torch.float32, device=dev)[:, None].repeat(1, 3)
-    starts = torch.tensor([0, 10], device=dev)
-    gaps = torch.tensor([[1, 2, 3], [0, 0, 0]], device=dev)
-    tiles = _gather_tiles(ramp, starts, gaps, 4)
-    _check(tuple(tiles.shape) == (2, 4, 3, 4), f"tile shape {tuple(tiles.shape)}")
-    _check(tiles[0, :, 0, 0].tolist() == [0, 5, 11, 18], "tile starts with gaps (1,2,3)")
-    _check(tiles[1, :, 0, 0].tolist() == [10, 14, 18, 22], "tile starts with zero gaps")
-    _check(tiles[0, :, 0, -1].tolist() == [3, 8, 14, 21], "tile ends")
-    ends = tiles[:, :-1, 0, -1]
-    _check(bool((tiles[:, 1:, 0, 0] > ends).all()), "tiles must not overlap")
 
-    # 2. Trunk receptive field is exactly window_size, for both block types.
-    for block in TRUNK_BLOCKS:
-        for window in (4, 5, 9, 10, 16, 21):
-            trunk = _Trunk(3, window, 8, 0.0, block).to(dev).eval()
-            _check(tuple(trunk(torch.randn(2, 3, window, device=dev)).shape) == (2, 8),
-                   f"trunk({block}) output for window_size={window}")
-            try:
-                trunk(torch.randn(2, 3, window + 1, device=dev))
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("trunk accepted the wrong number of bins")
-        grad_input = torch.randn(1, 3, 10, device=dev, requires_grad=True)
-        _Trunk(3, 10, 8, 0.0, block).to(dev).eval()(grad_input).sum().backward()
-        _check(bool((grad_input.grad.abs().sum(dim=(0, 1)) > 0).all()),
-               f"every bin in the window must reach the output ({block})")
-    # The depthwise block must not mix channels inside its temporal convolution.
+def _self_test():
+    print("1. trunk receptive field")
+    for window in (4, 5, 9, 10, 16, 21):
+        for block in TRUNK_BLOCKS:
+            trunk = _Trunk(7, window, 8, 0.0, block)
+            out = trunk(torch.zeros(3, 7, window))
+            _check(out.shape == (3, 8), f"{block} trunk, window={window} -> one bin, {out.shape}")
     depthwise = [m for m in _Separable(8, 0.0).modules()
                  if isinstance(m, nn.Conv1d) and m.kernel_size == (3,)]
     _check(len(depthwise) == 1 and depthwise[0].groups == depthwise[0].in_channels,
-           "the separable block's 3-tap convolution must be depthwise")
-    _check(sum(p.numel() for p in _Separable(64, 0.0).parameters())
-           < 4 * sum(p.numel() for p in _Residual(64, 0.0).parameters()),
-           "the separable block should stay in the same parameter class as the plain one")
+           "the separable block's 3-tap convolution is depthwise")
 
-    # 3. Head equivariance -> shuffling tiles cannot change the loss.
-    batch, n_tiles, dimension = 6, 4, 5
-    head = _PuzzleHead(dimension, 16, n_tiles).to(dev).double().eval()
-    z = torch.randn(batch, n_tiles, dimension, device=dev, dtype=torch.float64)
-    order = torch.stack([torch.randperm(n_tiles, device=dev) for _ in range(batch)])
-    logits, scores = head(z)
-    shuffled_logits, shuffled_scores = head(z.gather(1, order[:, :, None].expand(-1, -1, dimension)))
-    _check(torch.allclose(shuffled_logits,
-                          logits.gather(1, order[:, :, None].expand(-1, -1, n_tiles)), atol=1e-10),
-           "puzzle head is not permutation-equivariant")
-    _check(torch.allclose(shuffled_scores, scores.gather(1, order), atol=1e-10),
-           "puzzle scores are not permutation-equivariant")
-    chronological = torch.arange(n_tiles, device=dev).expand(batch, -1)
-    ones = torch.ones(batch, device=dev, dtype=torch.float64)
-    _check(abs(float(_assignment_loss(logits, chronological, 5, ones))
-               - float(_assignment_loss(shuffled_logits, order, 5, ones))) < 1e-10,
-           "assignment loss changed under shuffling")
-    _check(abs(float(_rank_loss(scores, chronological, ones))
-               - float(_rank_loss(shuffled_scores, order, ones))) < 1e-10,
-           "rank loss changed under shuffling")
+    print("2. tiles never overlap and the forecast target sits in the gap")
+    ramp = torch.arange(300.0)[:, None].repeat(1, 3)
+    tiles, nxt = _gather_tiles(ramp, torch.tensor([0, 50]), torch.tensor([[1, 2, 3], [1, 1, 1]]), 4)
+    _check(tiles.shape == (2, 4, 3, 4), f"shape (B,K,N,W)={tuple(tiles.shape)}")
+    _check(tiles[0, :, 0, 0].tolist() == [0, 5, 11, 18], "gapped tile starts [0,5,11,18]")
+    _check((tiles[:, 1:, 0, 0] > tiles[:, :-1, 0, -1]).all(), "tiles are disjoint")
+    _check((nxt[:, :-1] < tiles[:, 1:, 0, 0]).all(),
+           "every forecast target bin lies strictly inside a discarded gap")
 
-    # 4. Sinkhorn: rows are exact probabilities, columns converge to uniform.
-    mild = torch.randn(200, 5, 5, device=dev, dtype=torch.float64)
-    log_p = _log_sinkhorn(mild, 50)
-    _check(torch.allclose(log_p.exp().sum(2), torch.ones(200, 5, device=dev, dtype=torch.float64),
-                          atol=1e-9), "sinkhorn rows are not probabilities")
-    _check(float((log_p.exp().sum(1) - 1).abs().max()) < 1e-6, "sinkhorn columns far from uniform")
-    sharp = mild * 4
-    deviations = [float((_log_sinkhorn(sharp, it).exp().sum(1) - 1).abs().max())
-                  for it in (0, 1, 5, 20, 100)]
-    _check(all(a > b for a, b in zip(deviations, deviations[1:])),
-           f"more sinkhorn iterations must balance the columns further: {deviations}")
-    # At the default 5 iterations with sharp logits the matrix is only PARTIALLY
-    # balanced: the assignment loss is a soft bijection prior, not a constraint.
-    _check(torch.allclose(_log_sinkhorn(sharp, 0), sharp - torch.logsumexp(sharp, 2, keepdim=True)),
-           "sinkhorn_iterations=0 must reduce to a per-slot softmax over positions")
-    _check(bool(torch.isfinite(_log_sinkhorn(torch.zeros(2, 4, 4, device=dev), 5)).all()),
-           "sinkhorn produced nonfinite values")
+    print("3. losses are cross-entropy and hit the right chance levels")
+    batch, K = 64, 4
+    positions = torch.arange(K).expand(batch, -1)
+    position_loss, pair_loss = _order_losses(torch.zeros(batch, K, K), torch.zeros(batch, K),
+                                             positions)
+    _check(abs(float(position_loss) - math.log(K)) < 1e-6,
+           f"uniform position logits cost exactly log(K)={math.log(K):.4f}")
+    _check(abs(float(pair_loss) - math.log(2)) < 1e-6,
+           f"tied pair scores cost exactly log(2)={math.log(2):.4f}")
+    perfect = F.one_hot(positions, K).float() * 20
+    position_loss, _ = _order_losses(perfect, -positions.float(), positions)
+    _check(float(position_loss) < 1e-6, "a correct confident prediction costs ~0")
 
-    # 5. Assignment decoding is bijective and exact.
-    table = _permutation_table(4)
-    truth = torch.tensor([[2, 0, 3, 1], [0, 1, 2, 3]], device=dev)
-    onehot = F.one_hot(truth, 4).float() * 12 + torch.randn(2, 4, 4, device=dev) * 0.1
-    _check(torch.equal(_best_assignment(onehot, table), truth), "exact assignment failed")
-    _check(torch.equal(_best_assignment(onehot, None), truth), "greedy assignment failed")
-    random_logits = torch.randn(32, 4, 4, device=dev)
-    decoded = _best_assignment(random_logits, table)
-    _check(bool((decoded.sort(dim=1).values == torch.arange(4, device=dev)).all()),
-           "assignment is not a permutation")
-    exact_score = random_logits.gather(2, decoded[:, :, None]).sum((1, 2))
-    greedy_score = random_logits.gather(2, _best_assignment(random_logits, None)[:, :, None]).sum((1, 2))
-    _check(bool((exact_score >= greedy_score - 1e-6).all()), "greedy beat the exact solver")
+    print("4. the head is permutation equivariant")
+    head = _OrderHead(6, 16, K)
+    z = torch.randn(8, K, 6)
+    shuffle = torch.stack([torch.randperm(K) for _ in range(8)])
+    logits_a, scores_a = head(z)
+    logits_b, scores_b = head(z.gather(1, shuffle[:, :, None].expand(-1, -1, 6)))
+    _check(torch.allclose(logits_b, logits_a.gather(1, shuffle[:, :, None].expand(-1, -1, K)),
+                          atol=1e-5), "position logits permute with the tiles")
+    _check(torch.allclose(scores_b, scores_a.gather(1, shuffle), atol=1e-5),
+           "pair scores permute with the tiles")
 
-    # 6. Ranks and order metrics.
-    _check(_ranks(torch.tensor([[3.0, 1.0, 2.0]], device=dev)).tolist() == [[2, 0, 1]], "_ranks")
-    exact, pair = _order_metrics(chronological, chronological)
-    _check(float(exact.mean()) == 1.0 and float(pair.mean()) == 1.0, "perfect order metrics")
-    reverse = torch.arange(n_tiles - 1, -1, -1, device=dev).expand(batch, -1)
-    exact, pair = _order_metrics(reverse, chronological)
-    _check(float(exact.mean()) == 0.0 and float(pair.mean()) == 0.0, "reversed order metrics")
-
-    # 7. InfoNCE separates spans and flags leakage through its accuracy.
-    directions = F.normalize(torch.randn(8, 12, device=dev), dim=1)
-    easy = directions[:, None, :].repeat(1, 4, 1)
-    loss, accuracy = _infonce(easy, 0.1, torch.Generator(device=dev).manual_seed(0))
-    collapse = math.log(1 + (8 - 1) * 4)  # every embedding identical: the chance level.
-    _check(float(accuracy) == 1.0 and float(loss) < 0.2 * collapse,
-           f"InfoNCE on separable spans: {float(loss)} (collapse costs {collapse:.3f})")
-    flat = F.normalize(torch.randn(1, 12, device=dev), dim=1).expand(8, 12)
-    collapsed_loss, _ = _infonce(flat[:, None, :].repeat(1, 4, 1), 0.1,
-                                 torch.Generator(device=dev).manual_seed(0))
-    _check(abs(float(collapsed_loss) - collapse) < 1e-4,
-           f"a collapsed embedding must cost exactly log(1+(B-1)K)={collapse:.4f}")
-    try:
-        _infonce(easy[:1], 1.0, torch.Generator(device=dev).manual_seed(0))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("InfoNCE accepted a single-span batch")
-
-    # 8. Decorrelation penalty responds in the right direction.
-    a = torch.randn(4096, 8, device=dev)
-    b = torch.randn(4096, 8, device=dev)
-    _check(float(_decorrelation(a, a)) > 10 * float(_decorrelation(a, b)),
-           "decorrelation does not separate identical from independent blocks")
-
-    # 9. Tile normalization removes a per-tile level offset exactly.
-    raw = torch.randn(3, 4, 6, 10, device=dev)
-    offset = torch.randn(3, 4, 1, 1, device=dev) * 5
+    print("5. tile normalization kills the level shortcut")
+    raw = torch.randn(4, K, 5, 8)
+    offset = torch.randn(4, K, 1, 1) * 5
     for mode in ("mean", "zscore", "global_mean"):
-        shifted = _tile_normalize(raw + offset, mode)
-        _check(torch.allclose(shifted, _tile_normalize(raw, mode), atol=1e-4),
-               f"tile_norm={mode} did not remove the level shortcut")
-    _check(torch.equal(_tile_normalize(raw, "none"), raw), "tile_norm='none' must be identity")
-    ramp = raw + torch.arange(4, device=dev).reshape(1, 4, 1, 1) * 3.0
-    slots = torch.arange(4, device=dev)
-    _check(bool((_ranks(ramp.mean(dim=(2, 3))) == slots).all()),
-           "mean-sort must solve a level ramp perfectly: that is the shortcut the baseline measures")
-    _check(not bool((_ranks(_tile_normalize(ramp, "mean").mean(dim=(2, 3))) == slots).all()),
-           "tile normalization must destroy the level-ramp shortcut")
+        _check(torch.allclose(_tile_normalize(raw + offset, mode), _tile_normalize(raw, mode),
+                              atol=1e-3), f"tile_norm={mode} removes per-tile level")
+    ramped = raw + torch.arange(K).float()[None, :, None, None] * 4
+    _check((_ranks(ramped.mean(dim=(2, 3))) == torch.arange(K)).all(),
+           "mean-sort solves the puzzle perfectly under a level ramp (the shortcut)")
+    _check(not (_ranks(_tile_normalize(ramped, "mean").mean(dim=(2, 3))) == torch.arange(K)).all(),
+           "after normalization the ramp no longer gives the order away")
 
-    # 10. Augmentation endpoints.
-    generator = torch.Generator(device=dev).manual_seed(0)
-    _check(float(_augment(raw, 1.0, 0.0, 0.0, generator).abs().max()) == 0.0,
-           "neuron_dropout=1 must zero the input")
-    _check(torch.equal(_augment(raw, 0.0, 0.0, 0.0, generator), raw),
-           "augmentation with all strengths zero must be identity")
-    dropped = _augment(raw, 0.5, 0.0, 0.0, generator) == 0
-    _check(bool((dropped.all(dim=3) | (~dropped).all(dim=3)).all()),
-           "neuron dropout must drop whole neurons, not single bins")
+    print("6. quantization is balanced, not mode-collapsed")
+    data, _ = _synthetic(3000, 12, seed=3)
+    model = JigsawNet(window_size=8, n_tiles=3, tile_gap=(1, 3), output_dimension=8,
+                      num_hidden_units=12, head_hidden_units=12, max_epochs=0,
+                      device="cpu", verbose=False).fit(data)
+    model.forecast_edges_ = model._quantize_edges(data)
+    classes = model._bucketize(torch.from_numpy(data))
+    share = torch.bincount(classes.reshape(-1), minlength=8).float() / classes.numel()
+    _check(int(classes.max()) < model.forecast_levels and int(classes.min()) >= 0,
+           "every target lands inside [0, forecast_levels)")
+    _check(float(share.max()) < 0.75,
+           f"quantile edges avoid mode collapse (largest class share {float(share.max()):.2f}) "
+           "-> the forecast CE is not minimized by always predicting one class")
 
-    # 11. Ridge recovers a linear map.
-    features = np.random.default_rng(0).normal(size=(600, 6))
-    mapping = np.random.default_rng(1).normal(size=(6, 2))
-    result = _ridge_r2(features[:400], features[:400] @ mapping,
-                       features[400:], features[400:] @ mapping, (1e-3, 1e-2, 1e-1))
-    _check(result["r2"] > 0.99, f"ridge R2 on a linear problem was {result['r2']:.4f}")
-    _check(4.0 < result["participation_ratio"] <= 6.01,
-           f"participation ratio {result['participation_ratio']:.2f}")
+    print("7. end to end: training must not destroy decodable structure")
+    data, latent = _synthetic(7000, 24, seed=1)
+    cut = 5000
+    alphas = (1e-2, 1e-1, 1.0, 10.0, 100.0)
+    shared = dict(window_size=8, n_tiles=3, tile_gap=(1, 3), output_dimension=16,
+                  num_hidden_units=32, head_hidden_units=32, batch_size=256,
+                  learning_rate=3e-3, device="cpu", verbose=False, random_state=0)
+    trained = JigsawNet(max_epochs=12, **shared).fit(data[:cut])
+    random_encoder = JigsawNet(max_epochs=0, **shared).fit(data[:cut])
+    scores = {}
+    for name, fitted in (("trained", trained), ("random", random_encoder)):
+        z_train, i_train = fitted.transform(data[:cut], pad=False, return_indices=True)
+        z_test, i_test = fitted.transform(data[cut:], pad=False, return_indices=True)
+        scores[name] = _ridge_r2(z_train.astype(np.float64), latent[:cut][i_train].astype(np.float64),
+                                 z_test.astype(np.float64), latent[cut:][i_test].astype(np.float64),
+                                 alphas)["r2"]
+    print(f"      trained R2={scores['trained']:.4f}  random-encoder R2={scores['random']:.4f}")
+    _check(scores["trained"] > 0.5, f"trained embedding decodes the latent (R2={scores['trained']:.3f})")
+    _check(scores["trained"] > scores["random"] - 0.02,
+           "training does not fall behind the random-encoder control")
+    pretext = trained.evaluate_pretext(data[cut:], max_spans=400, verbose=False)
+    print(f"      held-out exact={pretext['exact_accuracy_percent']:.1f}% "
+          f"(chance {pretext['chance_exact_percent']:.1f}%) "
+          f"pair={pretext['pair_accuracy_percent']:.1f}%")
+    _check(pretext["pair_accuracy_percent"] > 55, "the order task is learned out of sample")
 
-    # 12. Spans never cross a trial boundary.
-    model = JigsawCEBRA(window_size=8, n_tiles=3, tile_gap=(1, 4), max_epochs=0,
-                        device=device, verbose=False)
-    trials = [np.random.default_rng(s).normal(size=(120, 5)).astype(np.float32) for s in (0, 1)]
-    data, starts, offsets = model._spans(trials)
-    span = model.training_span
-    _check(len(starts) == sum(len(trial) - span + 1 for trial in trials), "span count")
-    for index in range(len(trials)):
-        inside = starts[(starts >= offsets[index]) & (starts < offsets[index + 1])]
-        _check(int(inside.max()) + span <= offsets[index + 1], "a span crossed a trial boundary")
+    print("8. normalize=True is the ablation that costs R2")
+    spherical = JigsawNet(max_epochs=12, normalize=True, **shared).fit(data[:cut])
+    z_train, i_train = spherical.transform(data[:cut], pad=False, return_indices=True)
+    z_test, i_test = spherical.transform(data[cut:], pad=False, return_indices=True)
+    sphere_r2 = _ridge_r2(z_train.astype(np.float64), latent[:cut][i_train].astype(np.float64),
+                          z_test.astype(np.float64), latent[cut:][i_test].astype(np.float64),
+                          alphas)["r2"]
+    print(f"      normalize=True R2={sphere_r2:.4f} vs normalize=False R2={scores['trained']:.4f}")
+    _check(np.isfinite(sphere_r2), "the spherical ablation runs")
 
-    # 13. puzzle_grad_scale=0 cuts the pretext gradient out of the shared trunk.
-    blocked = JigsawCEBRA(window_size=8, n_tiles=3, tile_gap=(1, 2), behavior_dim=6, puzzle_dim=4,
-                          num_hidden_units=8, head_hidden_units=8, puzzle_grad_scale=0.0,
-                          device=device, verbose=False)
-    blocked._build(5)
-    blocked.data_scale_ = 1.0
-    sample = torch.randn(4, 3, 5, 8, device=blocked.device_)
-    order = torch.arange(3, device=blocked.device_).expand(4, -1)
-    blocked._training_step(sample, order)["puzzle"].backward()
-    trunk_grad = sum(float(p.grad.abs().sum()) for p in blocked.encoder_.trunk.parameters()
-                     if p.grad is not None)
-    head_grad = sum(float(p.grad.abs().sum()) for p in blocked.head_.parameters()
-                    if p.grad is not None)
-    _check(trunk_grad == 0.0, f"trunk received puzzle gradient despite scale 0 ({trunk_grad})")
-    _check(head_grad > 0.0, "puzzle head received no gradient")
-    _check(float(blocked.encoder_.project_puzzle.weight.grad.abs().sum()) > 0,
-           "puzzle projector received no gradient")
+    print("9. transform is deterministic, aligned and augmentation-free")
+    a = trained.transform(data[cut:], pad=False)
+    b = trained.transform(data[cut:], pad=False)
+    _check(np.allclose(a, b), "transform is deterministic (no augmentation leaks in)")
+    _check(len(a) == len(data[cut:]) - trained.window_size + 1,
+           f"pad=False drops exactly window_size-1={trained.window_size - 1} bins")
+    _check(len(trained.transform(data[cut:], pad=True)) == len(data[cut:]),
+           "pad=True returns one row per input bin")
+    _, index = trained.transform(data[cut:], pad=False, return_indices=True)
+    _check(index[0] == trained.window_size // 2, "pad=False starts at window_size//2")
 
-    # 14. End to end: fit, transform, evaluate, save, load.
-    rng = np.random.default_rng(3)
-    train = rng.normal(size=(700, 5)).astype(np.float32)
-    test = rng.normal(size=(300, 5)).astype(np.float32)
-    fitted = JigsawCEBRA(window_size=8, n_tiles=3, tile_gap=(1, 3), behavior_dim=6, puzzle_dim=4,
-                         num_hidden_units=12, head_hidden_units=12, batch_size=64, max_epochs=2,
-                         device=device, verbose=False, random_state=7)
-    fitted.fit(train, X_valid=test, validate_every=1)
-    _check(len(fitted.history_) == 2 and len(fitted.validation_history_) == 2, "history lengths")
-    for block, width in (("behavior", 6), ("puzzle", 4), ("all", 10)):
-        padded = fitted.transform(train, block=block, pad=True)
-        _check(padded.shape == (len(train), width), f"padded transform shape for {block}")
-        cropped = fitted.transform(train, block=block, pad=False)
-        _check(cropped.shape == (len(train) - 7, width), f"unpadded transform shape for {block}")
-    if fitted.normalize:
-        both = fitted.transform(test, block="all")
-        _check(np.allclose(np.linalg.norm(both[:, :6], axis=1), 1, atol=1e-4)
-               and np.allclose(np.linalg.norm(both[:, 6:], axis=1), 1, atol=1e-4),
-               "blocks in 'all' must be normalized separately")
-    _check(np.array_equal(fitted.transform(test), fitted.transform(test)),
-           "transform is not deterministic")
-    as_list, times = fitted.transform([train, test], return_indices=True)
-    _check(isinstance(as_list, list) and len(as_list) == 2 and len(times[1]) == len(test),
-           "list input must return a list")
-    metrics = fitted.evaluate_puzzle(test, max_spans=64, verbose=False)
-    for key in ("pair_accuracy_percent", "exact_accuracy_percent",
-                "baseline_mean_sort_pair_percent", "assignment_cross_entropy"):
-        _check(key in metrics and np.isfinite(metrics[key]), f"missing metric {key}")
-    _check(0 <= metrics["pair_accuracy_percent"] <= 100, "pair accuracy out of range")
-    scores = fitted.evaluate_decoding(train, rng.normal(size=(700, 2)), test,
-                                      rng.normal(size=(300, 2)), blocks=("behavior", "all"))
-    _check(set(scores) == {"behavior", "all"} and np.isfinite(scores["behavior"]["r2"]),
-           "evaluate_decoding output")
+    print("10. controls run and bad configs are rejected")
+    for override in ({"lambda_order": 0.0, "lambda_pair": 0.0}, {"lambda_forecast": 0.0},
+                     {"order_grad_scale": 0.0}, {"trunk_block": "separable"},
+                     {"tile_norm": "none"}, {"n_tiles": 2}):
+        settings = dict(shared, max_epochs=2); settings.update(override)
+        fitted = JigsawNet(**settings).fit(data[:1500])
+        _check(np.isfinite(fitted.transform(data[:400], pad=False)).all(),
+               f"control {override} trains and transforms cleanly")
+    for bad in ({"window_size": 3}, {"n_tiles": 1}, {"tile_gap": (0, 3)},
+                {"trunk_block": "mobilenet"}, {"tile_norm": "l2"},
+                {"lambda_order": 0.0, "lambda_pair": 0.0, "lambda_forecast": 0.0}):
+        try:
+            JigsawNet(**dict(shared, **bad))
+            raise AssertionError(f"{bad} should have been rejected")
+        except ValueError:
+            pass
+    _check(True, "invalid constructor arguments all raise ValueError")
     try:
-        fitted.evaluate_decoding(train, rng.normal(size=(699, 2)), test,
-                                 rng.normal(size=(300, 2)), blocks=("behavior",))
+        JigsawNet(window_size=8, n_tiles=3, tile_gap=(1, 3), max_epochs=1, device="cpu",
+                  verbose=False).fit(np.zeros((31, 5), dtype=np.float32))
+        raise AssertionError("a one-span recording should have been rejected")
     except ValueError:
-        pass
-    else:
-        raise AssertionError("evaluate_decoding accepted misaligned labels")
-    path = Path("_jigsaw_cebra_selftest.pt")
+        _check(True, "a recording with fewer than two spans raises instead of dividing by zero")
+
+    print("11. save / load round trip")
+    path = Path("_jigsaw_net_selftest.pt")
     try:
-        fitted.save(path)
-        restored = JigsawCEBRA.load(path, device=device)
-        _check(np.allclose(fitted.transform(test), restored.transform(test), atol=1e-6),
-               "save/load changed the embedding")
-        _check(restored.get_params() == fitted.get_params(), "save/load changed the parameters")
+        trained.save(path)
+        restored = JigsawNet.load(path, device="cpu")
+        _check(np.allclose(restored.transform(data[cut:cut + 300], pad=False),
+                           trained.transform(data[cut:cut + 300], pad=False), atol=1e-6),
+               "a reloaded model reproduces its embedding exactly")
     finally:
         path.unlink(missing_ok=True)
 
-    # 15. Controls run: random encoder, and each objective switched off.
-    control = JigsawCEBRA(window_size=8, n_tiles=3, tile_gap=(1, 3), num_hidden_units=8,
-                          max_epochs=0, device=device, verbose=False).fit(train)
-    _check(control.n_steps_ == 0 and control.transform(test).shape[0] == len(test),
-           "max_epochs=0 control")
-    for override in ({"lambda_puzzle": 0.0}, {"lambda_infonce": 0.0},
-                     {"lambda_decorrelation": 0.0}, {"puzzle_head": "rank"},
-                     {"puzzle_head": "assign"}, {"shuffle_tiles": True},
-                     {"shortcut_reject": 1.0}, {"tile_norm": "none", "separate_puzzle_view": False},
-                     {"normalize": False}, {"n_tiles": 8}, {"n_tiles": 2},
-                     {"trunk_block": "separable"}, {"puzzle_grad_scale": 0.0}):
-        JigsawCEBRA(window_size=8, tile_gap=(1, 2), behavior_dim=6, puzzle_dim=4,
-                    num_hidden_units=8, head_hidden_units=8, batch_size=32, max_epochs=1,
-                    device=device, verbose=False, **override).fit(train).transform(test)
-
-    # 16. Configuration guards.
-    for bad in ({"tile_norm": "mean", "separate_puzzle_view": False}, {"window_size": 3},
-                {"tile_gap": (5, 1)}, {"puzzle_head": "sort"}, {"rank_weight": 1.5},
-                {"n_tiles": 1}, {"temperature": 0.0}, {"trunk_block": "mobilenet"}):
-        try:
-            JigsawCEBRA(**bad)
-        except ValueError:
-            continue
-        raise AssertionError(f"constructor accepted {bad}")
-    try:
-        fitted.transform(np.full((200, 5), np.nan, dtype=np.float32))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("transform accepted nonfinite input")
-    # A sequence shorter than the receptive field is only an error without padding;
-    # with pad=True the edges are extended and every bin still gets a row.
-    short = np.zeros((4, 5), dtype=np.float32)
-    try:
-        fitted.transform(short, pad=False)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("transform accepted a sequence shorter than window_size")
-    _check(fitted.transform(short, pad=True).shape == (4, fitted.behavior_dim),
-           "pad=True must return one row per bin even for a very short sequence")
-    try:
-        fitted.transform(np.zeros((200, 9), dtype=np.float32))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("transform accepted the wrong neuron count")
-    # A recording too short to hold two spans must fail loudly, not divide by zero.
-    try:
-        JigsawCEBRA(window_size=8, n_tiles=3, tile_gap=(1, 3), max_epochs=1,
-                    device=device, verbose=False).fit(np.zeros((30, 5), dtype=np.float32))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("fit accepted a recording with fewer than two spans")
-
-    print("All self tests passed.")
-    return True
+    print("\nAll self-tests passed. No contrastive loss exists in this module.")
 
 
-# --------------------------------------------------------------------------- #
-# synthetic demo: the ablation table you should reproduce on Perich
-# --------------------------------------------------------------------------- #
-def _synthetic(n_samples=8000, n_neurons=60, seed=0):
-    """Ring latent + slow multiplicative drift (the level shortcut, on purpose)."""
-    rng = np.random.default_rng(seed)
-    time = np.arange(n_samples)
-    speed = 0.05 + 0.03 * np.sin(2 * np.pi * time / 1700)
-    angle = np.cumsum(speed)
-    centers = rng.uniform(0, 2 * np.pi, n_neurons)
-    rate = np.exp(2.0 * np.cos(angle[:, None] - centers[None, :]))
-    drift = np.cumsum(rng.normal(0, 1, n_samples))
-    drift = drift / (np.abs(drift).max() + 1e-12)
-    gain = rng.uniform(0.5, 1.5, n_neurons)
-    neural = rate * (1 + 0.6 * drift[:, None] * gain[None, :]) + rng.normal(0, 0.4, rate.shape)
-    targets = np.stack([np.cos(angle), np.sin(angle), speed], axis=1)
-    return neural.astype(np.float32), targets.astype(np.float32)
-
-
-def _demo(device="cuda_if_available", max_epochs=10, seed=0, n_samples=8000):
-    """Run the arms that decide whether the pretext helps. Read the R2 column."""
-    neural, targets = _synthetic(n_samples=n_samples, seed=seed)
-    cut = int(0.7 * len(neural))
-    train, test = neural[:cut], neural[cut:]
-    y_train, y_test = targets[:cut], targets[cut:]
-    shared = dict(window_size=10, n_tiles=4, tile_gap=(1, 8), behavior_dim=16, puzzle_dim=8,
-                  num_hidden_units=64, head_hidden_units=64, batch_size=256, learning_rate=1e-3,
-                  max_epochs=max_epochs, device=device, verbose=False, random_state=seed)
+def _demo():
+    data, latent = _synthetic(9000, 32, seed=7)
+    cut = 6500
+    shared = dict(window_size=10, n_tiles=4, tile_gap=(1, 6), output_dimension=32,
+                  num_hidden_units=48, head_hidden_units=48, batch_size=256,
+                  learning_rate=2e-3, device="cuda_if_available", verbose=False, random_state=0)
     arms = {
-        "jigsaw + infonce (proposed)": {},
-        "infonce only (lambda_puzzle=0)": dict(lambda_puzzle=0.0),
-        "puzzle only (lambda_infonce=0)": dict(lambda_infonce=0.0, lambda_decorrelation=0.0),
-        "no decorrelation": dict(lambda_decorrelation=0.0),
-        "mobilenet-style trunk": dict(trunk_block="separable"),
-        "easiest pretext (n_tiles=2)": dict(n_tiles=2),
-        "shortcut left open": dict(tile_norm="none", separate_puzzle_view=False,
-                                   neuron_dropout=0.0, gain_jitter=0.0),
-        "random encoder (max_epochs=0)": dict(max_epochs=0),
+        "proposed (order + forecast)": dict(max_epochs=25),
+        "order only": dict(max_epochs=25, lambda_forecast=0.0),
+        "forecast only": dict(max_epochs=25, lambda_order=0.0, lambda_pair=0.0),
+        "random encoder": dict(max_epochs=0),
+        "normalize=True (sphere)": dict(max_epochs=25, normalize=True),
+        "mobilenet trunk": dict(max_epochs=25, trunk_block="separable"),
     }
-    print(f"Synthetic ring latent: train {train.shape}, test {test.shape}, "
-          f"targets cos/sin/speed. Higher R2 is better.\n")
-    rows = []
+    print(f"{'arm':<30}{'R2':>9}{'raw R2':>9}{'delta':>9}{'pair %':>9}{'shortcut':>10}")
+    print("-" * 76)
     for name, override in arms.items():
-        model = JigsawCEBRA(**dict(shared, **override)).fit(train)
-        puzzle = model.evaluate_puzzle(test, max_spans=512, verbose=False)
-        decoding = model.evaluate_decoding(train, y_train, test, y_test,
-                                           blocks=("behavior", "puzzle", "all"))
-        rows.append((name, decoding["behavior"]["r2"], decoding["puzzle"]["r2"],
-                     decoding["all"]["r2"], puzzle["pair_accuracy_percent"],
-                     puzzle["baseline_mean_sort_pair_percent"],
-                     decoding["behavior"]["participation_ratio"]))
-    header = (f"{'arm':<32}{'R2 behav':>10}{'R2 puzz':>9}{'R2 all':>9}"
-              f"{'pair %':>9}{'shortcut %':>12}{'PR':>7}")
-    print(header)
-    print("-" * len(header))
-    for name, behavior, puzzle_r2, everything, pair, baseline, ratio in rows:
-        print(f"{name:<32}{behavior:>10.3f}{puzzle_r2:>9.3f}{everything:>9.3f}"
-              f"{pair:>9.1f}{baseline:>12.1f}{ratio:>7.2f}")
-    print("\nRead it like this: the pretext is only worth keeping if 'R2 behav' for the "
-          "proposed arm beats BOTH 'infonce only' and 'random encoder'. If 'pair %' is not "
-          "clearly above 'shortcut %', the puzzle is being solved by drift, not by structure.")
-    return rows
+        model = JigsawNet(**dict(shared, **override)).fit(data[:cut])
+        decoding = model.evaluate_decoding(data[:cut], latent[:cut], data[cut:], latent[cut:])
+        pretext = model.evaluate_pretext(data[cut:], max_spans=400, verbose=False)
+        print(f"{name:<30}{decoding['embedding']['r2']:>9.4f}"
+              f"{decoding['raw_window']['r2']:>9.4f}{decoding['embedding_minus_raw']:>9.4f}"
+              f"{pretext['pair_accuracy_percent']:>9.2f}"
+              f"{pretext['baseline_mean_sort_pair_percent']:>10.2f}")
+    print("-" * 76)
+    print("delta < 0 means the encoder is removing information the raw window already had.")
 
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--self-test", action="store_true", help="run correctness checks")
-    parser.add_argument("--demo", action="store_true", help="run the synthetic ablation table")
-    parser.add_argument("--device", default="cpu", help="cpu, cuda, or cuda_if_available")
-    parser.add_argument("--epochs", type=int, default=10, help="epochs per demo arm")
-    parser.add_argument("--samples", type=int, default=8000, help="synthetic sequence length")
-    parser.add_argument("--seed", type=int, default=0)
-    arguments = parser.parse_args()
-    if not (arguments.self_test or arguments.demo):
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--demo", action="store_true")
+    options = parser.parse_args()
+    if options.self_test:
+        _self_test()
+    elif options.demo:
+        _demo()
+    else:
         parser.print_help()
-        return
-    if arguments.self_test:
-        _self_test(device=arguments.device)
-    if arguments.demo:
-        _demo(device=arguments.device, max_epochs=arguments.epochs, seed=arguments.seed,
-              n_samples=arguments.samples)
 
 
 if __name__ == "__main__":
     main()
-   
+
+
 # """Shortcut-robust temporal jigsaw pretext task for neural population data.
 
 # Companion / replacement for the earlier `puzzle` module. Keeps the tiles-mode
