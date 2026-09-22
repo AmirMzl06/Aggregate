@@ -30,7 +30,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from jigsaw_net import JigsawNet, _ridge_r2
+from Neural_Jigsaw import JigsawNet, _ridge_r2
 
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 OUTPUT_ROOT = Path("/home/mirzaei/sam/result/Aggregate")
