@@ -1,626 +1,482 @@
-"""Ablation run for JigsawCEBRA on one Perich session: does the pretext help?
+"""Perich runner for JigsawNet. Architecture lives in jigsaw_net.py; this file
+only loads data, runs arms, and reports.
 
-This script is deliberately NOT a "tune the pretext" sweep. It is built to
-answer one question your own tile_normalize sweep could not answer, because it
-was missing the controls that make the answer identifiable:
+    python run_jigsaw.py                          # default arms
+    python run_jigsaw.py --arms proposed random_encoder dim_128
+    python run_jigsaw.py --list
+    python run_jigsaw.py --epochs 200 --sessions 3
 
-    Does learning temporal order add anything to a behavior embedding,
-    over and above (a) an untrained encoder, (b) the same model with the
-    pretext switched off, and (c) decoding the raw neural window directly?
+THE THREE NUMBERS THAT DECIDE EVERYTHING
+  R2 raw     ridge on the raw window. The CEILING. Not a baseline you may lose
+             to -- if your embedding is below it, the encoder deleted signal.
+  R2 random  the SAME architecture with max_epochs=0, frozen at init. This is
+             what your weights are worth before any learning. If a trained arm
+             is below it, training made things worse, and pretext accuracy is
+             irrelevant at that point.
+  pair %     held-out order accuracy, chance 50%. Reported next to the
+             sort-by-mean shortcut baseline. Model >> baseline or it is cheating.
 
-Every number is therefore reported next to its own null:
-
-    R2                  vs  RAW WINDOW ridge/MLP R2   (the real ceiling)
-                        vs  random-encoder arm        (did training do anything)
-                        vs  lambda_puzzle=0 arm       (did the PUZZLE do anything)
-    puzzle pair %       vs  mean-sort / norm-sort baselines (the drift shortcut)
-    puzzle exact %      vs  1/K! chance, with a 95% CI and a z-test, so a
-                            "4.69% vs 4.17% chance" reading is called what it
-                            is: noise.
-
-It also runs a LEARNABILITY LADDER. If the model cannot beat chance on the
-easiest possible version of the pretext (n_tiles=2, i.e. "which of these two
-snippets came first", chance 50%), then no conclusion about "puzzle learning
-does not build good embeddings" is available from the data -- the pretext was
-simply never learned, and every arm is a random encoder wearing a hat.
-
-Data contract (same .npz layout as the earlier scripts):
-    train_data (T1,N), valid_data (T2,N), train_label (T1,M), valid_label (T2,M)
-    test_data (T3,N) optional; used for the puzzle evaluation when present.
-
-Usage
-    python run_jigsaw_perich.py --quick              # ~minutes, sanity check
-    python run_jigsaw_perich.py                      # the full table
-    python run_jigsaw_perich.py --arms proposed infonce_only random_encoder
-    python run_jigsaw_perich.py --session C-CO16 --epochs 60
-
-Reading the result: the pretext is worth keeping only if `proposed` beats BOTH
-`infonce_only` and `random_encoder` on valid R2, on the same split, with the
-same seed. If `raw_window` beats all of them, the encoder is subtracting
-information and the honest report is that it does.
+Every arm also prints delta_random = R2 - R2(random_encoder), which is the only
+honest measure of what training contributed.
 """
-from datetime import datetime, timezone
-from pathlib import Path
 import argparse
-import csv
-import gc
 import json
 import math
-import random
 import time
+import traceback
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from jigsaw_net import JigsawNet, _ridge_r2
 
-from Neural_Jigsaw import JigsawCEBRA, _ridge_r2  # _ridge_r2: chronological-split ridge
-
-ROOT = Path(__file__).resolve().parent
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
+OUTPUT_ROOT = Path("/home/mirzaei/sam/result/Aggregate")
 SEED = 42
+TRAIN_FRACTION = 0.8
 
-# -- encoder: identical across every arm, so the arm is the only difference -- #
 WINDOW_SIZE = 10
 N_TILES = 4
 TILE_GAP = (1, 8)
-BEHAVIOR_DIM = 32
-PUZZLE_DIM = 16
-ENCODER_HIDDEN = 64
-HEAD_HIDDEN = 64
+OUTPUT_DIMENSION = 64
+NUM_HIDDEN_UNITS = 64
+HEAD_HIDDEN_UNITS = 64
 BATCH_SIZE = 512
 EPOCHS = 60
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 0.0
-DROPOUT = 0.0
-TEMPERATURE = 1.0
-LAMBDA_INFONCE = 1.0
-LAMBDA_PUZZLE = 0.3
-LAMBDA_DECORRELATION = 1.0
 TILE_NORM = "mean"
 NEURON_DROPOUT = 0.1
 GAIN_JITTER = 0.1
-DEVICE = "cuda_if_available"
 
-# -- downstream decoder: the same full-batch MLP the earlier scripts used ---- #
 DECODER_EPOCHS = 2500
 DECODER_HIDDEN = 64
 DECODER_DROPOUT = 0.4
 DECODER_LR = 1e-3
-PREDICT_BATCH_SIZE = 8192
-RIDGE_ALPHAS = (1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1e3, 1e4)
-
-# -- puzzle evaluation ------------------------------------------------------- #
-PUZZLE_EVAL_SPANS = 2048
-PUZZLE_EVAL_BATCH = 256
-PUZZLE_EVAL_SEED = SEED + 200000
-
-MAX_RAW_FEATURES = 20000  # guard on the flattened-window baseline
-
+PRETEXT_SPANS = 2048
+RIDGE_ALPHAS = (1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1e3, 1e4, 1e5)
 
 # --------------------------------------------------------------------------- #
-# arms
+# arms. No contrastive arm exists -- the model has no contrastive loss.
 # --------------------------------------------------------------------------- #
 ARMS = {
-    # The proposal: split latent, InfoNCE on z_behavior, jigsaw on z_puzzle.
+    # ---- the proposal ---------------------------------------------------- #
     "proposed": {},
-    # Did the PUZZLE do anything? Same code path, pretext weight zero.
-    "infonce_only": dict(lambda_puzzle=0.0),
-    # The failure mode on purpose: pretext alone, nothing pulling toward behavior.
-    "puzzle_only": dict(lambda_infonce=0.0, lambda_decorrelation=0.0),
-    # Did TRAINING do anything? Same architecture, zero optimizer steps.
+
+    # ---- controls that can falsify it ----------------------------------- #
+    # Frozen at init. THE reference point. Beat this or nothing else matters.
     "random_encoder": dict(max_epochs=0),
-    # Is order even decodable from behavior features? Head trains, trunk is
-    # shielded from its gradient, so R2 cannot be harmed by the pretext.
-    "puzzle_probe_only": dict(puzzle_grad_scale=0.0),
-    # Leave the level/drift shortcut wide open: puzzle accuracy should jump and
-    # track the mean-sort baseline. That is the shortcut, caught in the act.
-    "shortcut_open": dict(tile_norm="none", separate_puzzle_view=False,
-                          neuron_dropout=0.0, gain_jitter=0.0),
-    # MobileNetV2-style depthwise-separable trunk (the advisor's suggestion).
+    # Order CE only: the classic jigsaw. Nothing keeps firing-rate level.
+    "order_only": dict(lambda_forecast=0.0),
+    # Forecast CE only: is the puzzle contributing anything at all?
+    "forecast_only": dict(lambda_order=0.0, lambda_pair=0.0),
+    # Order head trains on a trunk it cannot influence. Asks "is order
+    # decodable from a forecast-trained trunk?" with zero risk to R2.
+    "order_probe_only": dict(order_grad_scale=0.0),
+    # Every anti-shortcut guard off. If pretext accuracy JUMPS here, the task
+    # was being solved by level drift, not by temporal structure.
+    "shortcut_open": dict(tile_norm="none", neuron_dropout=0.0, gain_jitter=0.0),
+
+    # ---- the bottleneck, which the numpy analysis says costs the most ---- #
+    "dim_16": dict(output_dimension=16),
+    "dim_32": dict(output_dimension=32),
+    "dim_128": dict(output_dimension=128),
+    "dim_256": dict(output_dimension=256),
+
+    # ---- ablations ------------------------------------------------------- #
+    # The sphere. Expected to LOSE: it deletes magnitude.
+    "normalized": dict(normalize=True),
+    # Advisor's suggestion: depthwise-separable / MobileNetV2 inverted residual.
     "mobilenet_trunk": dict(trunk_block="separable"),
-    # LEARNABILITY LADDER: easiest possible pretext, chance is 50% not 4.17%.
-    "ladder_2_tiles": dict(n_tiles=2),
-    "ladder_3_tiles": dict(n_tiles=3),
-    # Is the pretext only hard because the tiles are close together in time?
+    # Difficulty ladder. n_tiles=2 is the most sensitive learnability test
+    # there is: chance is exactly 50%, so tiny effects are detectable.
+    "tiles_2": dict(n_tiles=2),
+    "tiles_3": dict(n_tiles=3),
+    "tiles_6": dict(n_tiles=6),
+    # Long-range order: are far-apart tiles easier (more drift) or harder?
     "wide_gaps": dict(tile_gap=(8, 40)),
-    # No cross-block decorrelation: does the penalty matter at all?
-    "no_decorrelation": dict(lambda_decorrelation=0.0),
+    "tight_gaps": dict(tile_gap=(1, 2)),
+    # Coarser / finer forecast targets.
+    "forecast_4": dict(forecast_levels=4),
+    "forecast_16": dict(forecast_levels=16),
+    "zscore_tiles": dict(tile_norm="zscore"),
 }
-DEFAULT_ARMS = ("proposed", "infonce_only", "random_encoder", "puzzle_only",
-                "shortcut_open", "mobilenet_trunk", "ladder_2_tiles")
+
+DEFAULT_ARMS = ("proposed", "random_encoder", "order_only", "forecast_only",
+                "shortcut_open", "dim_256", "mobilenet_trunk", "tiles_2")
 
 
 # --------------------------------------------------------------------------- #
-# utilities
+# helpers
 # --------------------------------------------------------------------------- #
 def seed_all(seed):
-    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
 
 
-def json_safe(value):
-    """NaN/Inf -> null, so the JSON stays strictly valid and loadable anywhere.
-
-    This matters: the random_encoder arm has no training history, so several
-    fields are legitimately NaN, and json.dumps(allow_nan=False) would crash the
-    whole run at the very last step.
-    """
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe(item) for item in value]
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (float, np.floating)):
-        return float(value) if math.isfinite(float(value)) else None
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    if isinstance(value, np.ndarray):
-        return json_safe(value.tolist())
-    return value
+def json_safe(obj):
+    """NaN/Inf -> None so one broken arm cannot poison the whole dump."""
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    if isinstance(obj, np.ndarray):
+        return json_safe(obj.tolist())
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
 
 
-def save_json(path, values):
-    path.write_text(json.dumps(json_safe(values), indent=2), encoding="utf-8")
+def save_json(path, payload):
+    path.write_text(json.dumps(json_safe(payload), indent=2, allow_nan=False))
 
 
 def cleanup():
-    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
 def normal_tail(z):
-    """One-sided upper-tail probability of the standard normal."""
-    return 0.5 * math.erfc(abs(z) / math.sqrt(2.0))
+    return 0.5 * math.erfc(z / math.sqrt(2.0))
 
 
-def proportion_versus_chance(successes, trials, chance):
-    """Wilson 95% interval plus a one-sided z-test against a known chance rate.
+def versus_chance(successes, trials, chance):
+    """Wilson 95% CI plus a one-sided z-test against a KNOWN chance rate.
 
-    Why this is here: with 1024 spans the standard error of a 4.17%-chance
-    accuracy is about 0.6 points, so 4.69% is well inside the noise band. Any
-    claim of the form "the model is slightly above chance" needs this column
-    before it means anything.
+    The chance rate here is known exactly (1/K! or 1/2), not estimated, so a
+    one-sample z-test is the right test and no correction is needed.
     """
-    trials = int(trials)
     if trials <= 0:
-        return dict(estimate=float("nan"), ci_low=float("nan"), ci_high=float("nan"),
-                    z=float("nan"), p_one_sided=float("nan"), above_chance=False, n=0)
-    phat = successes / trials
-    z = 1.959963985
-    denominator = 1.0 + z * z / trials
-    center = (phat + z * z / (2 * trials)) / denominator
-    spread = z * math.sqrt(phat * (1 - phat) / trials + z * z / (4 * trials * trials)) / denominator
+        return dict(rate=float("nan"), low=float("nan"), high=float("nan"),
+                    z=float("nan"), p=float("nan"), significant=False, n=0)
+    rate = successes / trials
+    z_critical = 1.959963985
+    denominator = 1 + z_critical ** 2 / trials
+    centre = (rate + z_critical ** 2 / (2 * trials)) / denominator
+    spread = z_critical * math.sqrt(rate * (1 - rate) / trials
+                                    + z_critical ** 2 / (4 * trials ** 2)) / denominator
     standard_error = math.sqrt(max(chance * (1 - chance) / trials, 1e-300))
-    statistic = (phat - chance) / standard_error
-    return dict(estimate=100 * phat, ci_low=100 * (center - spread), ci_high=100 * (center + spread),
-                chance=100 * chance, z=statistic, p_one_sided=normal_tail(statistic) if statistic > 0 else 0.5,
-                above_chance=bool(statistic > 1.96), n=trials)
+    z = (rate - chance) / standard_error
+    p = normal_tail(z)
+    return dict(rate=rate, low=max(0.0, centre - spread), high=min(1.0, centre + spread),
+                z=z, p=p, significant=bool(p < 0.05 and rate > chance), n=int(trials))
 
 
 def load_session(path):
-    with np.load(path, allow_pickle=False) as data:
-        available = set(data.files)
-        required = ("train_data", "valid_data", "train_label", "valid_label")
-        missing = [key for key in required if key not in available]
-        if missing:
-            raise KeyError(f"{path} is missing {missing}.")
-        arrays = {key: np.ascontiguousarray(np.asarray(data[key], dtype=np.float32))
-                  for key in required}
-        test = np.ascontiguousarray(np.asarray(data["test_data"], dtype=np.float32)) \
-            if "test_data" in available else None
-    for key in ("train_label", "valid_label"):
-        if arrays[key].ndim == 1:
-            arrays[key] = arrays[key][:, None]
-    for key, value in arrays.items():
-        if value.ndim != 2 or min(value.shape) < 1 or not np.isfinite(value).all():
-            raise ValueError(f"{key}: expected a finite nonempty 2D array; got {value.shape}.")
-    if len(arrays["train_data"]) != len(arrays["train_label"]) \
-            or len(arrays["valid_data"]) != len(arrays["valid_label"]):
-        raise ValueError("Feature and label lengths disagree.")
-    if arrays["train_data"].shape[1] != arrays["valid_data"].shape[1]:
-        raise ValueError("Train and validation neuron counts disagree.")
-    if test is not None and test.shape[1] != arrays["train_data"].shape[1]:
-        raise ValueError("test_data neuron count disagrees with train_data.")
-    return arrays["train_data"], arrays["valid_data"], arrays["train_label"], \
-        arrays["valid_label"], test
+    with np.load(path, allow_pickle=True) as handle:
+        keys = set(handle.files)
+        spikes_key = next((k for k in ("spikes", "neural", "rates", "X", "counts")
+                           if k in keys), None)
+        behavior_key = next((k for k in ("behavior", "velocity", "vel", "Y", "y", "kin")
+                            if k in keys), None)
+        if spikes_key is None or behavior_key is None:
+            raise KeyError(f"{path.name}: need a spike key and a behavior key; has {sorted(keys)}")
+        spikes = np.asarray(handle[spikes_key], dtype=np.float32)
+        behavior = np.asarray(handle[behavior_key], dtype=np.float32)
+    if spikes.ndim != 2:
+        raise ValueError(f"{path.name}: spikes must be 2D, got {spikes.shape}")
+    if behavior.ndim == 1:
+        behavior = behavior[:, None]
+    if spikes.shape[0] != behavior.shape[0] and spikes.shape[1] == behavior.shape[0]:
+        spikes = spikes.T
+    length = min(len(spikes), len(behavior))
+    spikes, behavior = spikes[:length], behavior[:length]
+    if behavior.shape[1] > 2:
+        behavior = behavior[:, :2]
+    keep = np.isfinite(spikes).all(1) & np.isfinite(behavior).all(1)
+    if not keep.all():
+        first, last = int(np.argmax(keep)), length - int(np.argmax(keep[::-1]))
+        spikes, behavior = spikes[first:last], behavior[first:last]
+        if not (np.isfinite(spikes).all() and np.isfinite(behavior).all()):
+            raise ValueError(f"{path.name}: nonfinite values in the interior, not just the edges")
+    alive = spikes.std(0) > 0
+    return np.ascontiguousarray(spikes[:, alive]), np.ascontiguousarray(behavior)
 
 
-# --------------------------------------------------------------------------- #
-# downstream decoding
-# --------------------------------------------------------------------------- #
 class Decoder(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, dimension, targets, hidden, dropout):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, DECODER_HIDDEN), nn.LayerNorm(DECODER_HIDDEN),
-            nn.ReLU(), nn.Dropout(DECODER_DROPOUT),
-            nn.Linear(DECODER_HIDDEN, output_dim),
-        )
+        self.net = nn.Sequential(nn.Linear(dimension, hidden), nn.LayerNorm(hidden),
+                                 nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, targets))
 
-    def forward(self, z):
-        return self.net(z)
+    def forward(self, x):
+        return self.net(x)
 
 
-def r2_raw(y_true, y_hat):
-    residual = np.square(y_true - y_hat).sum(0)
-    total = np.square(y_true - y_true.mean(0, keepdims=True)).sum(0)
-    return 1.0 - residual / np.maximum(total, 1e-12)
+def r2_raw(truth, prediction):
+    residual = np.square(truth - prediction).sum(0)
+    total = np.square(truth - truth.mean(0, keepdims=True)).sum(0)
+    return float(np.mean(1.0 - residual / np.maximum(total, 1e-12)))
 
 
-def mlp_r2(z_train, y_train, z_valid, y_valid, device, epochs, tag=""):
-    """Full-batch MLP decoder, identical in shape to the earlier scripts.
+def mlp_r2(x_train, y_train, x_test, y_test, *, epochs, hidden, dropout,
+           learning_rate, seed, device):
+    """Chronological internal split for model selection -- never random.
 
-    Standardization uses TRAIN statistics only. The decoder is reseeded per arm
-    so decoder initialization is not a confound between arms.
+    A random split lets adjacent, near-identical bins land on both sides, and
+    the score is then optimistic by a wide margin on autocorrelated data.
     """
-    seed_all(SEED + 100000)
-    mean = z_train.mean(0, keepdims=True)
-    scale = z_train.std(0, keepdims=True) + 1e-8
-    model = Decoder(z_train.shape[1], y_train.shape[1]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=DECODER_LR)
-    features = torch.as_tensor((z_train - mean) / scale, dtype=torch.float32, device=device)
-    targets = torch.as_tensor(y_train, dtype=torch.float32, device=device)
-    losses = []
-    model.train()
+    torch.manual_seed(seed)
+    mean, scale = x_train.mean(0, keepdims=True), x_train.std(0, keepdims=True) + 1e-8
+    cut = max(1, int(0.9 * len(x_train)))
+    tensors = [torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(device)
+               for a in ((x_train - mean) / scale, y_train, (x_test - mean) / scale, y_test)]
+    xt, yt, xv, yv = tensors
+    inner_x, inner_y, hold_x, hold_y = xt[:cut], yt[:cut], xt[cut:], yt[cut:]
+    if len(hold_x) < 2:
+        inner_x, inner_y, hold_x, hold_y = xt, yt, xt, yt
+    model = Decoder(xt.shape[1], yt.shape[1], hidden, dropout).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    best_state, best_score, best_epoch = None, -float("inf"), 0
     for epoch in range(epochs):
+        model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss = nn.functional.mse_loss(model(features), targets)
-        if not torch.isfinite(loss).item():
-            raise FloatingPointError(f"Nonfinite decoder loss at epoch {epoch + 1}.")
-        loss.backward()
+        nn.functional.mse_loss(model(inner_x), inner_y).backward()
         optimizer.step()
-        losses.append(float(loss.detach()))
-        if (epoch + 1) % 500 == 0 or epoch + 1 == epochs:
-            print(f"      decoder{tag} {epoch + 1}/{epochs}: train MSE={losses[-1]:.6f}", flush=True)
-
-    def predict(z):
-        model.eval()
-        out = []
-        standardized = (z - mean) / scale
-        with torch.inference_mode():
-            for start in range(0, len(standardized), PREDICT_BATCH_SIZE):
-                block = torch.as_tensor(standardized[start:start + PREDICT_BATCH_SIZE],
-                                        dtype=torch.float32, device=device)
-                out.append(model(block).cpu().numpy())
-        return np.concatenate(out, axis=0)
-
-    train_r2 = r2_raw(y_train, predict(z_train))
-    valid_r2 = r2_raw(y_valid, predict(z_valid))
-    del model, features, targets
+        if (epoch + 1) % 25 == 0 or epoch + 1 == epochs:
+            model.eval()
+            with torch.no_grad():
+                score = r2_raw(hold_y.cpu().numpy(), model(hold_x).cpu().numpy())
+            if score > best_score:
+                best_score, best_epoch = score, epoch + 1
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        test = r2_raw(yv.cpu().numpy(), model(xv).cpu().numpy())
+        train = r2_raw(yt.cpu().numpy(), model(xt).cpu().numpy())
+    del model, xt, yt, xv, yv
     cleanup()
-    return dict(train_r2=float(train_r2.mean()), valid_r2=float(valid_r2.mean()),
-                train_r2_per_dimension=train_r2.tolist(),
-                valid_r2_per_dimension=valid_r2.tolist(),
-                final_train_mse=losses[-1] if losses else float("nan"))
+    return dict(r2=test, r2_train=train, r2_internal_holdout=best_score,
+                best_epoch=best_epoch)
 
 
 def safe_ridge(x_train, y_train, x_test, y_test):
-    """Closed-form ridge, in float64 unless the design matrix is too big for it.
-
-    Embedding blocks are tiny, so they always run in float64. The flattened raw
-    window can be 40k x 2k, which is 640 MB per copy in float64; that case falls
-    back to float32, which is fine because the features are standardized and the
-    smallest alpha is 1e-3.
-    """
-    dtype = np.float64 if (x_train.size + x_test.size) * 8 < 1.5e9 else np.float32
-    return _ridge_r2(x_train.astype(dtype), y_train.astype(dtype),
-                     x_test.astype(dtype), y_test.astype(dtype), RIDGE_ALPHAS)
-
-
-def sliding_windows(x, window_size):
-    """(T,N) -> (T-W+1, W*N) flattened windows, matching transform(pad=False)."""
-    strides = np.lib.stride_tricks.sliding_window_view(x, window_size, axis=0)
-    return np.ascontiguousarray(strides.reshape(len(strides), -1))
+    """float64 unless the design matrix would blow past ~1.5 GB per copy."""
+    if (x_train.size + x_test.size) * 8 >= 1.5e9:
+        cast = np.float32
+        print("      (ridge in float32: the raw design matrix is too large for float64)",
+              flush=True)
+    else:
+        cast = np.float64
+    return _ridge_r2(x_train.astype(cast), y_train.astype(np.float64),
+                     x_test.astype(cast), y_test.astype(np.float64), RIDGE_ALPHAS)
 
 
-def raw_window_baseline(x_train, y_train, x_valid, y_valid, window_size, device,
-                        decoder_epochs, run_mlp=True):
-    """Decode behavior straight from the raw window. This is the number every
-    embedding has to beat before it is worth anything.
-    """
-    left = window_size // 2
-    right = window_size - left - 1
-    features_train = sliding_windows(x_train, window_size)
-    features_valid = sliding_windows(x_valid, window_size)
-    targets_train = y_train[left:len(x_train) - right]
-    targets_valid = y_valid[left:len(x_valid) - right]
-    result = dict(n_features=int(features_train.shape[1]), window_size=window_size)
-    if features_train.shape[1] > MAX_RAW_FEATURES:
-        print(f"  raw baseline: {features_train.shape[1]} features > {MAX_RAW_FEATURES}; "
-              f"falling back to the single centre bin.", flush=True)
-        features_train = x_train[left:len(x_train) - right]
-        features_valid = x_valid[left:len(x_valid) - right]
-        result["n_features"] = int(features_train.shape[1])
-        result["window_size"] = 1
-    ridge = safe_ridge(features_train, targets_train, features_valid, targets_valid)
-    result["ridge_valid_r2"] = ridge["r2"]
-    result["ridge_alpha"] = ridge["alpha"]
-    result["participation_ratio"] = ridge["participation_ratio"]
-    if run_mlp:
-        mlp = mlp_r2(features_train, targets_train, features_valid, targets_valid,
-                     device, decoder_epochs, tag=" [raw]")
-        result["mlp_train_r2"] = mlp["train_r2"]
-        result["mlp_valid_r2"] = mlp["valid_r2"]
-    print(f"  RAW WINDOW baseline: ridge valid R2={result['ridge_valid_r2']:.4f}"
-          + (f", MLP valid R2={result['mlp_valid_r2']:.4f}" if run_mlp else "")
-          + f"  ({result['n_features']} features)", flush=True)
-    return result
+def sliding_windows(spikes, window_size):
+    view = np.lib.stride_tricks.sliding_window_view(spikes, window_size, axis=0)
+    return view.reshape(len(view), -1), window_size // 2
 
 
-# --------------------------------------------------------------------------- #
-# one arm
-# --------------------------------------------------------------------------- #
-def build_model(override, epochs, device):
-    settings = dict(
-        window_size=WINDOW_SIZE, n_tiles=N_TILES, tile_gap=TILE_GAP,
-        behavior_dim=BEHAVIOR_DIM, puzzle_dim=PUZZLE_DIM,
-        num_hidden_units=ENCODER_HIDDEN, head_hidden_units=HEAD_HIDDEN,
-        dropout=DROPOUT, temperature=TEMPERATURE, lambda_infonce=LAMBDA_INFONCE,
-        lambda_puzzle=LAMBDA_PUZZLE, lambda_decorrelation=LAMBDA_DECORRELATION,
-        tile_norm=TILE_NORM, neuron_dropout=NEURON_DROPOUT, gain_jitter=GAIN_JITTER,
-        batch_size=BATCH_SIZE, max_epochs=epochs, learning_rate=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY, device=device, random_state=SEED, verbose=True,
-        log_every=max(1, epochs // 20) if epochs else 1,
-    )
+def raw_window_baseline(spikes_train, behavior_train, spikes_test, behavior_test,
+                        window_size, device):
+    """The ceiling: ridge and an MLP on the flattened raw window."""
+    x_train, offset = sliding_windows(spikes_train, window_size)
+    x_test, _ = sliding_windows(spikes_test, window_size)
+    y_train = behavior_train[offset:offset + len(x_train)]
+    y_test = behavior_test[offset:offset + len(x_test)]
+    ridge = safe_ridge(x_train, y_train, x_test, y_test)
+    mlp = mlp_r2(x_train, y_train, x_test, y_test, epochs=DECODER_EPOCHS,
+                 hidden=DECODER_HIDDEN, dropout=DECODER_DROPOUT,
+                 learning_rate=DECODER_LR, seed=SEED, device=device)
+    return dict(ridge=ridge, mlp=mlp, n_features=int(x_train.shape[1]))
+
+
+def build_model(override, epochs, device, verbose):
+    settings = dict(window_size=WINDOW_SIZE, n_tiles=N_TILES, tile_gap=TILE_GAP,
+                    output_dimension=OUTPUT_DIMENSION, num_hidden_units=NUM_HIDDEN_UNITS,
+                    head_hidden_units=HEAD_HIDDEN_UNITS, tile_norm=TILE_NORM,
+                    neuron_dropout=NEURON_DROPOUT, gain_jitter=GAIN_JITTER,
+                    batch_size=BATCH_SIZE, max_epochs=epochs,
+                    learning_rate=LEARNING_RATE, device=device, random_state=SEED,
+                    verbose=verbose, log_every=max(1, epochs // 10) if epochs else 1)
     settings.update(override)
-    return JigsawCEBRA(**settings)
+    return JigsawNet(**settings)
 
 
-def puzzle_report(model, x, name):
-    metrics = model.evaluate_puzzle(x, max_spans=PUZZLE_EVAL_SPANS, batch_size=PUZZLE_EVAL_BATCH,
-                                    random_state=PUZZLE_EVAL_SEED, verbose=False)
-    spans = metrics["n_spans"]
-    pairs = spans * model.n_tiles * (model.n_tiles - 1)
-    exact_test = proportion_versus_chance(
-        metrics["exact_accuracy_percent"] / 100 * spans, spans,
-        metrics["chance_exact_accuracy_percent"] / 100)
-    pair_test = proportion_versus_chance(
-        metrics["pair_accuracy_percent"] / 100 * pairs, pairs, 0.5)
-    metrics["exact_significance"] = exact_test
-    metrics["pair_significance"] = pair_test
-    verdict = "ABOVE CHANCE" if (exact_test["above_chance"] or pair_test["above_chance"]) \
-        else "at chance -> the pretext was NOT learned on this split"
-    print(f"  puzzle[{name}]: exact={metrics['exact_accuracy_percent']:.2f}% "
-          f"[{exact_test['ci_low']:.2f}, {exact_test['ci_high']:.2f}] "
-          f"vs chance {metrics['chance_exact_accuracy_percent']:.2f}% (z={exact_test['z']:.2f}) | "
-          f"pair={metrics['pair_accuracy_percent']:.2f}% vs 50% (z={pair_test['z']:.2f}) | "
-          f"mean-sort shortcut {metrics['baseline_mean_sort_pair_percent']:.1f}% | {verdict}",
-          flush=True)
+def pretext_report(model, spikes_valid):
+    metrics = model.evaluate_pretext(spikes_valid, max_spans=PRETEXT_SPANS, verbose=False)
+    n = metrics["n_spans"]
+    exact_chance = metrics["chance_exact_percent"] / 100.0
+    exact = versus_chance(round(metrics["exact_accuracy_percent"] / 100.0 * n), n, exact_chance)
+    pair = versus_chance(round(metrics["pair_accuracy_percent"] / 100.0 * n), n, 0.5)
+    metrics["exact_test"] = exact
+    metrics["pair_test"] = pair
+    # "learned" requires beating BOTH chance and the level-sorting shortcut.
+    metrics["learned"] = bool(
+        (exact["significant"] or pair["significant"])
+        and metrics["pair_accuracy_percent"] > metrics["baseline_mean_sort_pair_percent"] + 1.0)
     return metrics
 
 
-def run_arm(name, override, data, out_root, device, epochs, decoder_epochs):
-    x_train, x_valid, y_train, y_valid, x_eval = data
-    seed_all(SEED)
-    out = out_root / name
-    out.mkdir(parents=True, exist_ok=True)
-    print(f"\n===== arm: {name}  {override or '(defaults)'} =====", flush=True)
+def run_arm(name, override, data, device, epochs, verbose):
+    spikes_train, behavior_train, spikes_valid, behavior_valid = data
+    started = time.time()
+    model = build_model(override, epochs, device, verbose)
+    model.fit(spikes_train, X_valid=spikes_valid,
+              validate_every=max(1, epochs // 6) if epochs else 1)
 
-    model = build_model(override, epochs, device)
-    save_json(out / "config.json", dict(arm=name, override=override, params=model.get_params()))
-    started = time.perf_counter()
-    model.fit(x_train, X_valid=x_valid, validate_every=max(1, epochs // 10) if epochs else 1)
-    train_seconds = time.perf_counter() - started
-    model.save(out / "encoder.pt")
-    save_json(out / "history.json", model.history_)
-    save_json(out / "validation_history.json", model.validation_history_)
+    z_train, index_train = model.transform(spikes_train, pad=False, return_indices=True)
+    z_valid, index_valid = model.transform(spikes_valid, pad=False, return_indices=True)
+    y_train = behavior_train[index_train]
+    y_valid = behavior_valid[index_valid]
 
-    # Puzzle: on the training split (how much was memorized) and on held-out data.
-    puzzle_train = puzzle_report(model, x_train, "train")
-    puzzle_valid = puzzle_report(model, x_valid, "valid")
-    puzzle_test = puzzle_report(model, x_eval, "test") if x_eval is not None else None
-    save_json(out / "puzzle.json", dict(train=puzzle_train, valid=puzzle_valid, test=puzzle_test))
-
-    # Embeddings. pad=False plus return_indices keeps labels exactly aligned and
-    # avoids the edge-padding artifact at the two ends of the recording.
-    z_train, index_train = model.transform(x_train, block="behavior", pad=False,
-                                           batch_size=2048, return_indices=True)
-    z_valid, index_valid = model.transform(x_valid, block="behavior", pad=False,
-                                           batch_size=2048, return_indices=True)
-    targets_train, targets_valid = y_train[index_train], y_valid[index_valid]
-    for name_, z in (("train", z_train), ("valid", z_valid)):
-        if not np.isfinite(z).all():
-            raise FloatingPointError(f"Nonfinite {name_} embedding in arm {name}.")
-    np.savez_compressed(out / "embeddings.npz", Z_train=z_train, Z_valid=z_valid,
-                        Y_train=targets_train, Y_valid=targets_valid,
-                        train_indices=index_train, valid_indices=index_valid)
-
-    ridge = safe_ridge(z_train, targets_train, z_valid, targets_valid)
-    mlp = mlp_r2(z_train, targets_train, z_valid, targets_valid, device, decoder_epochs)
-    # The nuisance block: order information is supposed to have moved HERE.
-    z_puzzle_train = model.transform(x_train, block="puzzle", pad=False, batch_size=2048)
-    z_puzzle_valid = model.transform(x_valid, block="puzzle", pad=False, batch_size=2048)
-    ridge_puzzle = safe_ridge(z_puzzle_train, targets_train, z_puzzle_valid, targets_valid)
-    scores = dict(ridge_behavior=ridge, ridge_puzzle=ridge_puzzle, mlp_behavior=mlp)
-    save_json(out / "R2.json", scores)
-
-    row = dict(
-        arm=name, override=json.dumps(override), out_dir=str(out),
-        epochs=epochs if "max_epochs" not in override else override["max_epochs"],
-        n_tiles=model.n_tiles, train_seconds=train_seconds,
-        r2_ridge_valid=ridge["r2"], r2_ridge_train_pr=ridge["participation_ratio"],
-        r2_mlp_train=mlp["train_r2"], r2_mlp_valid=mlp["valid_r2"],
-        r2_puzzle_block_valid=ridge_puzzle["r2"],
-        puzzle_train_exact=puzzle_train["exact_accuracy_percent"],
-        puzzle_valid_exact=puzzle_valid["exact_accuracy_percent"],
-        puzzle_valid_exact_ci_low=puzzle_valid["exact_significance"]["ci_low"],
-        puzzle_valid_exact_ci_high=puzzle_valid["exact_significance"]["ci_high"],
-        puzzle_valid_exact_z=puzzle_valid["exact_significance"]["z"],
-        puzzle_chance_exact=puzzle_valid["chance_exact_accuracy_percent"],
-        puzzle_train_pair=puzzle_train["pair_accuracy_percent"],
-        puzzle_valid_pair=puzzle_valid["pair_accuracy_percent"],
-        puzzle_valid_pair_z=puzzle_valid["pair_significance"]["z"],
-        shortcut_mean_sort_pair=puzzle_valid["baseline_mean_sort_pair_percent"],
-        shortcut_norm_sort_pair=puzzle_valid["baseline_norm_sort_pair_percent"],
-        puzzle_learned=bool(puzzle_valid["pair_significance"]["above_chance"]
-                            or puzzle_valid["exact_significance"]["above_chance"]),
-        infonce_final=model.history_[-1]["contrastive"] if model.history_ else float("nan"),
-        infonce_accuracy_final=(100 * model.history_[-1]["contrastive_accuracy"]
-                                if model.history_ else float("nan")),
-    )
-    print(f"[{name}] valid R2: ridge={row['r2_ridge_valid']:.4f}  MLP={row['r2_mlp_valid']:.4f} "
-          f"(train {row['r2_mlp_train']:.4f}) | puzzle block R2={row['r2_puzzle_block_valid']:.4f} "
-          f"| puzzle learned: {row['puzzle_learned']} | {train_seconds:.0f}s", flush=True)
-    del model, z_train, z_valid, z_puzzle_train, z_puzzle_valid
+    mlp = mlp_r2(z_train, y_train, z_valid, y_valid, epochs=DECODER_EPOCHS,
+                 hidden=DECODER_HIDDEN, dropout=DECODER_DROPOUT,
+                 learning_rate=DECODER_LR, seed=SEED, device=device)
+    ridge = safe_ridge(z_train, y_train, z_valid, y_valid)
+    pretext = pretext_report(model, spikes_valid)
+    del model, z_train, z_valid
     cleanup()
-    return row
+    return dict(arm=name, override=override, mlp=mlp, ridge=ridge, pretext=pretext,
+                seconds=time.time() - started)
 
 
-# --------------------------------------------------------------------------- #
-# reporting
-# --------------------------------------------------------------------------- #
-def plot_summary(summary, baseline, out_root, session):
-    names = [row["arm"] for row in summary]
-    x = np.arange(len(names))
-    fig, axes = plt.subplots(1, 2, figsize=(max(11, 1.6 * len(names) + 5), 5),
-                             constrained_layout=True)
-
-    axes[0].bar(x - 0.19, [row["r2_mlp_train"] for row in summary], width=0.38, label="train (MLP)")
-    axes[0].bar(x + 0.19, [row["r2_mlp_valid"] for row in summary], width=0.38, label="valid (MLP)")
-    axes[0].plot(x, [row["r2_ridge_valid"] for row in summary], "k.", markersize=9,
-                 label="valid (ridge)")
-    if baseline is not None:
-        level = baseline.get("mlp_valid_r2", baseline["ridge_valid_r2"])
-        axes[0].axhline(level, color="crimson", linestyle="--", linewidth=1.4,
-                        label=f"raw window ({level:.3f})")
-    axes[0].axhline(0, color="black", linewidth=0.8)
-    axes[0].set_xticks(x, names, rotation=30, ha="right")
-    axes[0].set_ylabel("Behavior decoding R2")
-    axes[0].set_title("What actually matters: R2 vs the raw-window ceiling")
-    axes[0].legend(fontsize=8)
-
-    axes[1].bar(x - 0.19, [row["puzzle_train_pair"] for row in summary], width=0.38, label="train")
-    axes[1].bar(x + 0.19, [row["puzzle_valid_pair"] for row in summary], width=0.38, label="valid")
-    axes[1].plot(x, [row["shortcut_mean_sort_pair"] for row in summary], "v", color="darkorange",
-                 markersize=8, label="mean-sort shortcut")
-    axes[1].axhline(50, color="black", linestyle="--", linewidth=1, label="chance (50%)")
-    axes[1].set_xticks(x, names, rotation=30, ha="right")
-    axes[1].set_ylabel("Pairwise order accuracy (%)")
-    axes[1].set_ylim(40, 100)
-    axes[1].set_title("Was the pretext learned at all?")
-    axes[1].legend(fontsize=8)
-
-    fig.suptitle(f"{session} | JigsawCEBRA ablation (seed {SEED})")
-    fig.savefig(out_root / "ablation.png", dpi=220)
-    plt.close(fig)
-
-
-def print_table(summary, baseline):
-    header = (f"{'arm':<20}{'R2 valid':>10}{'R2 train':>10}{'R2 ridge':>10}"
-              f"{'pair %':>9}{'shortcut':>10}{'exact %':>9}{'chance':>8}{'z':>7}{'learned':>9}")
+def print_table(results, baseline):
+    rows = [r for r in results.values() if "error" not in r]
+    if not rows:
+        print("no arm completed")
+        return
+    reference = results.get("random_encoder", {}).get("mlp", {}).get("r2")
+    header = (f"{'arm':<20}{'R2 mlp':>9}{'R2 train':>10}{'R2 ridge':>10}"
+              f"{'d.random':>10}{'pair%':>8}{'shortcut':>10}{'exact%':>8}"
+              f"{'chance':>8}{'z':>7}{'learned':>9}")
     print("\n" + "=" * len(header))
-    print("SUMMARY (sorted by validation R2)")
+    print("SUMMARY")
     print("=" * len(header))
     print(header)
     print("-" * len(header))
-    for row in summary:
-        print(f"{row['arm']:<20}{row['r2_mlp_valid']:>10.4f}{row['r2_mlp_train']:>10.4f}"
-              f"{row['r2_ridge_valid']:>10.4f}{row['puzzle_valid_pair']:>9.2f}"
-              f"{row['shortcut_mean_sort_pair']:>10.2f}{row['puzzle_valid_exact']:>9.2f}"
-              f"{row['puzzle_chance_exact']:>8.2f}{row['puzzle_valid_pair_z']:>7.2f}"
-              f"{str(row['puzzle_learned']):>9}")
+    for row in sorted(rows, key=lambda r: -r["mlp"]["r2"]):
+        p = row["pretext"]
+        delta = (row["mlp"]["r2"] - reference) if reference is not None else float("nan")
+        print(f"{row['arm']:<20}{row['mlp']['r2']:>9.4f}{row['mlp']['r2_train']:>10.4f}"
+              f"{row['ridge']['r2']:>10.4f}{delta:>+10.4f}"
+              f"{p['pair_accuracy_percent']:>8.2f}{p['baseline_mean_sort_pair_percent']:>10.2f}"
+              f"{p['exact_accuracy_percent']:>8.2f}{p['chance_exact_percent']:>8.2f}"
+              f"{p['exact_test']['z']:>7.2f}{str(p['learned']):>9}")
     print("-" * len(header))
-    if baseline is not None:
-        print(f"{'RAW WINDOW':<20}{baseline.get('mlp_valid_r2', float('nan')):>10.4f}"
-              f"{'':>10}{baseline['ridge_valid_r2']:>10.4f}"
-              f"   <- no encoder at all; every arm must beat this to be useful")
+    print(f"{'RAW WINDOW':<20}{baseline['mlp']['r2']:>9.4f}"
+          f"{baseline['mlp']['r2_train']:>10.4f}{baseline['ridge']['r2']:>10.4f}"
+          f"{'':>10}{'':>8}{'':>10}{'':>8}{'':>8}{'':>7}{'':>9}"
+          f"   <- CEILING ({baseline['n_features']} features)")
+    print("=" * len(header))
 
-    best = summary[0]
-    by_name = {row["arm"]: row for row in summary}
+    best = max(rows, key=lambda r: r["mlp"]["r2"])
+    ceiling = max(baseline["mlp"]["r2"], baseline["ridge"]["r2"])
     print("\nHOW TO READ THIS")
-    if not any(row["puzzle_learned"] for row in summary):
-        print("  * NO arm beat chance on held-out order. Nothing here supports any claim "
-              "about what puzzle learning does to an embedding: the pretext was never "
-              "learned out of sample, so every encoder is effectively a random encoder.")
-    if "proposed" in by_name and "infonce_only" in by_name:
-        delta = by_name["proposed"]["r2_mlp_valid"] - by_name["infonce_only"]["r2_mlp_valid"]
-        print(f"  * proposed - infonce_only = {delta:+.4f} R2  <- the PUZZLE's contribution.")
-    if "proposed" in by_name and "random_encoder" in by_name:
-        delta = by_name["proposed"]["r2_mlp_valid"] - by_name["random_encoder"]["r2_mlp_valid"]
-        print(f"  * proposed - random_encoder = {delta:+.4f} R2  <- TRAINING's contribution. "
-              f"If this is ~0, the decoder is doing all the work.")
-    if baseline is not None:
-        level = baseline.get("mlp_valid_r2", baseline["ridge_valid_r2"])
-        print(f"  * best arm ({best['arm']}) - raw window = "
-              f"{best['r2_mlp_valid'] - level:+.4f} R2  <- the encoder's contribution.")
-    print("  * If 'pair %' sits on 'shortcut', the puzzle is being solved by level drift.")
+    print("  d.random  = R2 minus the frozen random_encoder arm. NEGATIVE means")
+    print("              training destroyed information. Pretext accuracy cannot")
+    print("              rescue a negative number here.")
+    print("  shortcut  = sort-tiles-by-mean-activity pair accuracy. The model must")
+    print("              beat this, not just beat 50%.")
+    print("  learned   = significant vs chance AND above the shortcut baseline.")
+    print(f"\nbest arm: {best['arm']}  R2={best['mlp']['r2']:.4f}")
+    if reference is not None:
+        verdict = ("training ADDS value" if best["mlp"]["r2"] > reference
+                   else "!! every trained arm is at or below the RANDOM encoder "
+                        "-- the objective is not building a useful embedding")
+        print(f"  vs random_encoder ({reference:.4f}): {verdict}")
+    gap = best["mlp"]["r2"] - ceiling
+    print(f"  vs raw-window ceiling ({ceiling:.4f}): {gap:+.4f}"
+          + ("" if gap >= 0 else "  <- the encoder is a lossy bottleneck; try a larger"
+                                 " output_dimension (dim_128 / dim_256) before anything else"))
+    learners = [r["arm"] for r in rows if r["pretext"]["learned"]]
+    print(f"  arms that actually learned the pretext: {learners or 'NONE'}")
+    if learners and gap < 0:
+        print("  note: pretext learned but R2 still under the ceiling -> the order task")
+        print("        is solvable yet its solution is not what the decoder needs.")
 
 
-# --------------------------------------------------------------------------- #
 def main():
-    parser = argparse.ArgumentParser(description="JigsawCEBRA experiments",
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--session", default="C-CO16")
-    parser.add_argument("--data-dir", default=str(PERICH_DATA_DIR))
-    parser.add_argument("--arms", nargs="+", choices=sorted(ARMS), default=list(DEFAULT_ARMS))
-    parser.add_argument("--all-arms", action="store_true", help="run every arm in ARMS")
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--decoder-epochs", type=int, default=None)
-    parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--no-raw-baseline", action="store_true")
-    parser.add_argument("--quick", action="store_true",
-                        help="Few epochs, small decoder. Run this once before the full table.")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--arms", nargs="+", default=list(DEFAULT_ARMS))
+    parser.add_argument("--list", action="store_true", help="print the arm table and exit")
+    parser.add_argument("--data-dir", type=Path, default=PERICH_DATA_DIR)
+    parser.add_argument("--out-dir", type=Path, default=OUTPUT_ROOT)
+    parser.add_argument("--sessions", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--tag", default="JIGSAWNET")
+    parser.add_argument("--quiet", action="store_true")
     options = parser.parse_args()
 
-    epochs = options.epochs if options.epochs is not None else (3 if options.quick else EPOCHS)
-    decoder_epochs = options.decoder_epochs if options.decoder_epochs is not None \
-        else (200 if options.quick else DECODER_EPOCHS)
-    arms = sorted(ARMS) if options.all_arms else options.arms
+    if options.list:
+        width = max(len(k) for k in ARMS)
+        for name, override in ARMS.items():
+            mark = "*" if name in DEFAULT_ARMS else " "
+            print(f" {mark} {name:<{width}}  {override or '(defaults)'}")
+        print("\n* = in the default set")
+        return
 
-    path = Path(options.data_dir) / f"{options.session}.npz"
-    x_train, x_valid, y_train, y_valid, x_test = load_session(path)
-    x_eval = x_test if x_test is not None else x_valid
-    device_name = options.device
-    if device_name == "cuda_if_available":
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_root = ROOT / f"JIGSAW_CEBRA_{options.session}_{stamp}"
-    out_root.mkdir(parents=True, exist_ok=True)
-    print(f"Session {options.session}: train={x_train.shape} valid={x_valid.shape} "
-          f"labels={y_train.shape[1]}D | puzzle-eval split="
-          f"{'test_data' if x_test is not None else 'valid_data'} | device={device_name} | "
-          f"epochs={epochs} | arms={arms}\nOutput: {out_root}", flush=True)
+    unknown = [a for a in options.arms if a not in ARMS]
+    if unknown:
+        raise SystemExit(f"unknown arm(s) {unknown}\nvalid: {sorted(ARMS)}")
+    if "random_encoder" not in options.arms:
+        options.arms = list(options.arms) + ["random_encoder"]
+        print("note: added the random_encoder control -- results are unreadable without it.")
 
     seed_all(SEED)
-    baseline = None
-    if not options.no_raw_baseline:
-        baseline = raw_window_baseline(x_train, y_train, x_valid, y_valid, WINDOW_SIZE,
-                                       device_name, decoder_epochs)
-        save_json(out_root / "raw_window_baseline.json", baseline)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    files = sorted(p for p in options.data_dir.glob("*.npz"))
+    if not files:
+        raise SystemExit(f"no .npz files under {options.data_dir}")
+    files = files[:max(1, options.sessions)]
+    stamp = time.strftime("%Y%m%d_%H%M%S")
 
-    data = (x_train, x_valid, y_train, y_valid, x_eval)
-    summary = []
-    for arm in arms:
-        summary.append(run_arm(arm, ARMS[arm], data, out_root, device_name, epochs, decoder_epochs))
-        summary_sorted = sorted(summary, key=lambda row: row["r2_mlp_valid"], reverse=True)
-        save_json(out_root / "summary.json",
-                  dict(session=options.session, seed=SEED, epochs=epochs,
-                       raw_window_baseline=baseline, arms=summary_sorted))
-    summary.sort(key=lambda row: row["r2_mlp_valid"], reverse=True)
+    for path in files:
+        spikes, behavior = load_session(path)
+        cut = int(TRAIN_FRACTION * len(spikes))
+        data = (spikes[:cut], behavior[:cut], spikes[cut:], behavior[cut:])
+        out_dir = options.out_dir / f"{options.tag}_{path.stem}_{stamp}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print("\n" + "#" * 78)
+        print(f"# {path.stem}: {len(spikes)} bins, {spikes.shape[1]} neurons, "
+              f"{behavior.shape[1]} behavior dims | train {cut} / valid {len(spikes) - cut}")
+        print(f"# device={device} epochs={options.epochs} -> {out_dir}")
+        print("#" * 78, flush=True)
 
-    with (out_root / "summary.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(summary[0].keys()))
-        writer.writeheader()
-        writer.writerows(summary)
-    plot_summary(summary, baseline, out_root, options.session)
-    print_table(summary, baseline)
-    print(f"\nSaved: {out_root}", flush=True)
+        print("\n[ceiling] ridge + MLP on the raw window", flush=True)
+        baseline = raw_window_baseline(*data, WINDOW_SIZE, device)
+        print(f"  raw window: ridge R2={baseline['ridge']['r2']:.4f}  "
+              f"MLP R2={baseline['mlp']['r2']:.4f}  ({baseline['n_features']} features)",
+              flush=True)
+
+        results = {}
+        for i, name in enumerate(options.arms, 1):
+            print(f"\n[{i}/{len(options.arms)}] {name}  {ARMS[name] or '(defaults)'}", flush=True)
+            try:
+                results[name] = run_arm(name, ARMS[name], data, device,
+                                        options.epochs, not options.quiet)
+                row = results[name]
+                print(f"  -> R2 mlp={row['mlp']['r2']:.4f} ridge={row['ridge']['r2']:.4f} "
+                      f"| pair={row['pretext']['pair_accuracy_percent']:.2f}% "
+                      f"(shortcut {row['pretext']['baseline_mean_sort_pair_percent']:.2f}%) "
+                      f"| {row['seconds']:.0f}s", flush=True)
+            except Exception as error:  # one bad arm must not kill the sweep
+                traceback.print_exc()
+                results[name] = dict(arm=name, error=f"{type(error).__name__}: {error}")
+                cleanup()
+            save_json(out_dir / "results.json",
+                      dict(session=path.stem, stamp=stamp, device=device,
+                           epochs=options.epochs, baseline=baseline, arms=results))
+
+        print_table(results, baseline)
+        print(f"\nwritten to {out_dir / 'results.json'}")
 
 
 if __name__ == "__main__":
     main()
+
 
 # """Sweep NeuralJigsaw's tile_normalize modes on one session and compare them
 # on BOTH puzzle-solving accuracy and downstream behavioral R^2 -- the two
