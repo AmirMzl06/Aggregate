@@ -48,7 +48,7 @@ MODELS = {"jigsaw": JigsawNet, "mobile": MobileJigsaw}
 
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 OUTPUT_ROOT = Path("/home/mirzaei/sam/result/Aggregate")
-SEED = 42
+SEED = 8
 
 WINDOW_SIZE = 10
 N_TILES = 4
