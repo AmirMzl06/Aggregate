@@ -6,18 +6,29 @@ only loads data, runs arms, and reports.
     python run_jigsaw.py --list
     python run_jigsaw.py --epochs 200 --sessions 3
 
-THE THREE NUMBERS THAT DECIDE EVERYTHING
+THE FOUR NUMBERS THAT DECIDE EVERYTHING
   R2 raw     ridge on the raw window. The CEILING. Not a baseline you may lose
              to -- if your embedding is below it, the encoder deleted signal.
   R2 random  the SAME architecture with max_epochs=0, frozen at init. This is
              what your weights are worth before any learning. If a trained arm
              is below it, training made things worse, and pretext accuracy is
              irrelevant at that point.
-  pair %     held-out order accuracy, chance 50%. Reported next to the
-             sort-by-mean shortcut baseline. Model >> baseline or it is cheating.
+  pair %     held-out order accuracy. The decode is now an ASSIGNMENT (a real
+             permutation), so chance is exactly 50% and a degenerate head scores
+             50%, not 0%. Reported next to the sort-by-mean shortcut baseline.
+  p.ratio    participation ratio of the embedding. In the 2026-09-22 run it
+             tracked ridge R2 almost monotonically (order_only: 3.4/64 -> 0.005).
+             A collapsing p.ratio is the failure, and no pretext number fixes it.
 
 Every arm also prints delta_random = R2 - R2(random_encoder), which is the only
 honest measure of what training contributed.
+
+EPOCHS ARE A HYPERPARAMETER, NOT A BUDGET. Spans overlap by construction
+(stride 1), so the effective sample size is far below the span count and a big
+epoch count memorizes the pretext task: the 6000-epoch run reached a held-out
+position cross-entropy of 5.7-36.8 against a uniform 1.386, i.e. confidently
+WRONG out of sample. Run `--arms epochs_10 epochs_30 ... ` (or just
+`--epoch-sweep`) before believing any single-epoch-count table.
 """
 import argparse
 import json
@@ -30,11 +41,15 @@ import numpy as np
 import torch
 from torch import nn
 
-from Neural_Jigsaw import JigsawNet, _ridge_r2
+from jigsaw_net import JigsawNet, _ridge_r2
+from mobile_jigsaw import MobileJigsaw
+
+MODELS = {"jigsaw": JigsawNet, "mobile": MobileJigsaw}
 
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 OUTPUT_ROOT = Path("/home/mirzaei/sam/result/Aggregate")
 SEED = 42
+TRAIN_FRACTION = 0.8
 
 WINDOW_SIZE = 10
 N_TILES = 4
@@ -67,15 +82,40 @@ ARMS = {
     # Frozen at init. THE reference point. Beat this or nothing else matters.
     "random_encoder": dict(max_epochs=0),
     # Order CE only: the classic jigsaw. Nothing keeps firing-rate level.
-    "order_only": dict(lambda_forecast=0.0),
+    # This is the arm that collapsed to p.ratio 3.4/64 and R2 0.005.
+    "order_only": dict(lambda_forecast=0.0, lambda_reconstruct=0.0),
     # Forecast CE only: is the puzzle contributing anything at all?
-    "forecast_only": dict(lambda_order=0.0, lambda_pair=0.0),
+    "forecast_only": dict(lambda_order=0.0, lambda_pair=0.0, lambda_reconstruct=0.0),
+    # The anti-collapse anchor on its own: a pure denoising autoencoder in CE
+    # form, no puzzle at all. If THIS is the best arm, the jigsaw is dead weight
+    # and you should say so in the paper rather than hide it.
+    "reconstruct_only": dict(lambda_order=0.0, lambda_pair=0.0, lambda_forecast=0.0),
+    # The proposal MINUS the anchor == the model that produced the 2026-09-22
+    # table. Its job is to reproduce the collapse, so the anchor's effect is
+    # measured against the right thing and not against a random encoder.
+    "no_reconstruct": dict(lambda_reconstruct=0.0),
+    # Puzzle + anchor, no forecasting: is forecast doing anything the
+    # reconstruction is not already doing? They are both "keep the rate".
+    "order_reconstruct": dict(lambda_forecast=0.0),
+    # Anchor turned up. If R2 keeps climbing with this, the bottleneck -- not
+    # the pretext task -- is what the whole experiment is measuring.
+    "reconstruct_heavy": dict(lambda_reconstruct=4.0),
     # Order head trains on a trunk it cannot influence. Asks "is order
     # decodable from a forecast-trained trunk?" with zero risk to R2.
     "order_probe_only": dict(order_grad_scale=0.0),
     # Every anti-shortcut guard off. If pretext accuracy JUMPS here, the task
     # was being solved by level drift, not by temporal structure.
     "shortcut_open": dict(tile_norm="none", neuron_dropout=0.0, gain_jitter=0.0),
+
+    # ---- epochs. The 6000-epoch run memorized the pretext task ----------- #
+    # Held-out position CE was 5.7-36.8 against a uniform 1.386: confidently
+    # wrong, which is overfitting, not underfitting. Spans overlap at stride 1,
+    # so ~2400 spans are worth far fewer independent samples than that.
+    "epochs_10": dict(max_epochs=10),
+    "epochs_30": dict(max_epochs=30),
+    "epochs_100": dict(max_epochs=100),
+    "epochs_300": dict(max_epochs=300),
+    "epochs_1000": dict(max_epochs=1000),
 
     # ---- the bottleneck, which the numpy analysis says costs the most ---- #
     "dim_16": dict(output_dimension=16),
@@ -86,8 +126,9 @@ ARMS = {
     # ---- ablations ------------------------------------------------------- #
     # The sphere. Expected to LOSE: it deletes magnitude.
     "normalized": dict(normalize=True),
-    # Advisor's suggestion: depthwise-separable / MobileNetV2 inverted residual.
-    "mobilenet_trunk": dict(trunk_block="separable"),
+    # A single MobileNetV2-style block dropped into the PLAIN trunk. Cheap
+    # sanity check; for the real architecture use the mobile_* arms below.
+    "separable_block": dict(trunk_block="separable"),
     # Difficulty ladder. n_tiles=2 is the most sensitive learnability test
     # there is: chance is exactly 50%, so tiny effects are detectable.
     "tiles_2": dict(n_tiles=2),
@@ -100,10 +141,49 @@ ARMS = {
     "forecast_4": dict(forecast_levels=4),
     "forecast_16": dict(forecast_levels=16),
     "zscore_tiles": dict(tile_norm="zscore"),
+
+    # ---- MOBILENET TRUNKS ------------------------------------------------ #
+    # Same losses, same tiles, same seed -- only the trunk changes, so any
+    # difference here is attributable to the architecture. "_model" is consumed
+    # by build_model and is not a constructor argument.
+    "mobile_v1": dict(_model="mobile", version="v1"),
+    "mobile_v2": dict(_model="mobile", version="v2", expansion=3),
+    # The paper's t=6. In 1D this is ~4x MORE parameters than a plain conv, so
+    # it is a capacity arm, not an efficiency arm. Label it honestly.
+    "mobile_v2_t6": dict(_model="mobile", version="v2", expansion=6),
+    "mobile_v3": dict(_model="mobile", version="v3"),
+    # Image-style stem: mixes neurons immediately instead of giving each neuron
+    # its own temporal filter. Isolates the EEGNet-style inductive bias.
+    "mobile_stem_mix": dict(_model="mobile", stem="mix"),
+    # alpha, MobileNet's real efficiency knob. Small alpha = regularization,
+    # which is the plausible win on short sessions.
+    "mobile_alpha_035": dict(_model="mobile", width_multiplier=0.35),
+    "mobile_alpha_050": dict(_model="mobile", width_multiplier=0.5),
+    "mobile_alpha_140": dict(_model="mobile", width_multiplier=1.4),
+    # Canonical MobileNet normalization. Expected to LOSE: running statistics
+    # are collected on the augmented/normalized training views and then applied
+    # to the raw windows transform sees. The table prints the measured gap.
+    "mobile_batchnorm": dict(_model="mobile", norm="batch"),
+    "mobile_hardswish": dict(_model="mobile", activation="hardswish"),
+    # MobileNet's final 1x1 before the classifier.
+    "mobile_head_256": dict(_model="mobile", head_channels=256),
+    # The control that makes the whole comparison readable.
+    "mobile_random": dict(_model="mobile", max_epochs=0),
 }
 
-DEFAULT_ARMS = ("proposed", "random_encoder", "order_only", "forecast_only",
-                "shortcut_open", "dim_256", "mobilenet_trunk", "tiles_2")
+DEFAULT_ARMS = ("proposed", "no_reconstruct", "random_encoder", "order_only",
+                "forecast_only", "reconstruct_only", "order_reconstruct",
+                "shortcut_open", "dim_256", "tiles_2",
+                "mobile_v1", "mobile_v2", "mobile_v3", "mobile_alpha_035",
+                "mobile_stem_mix", "mobile_random")
+
+# The epoch sweep. Run this FIRST on a new session: every other comparison is
+# conditional on being in a sane epoch regime, and the previous table was not.
+EPOCH_ARMS = ("epochs_10", "epochs_30", "epochs_100", "epochs_300",
+              "epochs_1000", "random_encoder")
+
+# Arms grouped by trunk, so the table can be read per-architecture.
+MOBILE_ARMS = tuple(k for k, v in ARMS.items() if v.get("_model") == "mobile")
 
 
 # --------------------------------------------------------------------------- #
@@ -172,59 +252,34 @@ def versus_chance(successes, trials, chance):
 
 
 def load_session(path):
-    """Load the existing NPZ train/validation split without splitting again.
-
-    Keep the original runner's first-two-label selection. The neuron mask is
-    fitted on training data only and applied identically to both splits.
-    """
-    path = Path(path)
-    required = ("train_data", "train_label", "valid_data", "valid_label")
-    with np.load(path, allow_pickle=False) as handle:
-        missing = [key for key in required if key not in handle.files]
-        if missing:
-            raise KeyError(
-                f"{path.name}: missing NPZ keys {missing}; has {sorted(handle.files)}")
-        arrays = [np.asarray(handle[key], dtype=np.float32) for key in required]
-
-    splits = []
-    for name, spikes, behavior in (("train", arrays[0], arrays[1]),
-                                  ("valid", arrays[2], arrays[3])):
-        if behavior.ndim == 1:
-            behavior = behavior[:, None]
-        if spikes.ndim != 2 or behavior.ndim != 2:
-            raise ValueError(
-                f"{path.name}: {name} data/labels must be 2D; "
-                f"got {spikes.shape} and {behavior.shape}")
-        # Preserve support for neural arrays stored as (neurons, time).
-        if len(spikes) != len(behavior) and spikes.shape[1] == len(behavior):
-            spikes = spikes.T
-        if len(spikes) != len(behavior):
-            raise ValueError(
-                f"{path.name}: {name} data/label length mismatch: "
-                f"{len(spikes)} vs {len(behavior)}")
-        if len(spikes) == 0 or spikes.shape[1] == 0 or behavior.shape[1] == 0:
-            raise ValueError(f"{path.name}: {name} contains an empty array")
+    with np.load(path, allow_pickle=True) as handle:
+        keys = set(handle.files)
+        spikes_key = next((k for k in ("spikes", "neural", "rates", "X", "counts")
+                           if k in keys), None)
+        behavior_key = next((k for k in ("behavior", "velocity", "vel", "Y", "y", "kin")
+                            if k in keys), None)
+        if spikes_key is None or behavior_key is None:
+            raise KeyError(f"{path.name}: need a spike key and a behavior key; has {sorted(keys)}")
+        spikes = np.asarray(handle[spikes_key], dtype=np.float32)
+        behavior = np.asarray(handle[behavior_key], dtype=np.float32)
+    if spikes.ndim != 2:
+        raise ValueError(f"{path.name}: spikes must be 2D, got {spikes.shape}")
+    if behavior.ndim == 1:
+        behavior = behavior[:, None]
+    if spikes.shape[0] != behavior.shape[0] and spikes.shape[1] == behavior.shape[0]:
+        spikes = spikes.T
+    length = min(len(spikes), len(behavior))
+    spikes, behavior = spikes[:length], behavior[:length]
+    if behavior.shape[1] > 2:
+        behavior = behavior[:, :2]
+    keep = np.isfinite(spikes).all(1) & np.isfinite(behavior).all(1)
+    if not keep.all():
+        first, last = int(np.argmax(keep)), length - int(np.argmax(keep[::-1]))
+        spikes, behavior = spikes[first:last], behavior[first:last]
         if not (np.isfinite(spikes).all() and np.isfinite(behavior).all()):
-            raise ValueError(f"{path.name}: {name} contains NaN or Inf")
-        splits.append((spikes, behavior))
-
-    spikes_train, behavior_train = splits[0]
-    spikes_valid, behavior_valid = splits[1]
-    if spikes_train.shape[1] != spikes_valid.shape[1]:
-        raise ValueError(f"{path.name}: train/valid neuron counts differ")
-    if behavior_train.shape[1] != behavior_valid.shape[1]:
-        raise ValueError(f"{path.name}: train/valid label counts differ")
-
-    # Same label selection as the supplied runner; no assumption about names.
-    behavior_train = behavior_train[:, :2]
-    behavior_valid = behavior_valid[:, :2]
-    alive = spikes_train.std(0) > 0
-    if not alive.any():
-        raise ValueError(f"{path.name}: no varying neurons in train_data")
-    return (np.ascontiguousarray(spikes_train[:, alive]),
-            np.ascontiguousarray(behavior_train),
-            np.ascontiguousarray(spikes_valid[:, alive]),
-            np.ascontiguousarray(behavior_valid))
+            raise ValueError(f"{path.name}: nonfinite values in the interior, not just the edges")
+    alive = spikes.std(0) > 0
+    return np.ascontiguousarray(spikes[:, alive]), np.ascontiguousarray(behavior)
 
 
 class Decoder(nn.Module):
@@ -318,15 +373,31 @@ def raw_window_baseline(spikes_train, behavior_train, spikes_test, behavior_test
 
 
 def build_model(override, epochs, device, verbose):
+    """Dispatch on the '_model' key so both trunks appear in ONE table."""
+    override = dict(override)
+    factory = MODELS[override.pop("_model", "jigsaw")]
     settings = dict(window_size=WINDOW_SIZE, n_tiles=N_TILES, tile_gap=TILE_GAP,
                     output_dimension=OUTPUT_DIMENSION, num_hidden_units=NUM_HIDDEN_UNITS,
                     head_hidden_units=HEAD_HIDDEN_UNITS, tile_norm=TILE_NORM,
                     neuron_dropout=NEURON_DROPOUT, gain_jitter=GAIN_JITTER,
                     batch_size=BATCH_SIZE, max_epochs=epochs,
                     learning_rate=LEARNING_RATE, device=device, random_state=SEED,
-                    verbose=verbose, log_every=max(1, epochs // 10) if epochs else 1)
+                    verbose=verbose)
     settings.update(override)
-    return JigsawNet(**settings)
+    # AFTER the update: the epoch-sweep arms override max_epochs, and logging
+    # every epochs//10 of the DEFAULT budget would print once or not at all.
+    settings.setdefault("log_every", max(1, settings["max_epochs"] // 10)
+                        if settings["max_epochs"] else 1)
+    return factory(**settings)
+
+
+def arm_epochs(name, epochs):
+    """The budget this arm will actually train for, for logging/validation."""
+    return int(ARMS[name].get("max_epochs", epochs))
+
+
+def trunk_parameters(model):
+    return int(sum(p.numel() for p in model.encoder_.trunk.parameters()))
 
 
 def pretext_report(model, spikes_valid):
@@ -334,22 +405,38 @@ def pretext_report(model, spikes_valid):
     n = metrics["n_spans"]
     exact_chance = metrics["chance_exact_percent"] / 100.0
     exact = versus_chance(round(metrics["exact_accuracy_percent"] / 100.0 * n), n, exact_chance)
+    # The decode is an assignment, i.e. a genuine permutation, so 50% is the
+    # true chance rate for pair accuracy. This was NOT true of the old argmax
+    # decode: argmax can put two tiles in one slot, those ties were scored as
+    # errors, and that moved chance to (1-1/K)/2 = 37.5% for a random head and
+    # all the way to 0% for a degenerate constant head. The 0.00% the frozen
+    # random_encoder printed on 2026-09-22 was that artifact, not a result.
     pair = versus_chance(round(metrics["pair_accuracy_percent"] / 100.0 * n), n, 0.5)
     metrics["exact_test"] = exact
     metrics["pair_test"] = pair
-    # "learned" requires beating BOTH chance and the level-sorting shortcut.
+    # "learned" requires beating chance AND both level-sorting shortcuts.
+    shortcut = max(metrics["baseline_mean_sort_pair_percent"],
+                   metrics["baseline_norm_sort_pair_percent"])
+    metrics["shortcut_pair_percent"] = shortcut
     metrics["learned"] = bool(
         (exact["significant"] or pair["significant"])
-        and metrics["pair_accuracy_percent"] > metrics["baseline_mean_sort_pair_percent"] + 1.0)
+        and metrics["pair_accuracy_percent"] > shortcut + 1.0)
+    # Held-out position CE above log(K) means the head is confidently WRONG on
+    # unseen spans -- memorization, which more epochs makes worse, not better.
+    # The 2% margin matters: a frozen encoder sits AT uniform by construction,
+    # and without a tolerance sampling noise flags every random control.
+    metrics["memorizing"] = bool(
+        metrics["position_cross_entropy"] > 1.02 * metrics["uniform_cross_entropy"])
     return metrics
 
 
 def run_arm(name, override, data, device, epochs, verbose):
     spikes_train, behavior_train, spikes_valid, behavior_valid = data
     started = time.time()
+    budget = int(override.get("max_epochs", epochs))
     model = build_model(override, epochs, device, verbose)
     model.fit(spikes_train, X_valid=spikes_valid,
-              validate_every=max(1, epochs // 6) if epochs else 1)
+              validate_every=max(1, budget // 6) if budget else 1)
 
     z_train, index_train = model.transform(spikes_train, pad=False, return_indices=True)
     z_valid, index_valid = model.transform(spikes_valid, pad=False, return_indices=True)
@@ -361,10 +448,15 @@ def run_arm(name, override, data, device, epochs, verbose):
                  learning_rate=DECODER_LR, seed=SEED, device=device)
     ridge = safe_ridge(z_train, y_train, z_valid, y_valid)
     pretext = pretext_report(model, spikes_valid)
+    trunk = trunk_parameters(model)
+    gap = (model.measure_train_eval_gap(spikes_valid)
+           if isinstance(model, MobileJigsaw) else None)
+    architecture = getattr(model, "version", None) or model.trunk_block
     del model, z_train, z_valid
     cleanup()
-    return dict(arm=name, override=override, mlp=mlp, ridge=ridge, pretext=pretext,
-                seconds=time.time() - started)
+    return dict(arm=name, override=override, architecture=architecture,
+                epochs=budget, trunk_parameters=trunk, train_eval_gap=gap,
+                mlp=mlp, ridge=ridge, pretext=pretext, seconds=time.time() - started)
 
 
 def print_table(results, baseline):
@@ -372,10 +464,19 @@ def print_table(results, baseline):
     if not rows:
         print("no arm completed")
         return
-    reference = results.get("random_encoder", {}).get("mlp", {}).get("r2")
-    header = (f"{'arm':<20}{'R2 mlp':>9}{'R2 train':>10}{'R2 ridge':>10}"
-              f"{'d.random':>10}{'pair%':>8}{'shortcut':>10}{'exact%':>8}"
-              f"{'chance':>8}{'z':>7}{'learned':>9}")
+
+    def is_mobile(row):
+        return row["override"].get("_model") == "mobile"
+
+    # Each family is compared against ITS OWN frozen control. Comparing a
+    # MobileNet arm to a plain-trunk random encoder would confound the
+    # architecture with the initialization scale, which is not the question.
+    controls = {False: results.get("random_encoder", {}).get("mlp", {}).get("r2"),
+                True: results.get("mobile_random", {}).get("mlp", {}).get("r2")}
+    header = (f"{'arm':<20}{'arch':>10}{'ep':>6}{'R2 mlp':>9}{'R2 ridge':>10}"
+              f"{'d.random':>10}{'p.ratio':>9}{'pair%':>8}{'shortcut':>10}"
+              f"{'exact%':>8}{'chance':>8}{'z':>7}{'ties%':>7}{'posCE':>8}"
+              f"{'learned':>9}{'trunk par':>11}{'tr/ev':>8}")
     print("\n" + "=" * len(header))
     print("SUMMARY")
     print("=" * len(header))
@@ -383,48 +484,133 @@ def print_table(results, baseline):
     print("-" * len(header))
     for row in sorted(rows, key=lambda r: -r["mlp"]["r2"]):
         p = row["pretext"]
-        delta = (row["mlp"]["r2"] - reference) if reference is not None else float("nan")
-        print(f"{row['arm']:<20}{row['mlp']['r2']:>9.4f}{row['mlp']['r2_train']:>10.4f}"
-              f"{row['ridge']['r2']:>10.4f}{delta:>+10.4f}"
-              f"{p['pair_accuracy_percent']:>8.2f}{p['baseline_mean_sort_pair_percent']:>10.2f}"
+        reference = controls[is_mobile(row)]
+        delta = f"{row['mlp']['r2'] - reference:+.4f}" if reference is not None else "n/a"
+        gap = row.get("train_eval_gap")
+        gap_text = f"{gap['relative_gap']:.4f}" if gap else "-"
+        flag = "*" if p.get("memorizing") else " "
+        print(f"{row['arm']:<20}{str(row.get('architecture', '?')):>10}"
+              f"{row.get('epochs', 0):>6}"
+              f"{row['mlp']['r2']:>9.4f}{row['ridge']['r2']:>10.4f}{delta:>10}"
+              f"{row['ridge'].get('participation_ratio', float('nan')):>9.2f}"
+              f"{p['pair_accuracy_percent']:>8.2f}"
+              f"{p.get('shortcut_pair_percent', p['baseline_mean_sort_pair_percent']):>10.2f}"
               f"{p['exact_accuracy_percent']:>8.2f}{p['chance_exact_percent']:>8.2f}"
-              f"{p['exact_test']['z']:>7.2f}{str(p['learned']):>9}")
+              f"{p['exact_test']['z']:>7.2f}{p.get('argmax_tie_rate_percent', 0.0):>7.1f}"
+              f"{p['position_cross_entropy']:>7.2f}{flag}{str(p['learned']):>9}"
+              f"{row.get('trunk_parameters', 0):>11,}{gap_text:>8}")
     print("-" * len(header))
-    print(f"{'RAW WINDOW':<20}{baseline['mlp']['r2']:>9.4f}"
-          f"{baseline['mlp']['r2_train']:>10.4f}{baseline['ridge']['r2']:>10.4f}"
-          f"{'':>10}{'':>8}{'':>10}{'':>8}{'':>8}{'':>7}{'':>9}"
-          f"   <- CEILING ({baseline['n_features']} features)")
+    print(f"{'RAW WINDOW':<20}{'-':>10}{'-':>6}{baseline['mlp']['r2']:>9.4f}"
+          f"{baseline['ridge']['r2']:>10.4f}{'-':>10}"
+          f"{baseline['ridge'].get('participation_ratio', float('nan')):>9.2f}"
+          f"   <- CEILING ({baseline['n_features']} features, no encoder at all)")
     print("=" * len(header))
 
     best = max(rows, key=lambda r: r["mlp"]["r2"])
     ceiling = max(baseline["mlp"]["r2"], baseline["ridge"]["r2"])
+    uniform = rows[0]["pretext"]["uniform_cross_entropy"]
     print("\nHOW TO READ THIS")
-    print("  d.random  = R2 minus the frozen random_encoder arm. NEGATIVE means")
-    print("              training destroyed information. Pretext accuracy cannot")
-    print("              rescue a negative number here.")
-    print("  shortcut  = sort-tiles-by-mean-activity pair accuracy. The model must")
-    print("              beat this, not just beat 50%.")
-    print("  learned   = significant vs chance AND above the shortcut baseline.")
-    print(f"\nbest arm: {best['arm']}  R2={best['mlp']['r2']:.4f}")
-    if reference is not None:
-        verdict = ("training ADDS value" if best["mlp"]["r2"] > reference
-                   else "!! every trained arm is at or below the RANDOM encoder "
-                        "-- the objective is not building a useful embedding")
-        print(f"  vs random_encoder ({reference:.4f}): {verdict}")
+    print("  d.random  = R2 minus the frozen control OF THE SAME FAMILY")
+    print("              (random_encoder for the plain trunk, mobile_random for")
+    print("              MobileNet). NEGATIVE means training destroyed information,")
+    print("              and pretext accuracy cannot rescue a negative number.")
+    print("  p.ratio   = participation ratio of the embedding (out of the output")
+    print("              dimension). This is the collapse detector: on 2026-09-22 it")
+    print("              tracked ridge R2 almost monotonically, from 3.4 -> R2 0.005")
+    print("              (order_only) up to 61.8 -> 0.784 (the raw window itself).")
+    print("              If p.ratio falls, R2 falls, whatever the pretext says.")
+    print("  pair %    = order accuracy under an ASSIGNMENT decode, so it is a real")
+    print("              permutation and chance is exactly 50%. The older argmax")
+    print("              decode was not a permutation, its ties were scored as")
+    print("              errors, and chance was silently 37.5% (or 0% for a")
+    print("              degenerate head). argmax is still reported in results.json")
+    print("              as argmax_pair_accuracy_percent for comparison.")
+    print("  shortcut  = the BEST of sort-by-mean and sort-by-norm pair accuracy.")
+    print("              The model must beat this, not just beat 50%.")
+    print(f"  posCE     = held-out position cross-entropy; uniform = {uniform:.3f}.")
+    print("              A '*' marks posCE ABOVE uniform, i.e. the head is")
+    print("              confidently WRONG out of sample. That is memorization and")
+    print("              more epochs make it worse. Run the epoch sweep.")
+    print("  trunk par = trunk parameters. Check this before calling MobileNet")
+    print("              'efficient': in 1D, v2 at t=6 is LARGER than a plain conv.")
+    print("  tr/ev     = relative embedding change between train and eval mode.")
+    print("              Should be ~0. Large values mean BatchNorm running stats")
+    print("              are wrong for the windows transform actually sees.")
+    print(f"\nbest arm: {best['arm']}  R2={best['mlp']['r2']:.4f}  ({best.get('architecture')})")
+    for mobile, label in ((False, "plain trunk"), (True, "mobilenet")):
+        family = [r for r in rows if is_mobile(r) == mobile]
+        reference = controls[mobile]
+        if not family or reference is None:
+            continue
+        top = max(family, key=lambda r: r["mlp"]["r2"])
+        verdict = ("training ADDS value" if top["mlp"]["r2"] > reference
+                   else "!! every trained arm is at or below its RANDOM control")
+        print(f"  {label:<12} best={top['arm']} {top['mlp']['r2']:.4f} "
+              f"vs frozen {reference:.4f}: {verdict}")
+    trained = [r for r in rows if r["override"].get("max_epochs") != 0]
+    plain = [r for r in trained if not is_mobile(r)]
+    mobile = [r for r in trained if is_mobile(r)]
+    if plain and mobile:
+        a = max(r["mlp"]["r2"] for r in plain)
+        b = max(r["mlp"]["r2"] for r in mobile)
+        print(f"  HEAD TO HEAD  plain {a:.4f}  vs  mobilenet {b:.4f}  -> "
+              f"{'mobilenet' if b > a else 'plain trunk'} wins by {abs(b - a):.4f}")
     gap = best["mlp"]["r2"] - ceiling
     print(f"  vs raw-window ceiling ({ceiling:.4f}): {gap:+.4f}"
           + ("" if gap >= 0 else "  <- the encoder is a lossy bottleneck; try a larger"
-                                 " output_dimension (dim_128 / dim_256) before anything else"))
+                                 " output_dimension (dim_128 / dim_256) first,"
+                                 " the trunk is not the binding constraint"))
     learners = [r["arm"] for r in rows if r["pretext"]["learned"]]
     print(f"  arms that actually learned the pretext: {learners or 'NONE'}")
     if learners and gap < 0:
         print("  note: pretext learned but R2 still under the ceiling -> the order task")
         print("        is solvable yet its solution is not what the decoder needs.")
 
+    # The anchor A/B. This is the only pair that isolates the reconstruction CE.
+    anchored, bare = results.get("proposed"), results.get("no_reconstruct")
+    if anchored and bare and "error" not in anchored and "error" not in bare:
+        d_r2 = anchored["mlp"]["r2"] - bare["mlp"]["r2"]
+        d_pr = (anchored["ridge"].get("participation_ratio", float("nan"))
+                - bare["ridge"].get("participation_ratio", float("nan")))
+        print(f"\nRECONSTRUCTION ANCHOR  proposed - no_reconstruct: "
+              f"R2 {d_r2:+.4f}, p.ratio {d_pr:+.2f}")
+        print("  no_reconstruct IS the model that produced the 2026-09-22 table, so")
+        print("  this difference -- not the distance to random_encoder -- is what the")
+        print("  anchor is worth. If it is ~0, drop the anchor and report that.")
+
+    memorizers = [r["arm"] for r in rows if r["pretext"].get("memorizing")]
+    if memorizers:
+        print(f"\n!! held-out position CE more than 2% ABOVE uniform for: {memorizers}")
+        print("   These arms are confidently wrong on unseen spans. That is")
+        print("   overfitting, not underfitting -- cut epochs, do not add them.")
+
+    # Epoch sweep. Only arms that differ from `proposed` in max_epochs ALONE
+    # belong on this curve: mixing objectives in would make it a function of
+    # two variables and unreadable as a budget curve.
+    ladder = [r for r in rows
+              if set(r["override"]) <= {"max_epochs"} and r["override"].get("max_epochs") != 0]
+    if len({r.get("epochs", 0) for r in ladder}) > 1:
+        print("\nEPOCH SWEEP (same objective, budget is the only difference)")
+        print(f"  {'epochs':>8}{'R2 mlp':>9}{'p.ratio':>9}{'pair%':>8}{'posCE':>8}  arm")
+        for row in sorted(ladder, key=lambda r: r.get("epochs", 0)):
+            p = row["pretext"]
+            print(f"  {row.get('epochs', 0):>8}{row['mlp']['r2']:>9.4f}"
+                  f"{row['ridge'].get('participation_ratio', float('nan')):>9.2f}"
+                  f"{p['pair_accuracy_percent']:>8.2f}"
+                  f"{p['position_cross_entropy']:>8.2f}  {row['arm']}")
+        peak = max(ladder, key=lambda r: r["mlp"]["r2"])
+        print(f"  peak: {peak.get('epochs')} epochs, R2 {peak['mlp']['r2']:.4f}. "
+              f"Rerun every other arm at that budget.")
+        print("  A comparison made in the wrong epoch regime is not a comparison")
+        print("  between objectives, it is a comparison between overfits.")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--arms", nargs="+", default=list(DEFAULT_ARMS))
+    parser.add_argument("--epoch-sweep", action="store_true",
+                        help="run the epoch ladder instead of --arms. Do this FIRST: "
+                             "every objective comparison is conditional on the budget.")
     parser.add_argument("--list", action="store_true", help="print the arm table and exit")
     parser.add_argument("--data-dir", type=Path, default=PERICH_DATA_DIR)
     parser.add_argument("--out-dir", type=Path, default=OUTPUT_ROOT)
@@ -437,17 +623,28 @@ def main():
     if options.list:
         width = max(len(k) for k in ARMS)
         for name, override in ARMS.items():
-            mark = "*" if name in DEFAULT_ARMS else " "
+            mark = "*" if name in DEFAULT_ARMS else ("e" if name in EPOCH_ARMS else " ")
             print(f" {mark} {name:<{width}}  {override or '(defaults)'}")
-        print("\n* = in the default set")
+        print("\n* = in the default set,  e = in --epoch-sweep")
         return
+
+    if options.epoch_sweep:
+        options.arms = list(EPOCH_ARMS)
+        print(f"epoch sweep: {options.arms}")
 
     unknown = [a for a in options.arms if a not in ARMS]
     if unknown:
         raise SystemExit(f"unknown arm(s) {unknown}\nvalid: {sorted(ARMS)}")
-    if "random_encoder" not in options.arms:
-        options.arms = list(options.arms) + ["random_encoder"]
-        print("note: added the random_encoder control -- results are unreadable without it.")
+    # Each trunk family needs its OWN frozen control, otherwise d.random
+    # confounds the architecture with the initialization scale.
+    selected = list(options.arms)
+    needed = {"random_encoder"}
+    if any(ARMS[a].get("_model") == "mobile" for a in selected):
+        needed.add("mobile_random")
+    for control in sorted(needed - set(selected)):
+        selected.append(control)
+        print(f"note: added the {control} control -- results are unreadable without it.")
+    options.arms = selected
 
     seed_all(SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -458,14 +655,14 @@ def main():
     stamp = time.strftime("%Y%m%d_%H%M%S")
 
     for path in files:
-        data = load_session(path)
-        spikes_train, behavior_train, spikes_valid, behavior_valid = data
+        spikes, behavior = load_session(path)
+        cut = int(TRAIN_FRACTION * len(spikes))
+        data = (spikes[:cut], behavior[:cut], spikes[cut:], behavior[cut:])
         out_dir = options.out_dir / f"{options.tag}_{path.stem}_{stamp}"
         out_dir.mkdir(parents=True, exist_ok=True)
         print("\n" + "#" * 78)
-        print(f"# {path.stem}: {len(spikes_train) + len(spikes_valid)} bins, "
-              f"{spikes_train.shape[1]} neurons, {behavior_train.shape[1]} behavior dims | "
-              f"train {len(spikes_train)} / valid {len(spikes_valid)} (NPZ split)")
+        print(f"# {path.stem}: {len(spikes)} bins, {spikes.shape[1]} neurons, "
+              f"{behavior.shape[1]} behavior dims | train {cut} / valid {len(spikes) - cut}")
         print(f"# device={device} epochs={options.epochs} -> {out_dir}")
         print("#" * 78, flush=True)
 
@@ -477,14 +674,18 @@ def main():
 
         results = {}
         for i, name in enumerate(options.arms, 1):
-            print(f"\n[{i}/{len(options.arms)}] {name}  {ARMS[name] or '(defaults)'}", flush=True)
+            print(f"\n[{i}/{len(options.arms)}] {name}  {ARMS[name] or '(defaults)'}"
+                  f"  [{arm_epochs(name, options.epochs)} epochs]", flush=True)
             try:
                 results[name] = run_arm(name, ARMS[name], data, device,
                                         options.epochs, not options.quiet)
                 row = results[name]
                 print(f"  -> R2 mlp={row['mlp']['r2']:.4f} ridge={row['ridge']['r2']:.4f} "
+                      f"p.ratio={row['ridge'].get('participation_ratio', float('nan')):.2f} "
                       f"| pair={row['pretext']['pair_accuracy_percent']:.2f}% "
-                      f"(shortcut {row['pretext']['baseline_mean_sort_pair_percent']:.2f}%) "
+                      f"(shortcut {row['pretext']['shortcut_pair_percent']:.2f}%, "
+                      f"posCE {row['pretext']['position_cross_entropy']:.2f} vs "
+                      f"{row['pretext']['uniform_cross_entropy']:.2f} uniform) "
                       f"| {row['seconds']:.0f}s", flush=True)
             except Exception as error:  # one bad arm must not kill the sweep
                 traceback.print_exc()
