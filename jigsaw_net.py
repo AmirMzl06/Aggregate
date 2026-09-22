@@ -12,8 +12,8 @@ binary_cross_entropy_with_logits on a task with a hard, known-correct label.
     print(model.evaluate_pretext(X_valid))
     print(model.evaluate_decoding(X_train, Y_train, X_valid, Y_valid))
 
-THE TWO TASKS (both cross-entropy)
-----------------------------------
+THE THREE TASKS (all cross-entropy)
+-----------------------------------
 1. ORDER (the jigsaw). K intact, chronological, nonoverlapping tiles are cut
    from one span. Two readouts share a permutation-equivariant DeepSets token:
      - position CE : K-way softmax per tile, "which slot in time is this?".
@@ -21,10 +21,14 @@ THE TWO TASKS (both cross-entropy)
        memorizable (24 classes is a lookup table; 4 classes x 4 tiles is not).
      - pair BCE    : for every ordered pair, "did i come before j?". Chance 50%,
        which is a far higher-powered test than 1/24 = 4.17%.
+   The position head is DECODED WITH AN ASSIGNMENT, not an argmax -- see below.
 2. FORECAST (why this one exists). From each tile's embedding, predict the
    QUANTIZED activity of the bin immediately AFTER that tile, per neuron, with
    cross-entropy over count bins. The target bin is always inside the discarded
    gap, so it never leaks into another tile.
+3. RECONSTRUCT (the anti-collapse anchor). From each tile's embedding, predict
+   the quantized activity of EVERY bin of that same tile. Input is augmented,
+   target is clean, so it is a denoising task. lambda_reconstruct=0 removes it.
 
 Task 2 is load-bearing. A pure order task gives the encoder no reason to keep
 absolute firing rate, and absolute rate is usually the dominant behavior-coding
@@ -32,9 +36,31 @@ feature; that is how pretext training ends up BELOW a random encoder. Forecastin
 quantized counts cannot be solved without representing level, so it pins rate
 information into the trunk while the order task carves temporal structure.
 
+Task 3 exists because task 2 turned out to be too weak a constraint on real
+data: the order objective drove the embedding's participation ratio to 3.4 out
+of 64 dimensions and ridge R2 to 0.005. One predicted bin does not stop a
+64-dimensional code from collapsing; all W bins does. The decoding ceiling is
+ridge on the raw window, so requiring the embedding to reproduce the raw window
+attacks the measured gap head on instead of a proxy for it.
+
+READING THE ORDER HEAD. argmax over the K-way position logits is NOT a
+permutation: it can put two tiles in the same slot, and an UNTRAINED head puts
+all of them in one slot because the class biases swamp the tile-dependent part
+of the logits. Scoring those ties as errors moves the chance level of pair
+accuracy from 50% to (1 - 1/K)/2 = 37.5% at K=4, and to 0% for the degenerate
+case -- so a frozen random encoder scores 0.00% and looks catastrophically
+anti-correlated when it is simply undefined. This module therefore decodes with
+the best-scoring permutation (`_assign`), gives ties half credit, and reports
+`argmax_tie_rate_percent` so a degenerate readout is visible.
+
 NO L2 NORMALIZATION BY DEFAULT. normalize=True projects the embedding onto a
 hypersphere and throws away magnitude. If ridge on the raw window beats your
 embedding, this is the first thing to check. Left available as an ablation only.
+
+EPOCHS. Spans overlap by construction, so the effective sample size is far below
+the span count and a large epoch budget memorizes the pretext task. Sweep
+max_epochs (10 / 30 / 100 / 300 / 1000) before concluding anything about an arm;
+fit prints a warning when max_epochs x n_spans gets large.
 
 SHORTCUTS. Tile order is recoverable from slow drift in overall level, so the
 order head can become a nonstationarity detector that does not transfer. The
@@ -54,8 +80,9 @@ uses. It is not a shortcut fix -- a linearly available shortcut stays available
 CONTROLS (all from the constructor)
   max_epochs=0        -> frozen random-encoder control. Your embedding must beat
                          this or training is destroying information.
-  lambda_order=0.0    -> forecast only
-  lambda_forecast=0.0 -> pure jigsaw (reproduces the known failure mode)
+  lambda_order=0.0    -> forecast + reconstruct only
+  lambda_forecast=0.0 -> drop the next-bin term
+  lambda_reconstruct=0 -> the pre-anchor model (reproduces the collapse)
   order_grad_scale=0  -> order head trains on a trunk it cannot influence; asks
                          "is order decodable?" with zero risk to R2
   normalize=True      -> the sphere ablation
@@ -74,6 +101,7 @@ Demo:       python jigsaw_net.py --demo
 """
 import argparse
 import copy
+import itertools
 import math
 import numbers
 from pathlib import Path
@@ -259,6 +287,29 @@ class _ForecastHead(nn.Module):
         return self.net(z).reshape(-1, self.channels, self.levels)
 
 
+class _ReconstructHead(nn.Module):
+    """Per-neuron, per-bin cross-entropy over the quantized tile the embedding came from.
+
+    The anti-collapse anchor. The order task only needs a low-dimensional
+    "where in time am I" code and will happily throw everything else away --
+    measured as a participation ratio of 3.4 out of 64 and ridge R2 of 0.005.
+    Forecasting one bin is too weak a constraint to stop that. Requiring the
+    embedding to reproduce EVERY bin of its own window forces it to stay an
+    information-preserving bottleneck, and the raw window is exactly what the
+    decoding ceiling is computed from, so this term targets the measured gap
+    rather than a proxy for it. Still nothing but cross-entropy.
+    """
+
+    def __init__(self, dimension, hidden, channels, window_size, levels):
+        super().__init__()
+        self.channels, self.window_size, self.levels = channels, window_size, levels
+        self.net = nn.Sequential(nn.Linear(dimension, hidden), nn.GELU(),
+                                 nn.Linear(hidden, channels * window_size * levels))
+
+    def forward(self, z):
+        return self.net(z).reshape(-1, self.channels, self.window_size, self.levels)
+
+
 # --------------------------------------------------------------------------- #
 # functional pieces
 # --------------------------------------------------------------------------- #
@@ -316,13 +367,47 @@ def _ranks(values):
     return values.argsort(dim=1).argsort(dim=1)
 
 
-def _order_metrics(predicted, positions):
+def _assign(position_logits):
+    """Decode the K-way position head into an actual PERMUTATION.
+
+    argmax is not a permutation: it can drop two tiles into the same slot, and
+    an untrained head drops ALL of them into one slot because the class biases
+    dominate the tile-dependent part of the logits. Reading the head correctly
+    means taking the permutation with the highest total log-probability, which
+    is what a jigsaw solver outputs. K! is tiny here, so brute force is exact;
+    above K=6 fall back to ranking the tiles by their own argmax slot.
+    """
+    n_tiles = position_logits.shape[1]
+    if n_tiles > 6:
+        return _ranks(position_logits.argmax(-1).to(torch.float32))
+    table = torch.tensor(list(itertools.permutations(range(n_tiles))),
+                         device=position_logits.device)                     # (P, K)
+    log_probability = F.log_softmax(position_logits.to(torch.float32), dim=-1)
+    slots = table.transpose(0, 1)                                           # (K, P)
+    total = sum(log_probability[:, tile, slots[tile]] for tile in range(n_tiles))
+    return table[total.argmax(dim=1)]                                       # (B, K)
+
+
+def _order_metrics(predicted, positions, *, tie_credit=0.5):
+    """Exact accuracy, pair accuracy, and the TIE RATE.
+
+    Ties are not a detail. If a pair of tiles is predicted into the same slot
+    there is no implied order, and scoring that as an error silently drags the
+    chance level of pair accuracy from 50% down to (1 - 1/K)/2 -- 37.5% at K=4
+    -- and all the way to 0% for a head whose argmax is constant across tiles.
+    Half credit puts chance back at exactly 50% for every predictor, because
+    (1 - 1/K)/2 + (1/2)(1/K) = 1/2, and the tie rate is returned so that a
+    degenerate readout shows up as a tie rate of 100% instead of masquerading
+    as a below-chance score.
+    """
     exact = (predicted == positions).all(dim=1).to(torch.float32)
     truth = torch.sign(positions[:, :, None] - positions[:, None, :])
     guess = torch.sign(predicted[:, :, None] - predicted[:, None, :])
     mask = truth != 0
-    pair = ((guess == truth) & mask).sum((1, 2)).to(torch.float32) / mask.sum((1, 2)).clamp_min(1)
-    return exact, pair
+    denominator = mask.sum((1, 2)).clamp_min(1).to(torch.float32)
+    hits = ((guess == truth) & mask).sum((1, 2)).to(torch.float32)
+    ties = ((guess == 0) & mask).sum((1, 2)).to(torch.float32)
+    return exact, (hits + tie_credit * ties) / denominator, ties / denominator
 
 
 def _participation_ratio(features):
@@ -370,10 +455,20 @@ def _ridge_r2(train_features, train_targets, test_features, test_targets, alphas
 class JigsawNet:
     """Cross-entropy-only self-supervised encoder: temporal order + forecasting."""
 
+    _MODEL_TYPE = "jigsaw_net"
+    _PARAM_NAMES = ("window_size", "n_tiles", "tile_gap", "output_dimension",
+                    "num_hidden_units", "head_hidden_units", "dropout", "normalize",
+                    "trunk_block", "lambda_order", "lambda_pair", "lambda_forecast",
+                    "lambda_reconstruct", "forecast_levels", "order_grad_scale",
+                    "tile_norm", "neuron_dropout",
+                    "gain_jitter", "batch_size", "max_epochs", "learning_rate",
+                    "weight_decay", "device", "random_state", "verbose", "log_every")
+
     def __init__(self, window_size=10, n_tiles=4, tile_gap=(1, 8),
                  output_dimension=64, num_hidden_units=64, head_hidden_units=64,
                  dropout=0.0, normalize=False, trunk_block="residual",
                  lambda_order=1.0, lambda_pair=0.5, lambda_forecast=1.0,
+                 lambda_reconstruct=1.0,
                  forecast_levels=8, order_grad_scale=1.0,
                  tile_norm="mean", neuron_dropout=0.1, gain_jitter=0.1,
                  batch_size=512, max_epochs=60, learning_rate=1e-3, weight_decay=0.0,
@@ -396,6 +491,7 @@ class JigsawNet:
         self.lambda_order = _real("lambda_order", lambda_order, 0)
         self.lambda_pair = _real("lambda_pair", lambda_pair, 0)
         self.lambda_forecast = _real("lambda_forecast", lambda_forecast, 0)
+        self.lambda_reconstruct = _real("lambda_reconstruct", lambda_reconstruct, 0)
         self.forecast_levels = _integer("forecast_levels", forecast_levels, 2, 64)
         self.order_grad_scale = _real("order_grad_scale", order_grad_scale, 0)
         if tile_norm not in TILE_NORMS:
@@ -412,7 +508,7 @@ class JigsawNet:
         self.verbose = _boolean("verbose", verbose)
         self.log_every = _integer("log_every", log_every, 1)
         if self.lambda_order == 0 and self.lambda_pair == 0 and self.lambda_forecast == 0 \
-                and self.max_epochs > 0:
+                and self.lambda_reconstruct == 0 and self.max_epochs > 0:
             raise ValueError("All loss weights are zero; set max_epochs=0 for a random encoder.")
         self.is_fitted_ = False
 
@@ -423,13 +519,7 @@ class JigsawNet:
         return self.n_tiles * self.window_size + (self.n_tiles - 1) * self.tile_gap[1] + 1
 
     def get_params(self):
-        return {name: getattr(self, name) for name in
-                ("window_size", "n_tiles", "tile_gap", "output_dimension",
-                 "num_hidden_units", "head_hidden_units", "dropout", "normalize",
-                 "trunk_block", "lambda_order", "lambda_pair", "lambda_forecast",
-                 "forecast_levels", "order_grad_scale", "tile_norm", "neuron_dropout",
-                 "gain_jitter", "batch_size", "max_epochs", "learning_rate",
-                 "weight_decay", "device", "random_state", "verbose", "log_every")}
+        return {name: getattr(self, name) for name in self._PARAM_NAMES}
 
     def _check_fitted(self):
         if not self.is_fitted_:
@@ -442,17 +532,24 @@ class JigsawNet:
             name = "cuda" if torch.cuda.is_available() else "cpu"
         return torch.device(name)
 
+    def _make_encoder(self, channels):
+        """Override to swap the trunk. Must map (B, channels, window_size) -> (B, D)."""
+        return _Encoder(channels, self.window_size, self.num_hidden_units,
+                        self.output_dimension, self.dropout, self.normalize,
+                        self.trunk_block)
+
     def _build(self, channels):
         torch.manual_seed(self.random_state)
         self.device_ = self._resolve_device()
         self.n_features_in_ = channels
-        self.encoder_ = _Encoder(channels, self.window_size, self.num_hidden_units,
-                                 self.output_dimension, self.dropout, self.normalize,
-                                 self.trunk_block).to(self.device_)
+        self.encoder_ = self._make_encoder(channels).to(self.device_)
         self.order_head_ = _OrderHead(self.output_dimension, self.head_hidden_units,
                                       self.n_tiles).to(self.device_)
         self.forecast_head_ = _ForecastHead(self.output_dimension, self.head_hidden_units,
                                             channels, self.forecast_levels).to(self.device_)
+        self.reconstruct_head_ = _ReconstructHead(
+            self.output_dimension, self.head_hidden_units, channels, self.window_size,
+            self.forecast_levels).to(self.device_)
         self._generator = torch.Generator(device=self.device_)
         self._generator.manual_seed(self.random_state + 1)
 
@@ -507,6 +604,24 @@ class JigsawNet:
             parts["forecast"] = torch.zeros((), device=self.device_)
             parts["forecast_accuracy"] = torch.zeros((), device=self.device_)
 
+        # RECONSTRUCT: same raw embedding must reproduce every bin of its own tile.
+        # Input is augmented, target is the CLEAN tile, so this is a denoising task.
+        if self.lambda_reconstruct > 0:
+            flat = tiles.permute(0, 1, 3, 2).reshape(-1, self.n_features_in_)
+            target = self._bucketize(flat).reshape(-1, self.window_size,
+                                                   self.n_features_in_).permute(0, 2, 1)
+            logits = self.reconstruct_head_(z_raw)
+            reconstruct = F.cross_entropy(logits.reshape(-1, self.forecast_levels),
+                                          target.reshape(-1))
+            with torch.no_grad():
+                parts["reconstruct_accuracy"] = (logits.argmax(-1) == target).to(
+                    torch.float32).mean()
+            parts["reconstruct"] = reconstruct
+            total = total + self.lambda_reconstruct * reconstruct
+        else:
+            parts["reconstruct"] = torch.zeros((), device=self.device_)
+            parts["reconstruct_accuracy"] = torch.zeros((), device=self.device_)
+
         # ORDER: normalized view, so level drift cannot give the answer away.
         if self.lambda_order > 0 or self.lambda_pair > 0:
             view = _tile_normalize(
@@ -521,11 +636,12 @@ class JigsawNet:
             total = total + self.lambda_order * position_loss + self.lambda_pair * pair_loss
             with torch.no_grad():
                 predicted = _ranks(scores) if self.lambda_order == 0 \
-                    else position_logits.argmax(-1)
-                exact, pair_accuracy = _order_metrics(predicted, positions)
+                    else _assign(position_logits)
+                exact, pair_accuracy, tie_rate = _order_metrics(predicted, positions)
                 parts["exact"], parts["pair_accuracy"] = exact.mean(), pair_accuracy.mean()
+                parts["tie_rate"] = tie_rate.mean()
         else:
-            for key in ("position", "pair", "exact", "pair_accuracy"):
+            for key in ("position", "pair", "exact", "pair_accuracy", "tie_rate"):
                 parts[key] = torch.zeros((), device=self.device_)
         parts["total"] = total
         return parts
@@ -560,22 +676,28 @@ class JigsawNet:
             return self
 
         parameters = list(self.encoder_.parameters()) + list(self.order_head_.parameters()) \
-            + list(self.forecast_head_.parameters())
+            + list(self.forecast_head_.parameters()) + list(self.reconstruct_head_.parameters())
         optimizer = torch.optim.AdamW(parameters, lr=self.learning_rate,
                                       weight_decay=self.weight_decay)
         if self.verbose:
             print(f"JigsawNet: {self.n_spans_} spans, window={self.window_size}, "
                   f"K={self.n_tiles}, dim={self.output_dimension}, trunk={self.trunk_block}, "
                   f"normalize={self.normalize}, tile_norm={self.tile_norm}, "
-                  f"lambda(order,pair,forecast)="
-                  f"({self.lambda_order},{self.lambda_pair},{self.lambda_forecast}), "
-                  f"device={self.device_}", flush=True)
+                  f"lambda(order,pair,forecast,reconstruct)="
+                  f"({self.lambda_order},{self.lambda_pair},{self.lambda_forecast},"
+                  f"{self.lambda_reconstruct}), device={self.device_}", flush=True)
+            if self.max_epochs * self.n_spans_ > 2_000_000:
+                print(f"      WARNING: {self.max_epochs} epochs x {self.n_spans_} overlapping "
+                      f"spans. Spans overlap by construction, so the effective sample size is "
+                      f"far below the span count and this budget memorizes the pretext task. "
+                      f"Sweep max_epochs before trusting any arm.", flush=True)
 
         index = torch.from_numpy(starts).to(self.device_)
         for epoch in range(self.max_epochs):
             order = torch.randperm(self.n_spans_, device=self.device_, generator=self._generator)
             totals, seen = {}, 0
             self.encoder_.train(); self.order_head_.train(); self.forecast_head_.train()
+            self.reconstruct_head_.train()
             for begin in range(0, self.n_spans_, self.batch_size):
                 chunk = index[order[begin:begin + self.batch_size]]
                 if len(chunk) < 2:
@@ -596,9 +718,12 @@ class JigsawNet:
                 print(f"  epoch {epoch + 1}/{self.max_epochs} loss={row['total']:.4f} "
                       f"| position CE={row['position']:.4f} pair BCE={row['pair']:.4f} "
                       f"forecast CE={row['forecast']:.4f} "
+                      f"reconstruct CE={row['reconstruct']:.4f} "
                       f"| train exact={100 * row['exact']:.1f}% "
                       f"pair={100 * row['pair_accuracy']:.1f}% "
-                      f"forecast acc={100 * row['forecast_accuracy']:.1f}%", flush=True)
+                      f"ties={100 * row['tie_rate']:.1f}% "
+                      f"forecast acc={100 * row['forecast_accuracy']:.1f}% "
+                      f"recon acc={100 * row['reconstruct_accuracy']:.1f}%", flush=True)
             if X_valid is not None and ((epoch + 1) % validate_every == 0
                                         or epoch + 1 == self.max_epochs):
                 metrics = self.evaluate_pretext(X_valid, max_spans=512, verbose=False)
@@ -661,7 +786,8 @@ class JigsawNet:
         chosen = torch.from_numpy(np.sort(chosen)).to(self.device_)
         generator = torch.Generator(device=self.device_).manual_seed(random_state)
         low, high = self.tile_gap
-        totals = {k: 0.0 for k in ("exact", "pair", "mean_exact", "mean_pair",
+        totals = {k: 0.0 for k in ("exact", "pair", "tie", "argmax_pair", "argmax_tie",
+                                   "rank_exact", "rank_pair", "mean_exact", "mean_pair",
                                    "norm_exact", "norm_pair", "position_ce")}
         count = 0
         self.encoder_.eval(); self.order_head_.eval()
@@ -676,18 +802,22 @@ class JigsawNet:
                 z = self.encoder_(view.reshape(-1, self.n_features_in_, self.window_size))
                 position_logits, scores = self.order_head_(
                     z.reshape(len(block), self.n_tiles, self.output_dimension))
-                predicted = position_logits.argmax(-1) if self.lambda_order > 0 else _ranks(scores)
-                exact, pair = _order_metrics(predicted, positions)
-                mean_exact, mean_pair = _order_metrics(_ranks(tiles.mean(dim=(2, 3))), positions)
-                norm_exact, norm_pair = _order_metrics(
+                # Headline decode: a real permutation, so chance is 1/K! and 50% exactly.
+                predicted = _assign(position_logits) if self.lambda_order > 0 else _ranks(scores)
+                exact, pair, tie = _order_metrics(predicted, positions)
+                # Kept for comparison: the naive argmax, which is NOT a permutation.
+                _, argmax_pair, argmax_tie = _order_metrics(position_logits.argmax(-1), positions)
+                rank_exact, rank_pair, _ = _order_metrics(_ranks(scores), positions)
+                mean_exact, mean_pair, _ = _order_metrics(_ranks(tiles.mean(dim=(2, 3))), positions)
+                norm_exact, norm_pair, _ = _order_metrics(
                     _ranks(tiles.reshape(len(block), self.n_tiles, -1).norm(dim=2)), positions)
                 weight = len(block)
-                totals["exact"] += float(exact.mean()) * weight
-                totals["pair"] += float(pair.mean()) * weight
-                totals["mean_exact"] += float(mean_exact.mean()) * weight
-                totals["mean_pair"] += float(mean_pair.mean()) * weight
-                totals["norm_exact"] += float(norm_exact.mean()) * weight
-                totals["norm_pair"] += float(norm_pair.mean()) * weight
+                for key, value in (("exact", exact), ("pair", pair), ("tie", tie),
+                                   ("argmax_pair", argmax_pair), ("argmax_tie", argmax_tie),
+                                   ("rank_exact", rank_exact), ("rank_pair", rank_pair),
+                                   ("mean_exact", mean_exact), ("mean_pair", mean_pair),
+                                   ("norm_exact", norm_exact), ("norm_pair", norm_pair)):
+                    totals[key] += float(value.mean()) * weight
                 totals["position_ce"] += float(F.cross_entropy(
                     position_logits.reshape(-1, self.n_tiles), positions.reshape(-1))) * weight
                 count += weight
@@ -696,18 +826,27 @@ class JigsawNet:
         result = dict(
             exact_accuracy_percent=totals["exact"] * scale,
             pair_accuracy_percent=totals["pair"] * scale,
+            tie_rate_percent=totals["tie"] * scale,
+            argmax_pair_accuracy_percent=totals["argmax_pair"] * scale,
+            argmax_tie_rate_percent=totals["argmax_tie"] * scale,
+            rank_exact_accuracy_percent=totals["rank_exact"] * scale,
+            rank_pair_accuracy_percent=totals["rank_pair"] * scale,
             baseline_mean_sort_exact_percent=totals["mean_exact"] * scale,
             baseline_mean_sort_pair_percent=totals["mean_pair"] * scale,
             baseline_norm_sort_exact_percent=totals["norm_exact"] * scale,
             baseline_norm_sort_pair_percent=totals["norm_pair"] * scale,
             position_cross_entropy=totals["position_ce"] / max(count, 1),
             uniform_cross_entropy=math.log(self.n_tiles),
+            decode="assignment" if self.lambda_order > 0 else "score_rank",
             chance_exact_percent=100.0 / math.factorial(self.n_tiles),
             chance_pair_percent=50.0, n_spans=int(count))
         if verbose:
             print(f"  pretext: exact={result['exact_accuracy_percent']:.2f}% "
                   f"(chance {result['chance_exact_percent']:.2f}%) "
                   f"pair={result['pair_accuracy_percent']:.2f}% (chance 50%) "
+                  f"| decode={result['decode']} "
+                  f"argmax pair={result['argmax_pair_accuracy_percent']:.2f}% "
+                  f"ties={result['argmax_tie_rate_percent']:.1f}% "
                   f"| mean-sort pair={result['baseline_mean_sort_pair_percent']:.2f}%", flush=True)
         return result
 
@@ -738,11 +877,12 @@ class JigsawNet:
     # -- persistence ------------------------------------------------------- #
     def save(self, path):
         self._check_fitted()
-        torch.save(dict(model_type="jigsaw_net", format_version=1, params=self.get_params(),
+        torch.save(dict(model_type=self._MODEL_TYPE, format_version=1, params=self.get_params(),
                         n_features_in=self.n_features_in_,
                         encoder=self.encoder_.state_dict(),
                         order_head=self.order_head_.state_dict(),
                         forecast_head=self.forecast_head_.state_dict(),
+                        reconstruct_head=self.reconstruct_head_.state_dict(),
                         forecast_edges=None if self.forecast_edges_ is None
                         else self.forecast_edges_.cpu(),
                         history=self.history_, validation_history=self.validation_history_),
@@ -755,7 +895,7 @@ class JigsawNet:
             data = torch.load(Path(path), map_location="cpu", weights_only=False)
         except TypeError:
             data = torch.load(Path(path), map_location="cpu")
-        if data.get("model_type") != "jigsaw_net" or data.get("format_version") != 1:
+        if data.get("model_type") != cls._MODEL_TYPE or data.get("format_version") != 1:
             raise ValueError("Expected a jigsaw_net checkpoint.")
         params = dict(data["params"]); params["device"] = device
         model = cls(**params)
@@ -763,6 +903,8 @@ class JigsawNet:
         model.encoder_.load_state_dict(data["encoder"])
         model.order_head_.load_state_dict(data["order_head"])
         model.forecast_head_.load_state_dict(data["forecast_head"])
+        if "reconstruct_head" in data:
+            model.reconstruct_head_.load_state_dict(data["reconstruct_head"])
         edges = data.get("forecast_edges")
         model.forecast_edges_ = None if edges is None else edges.to(model.device_)
         model.history_ = data["history"]
@@ -827,6 +969,49 @@ def _self_test():
     position_loss, _ = _order_losses(perfect, -positions.float(), positions)
     _check(float(position_loss) < 1e-6, "a correct confident prediction costs ~0")
 
+    print("3b. the order metric has the chance level it claims to have")
+    big = 200000
+    truth = torch.arange(K).expand(big, -1)
+    constant = torch.randint(0, K, (big, 1)).expand(-1, K)
+    _, pair_half, tie = _order_metrics(constant, truth)
+    _check(abs(float(pair_half.mean()) - 0.5) < 1e-6 and float(tie.mean()) == 1.0,
+           "a head that puts every tile in ONE slot scores exactly 50% with 100% ties "
+           "(scoring ties as errors would call this 0.00% and look anti-correlated)")
+    _, pair_zero, _ = _order_metrics(constant, truth, tie_credit=0.0)
+    _check(float(pair_zero.mean()) == 0.0,
+           "  ...and the tie_credit=0 convention is what produced the 0.00% in run 1")
+    iid = torch.randint(0, K, (big, K))
+    _, pair_iid, tie_iid = _order_metrics(iid, truth)
+    _, pair_iid_zero, _ = _order_metrics(iid, truth, tie_credit=0.0)
+    _check(abs(float(pair_iid.mean()) - 0.5) < 0.005,
+           f"an i.i.d. random argmax scores {100 * float(pair_iid.mean()):.2f}% with half credit")
+    _check(abs(float(pair_iid_zero.mean()) - (1 - 1 / K) / 2) < 0.005,
+           f"  ...but only {100 * float(pair_iid_zero.mean()):.2f}% with tie_credit=0, i.e. the "
+           f"true chance level of the old metric was (1-1/K)/2={100 * (1 - 1 / K) / 2:.1f}%, not 50%")
+    permutation = torch.argsort(torch.rand(big, K), dim=1)
+    _, pair_perm, tie_perm = _order_metrics(permutation, truth)
+    _check(abs(float(pair_perm.mean()) - 0.5) < 0.005 and float(tie_perm.mean()) == 0.0,
+           "a permutation decode has no ties and sits at 50% either way")
+
+    print("3c. _assign returns a permutation and maximizes total log-probability")
+    logits = torch.randn(256, K, K) * 3
+    assigned = _assign(logits)
+    _check(all(sorted(row.tolist()) == list(range(K)) for row in assigned),
+           "every _assign output is a genuine permutation of the K slots")
+    log_probability = F.log_softmax(logits, dim=-1)
+    chosen_score = log_probability.gather(2, assigned[:, :, None]).squeeze(-1).sum(1)
+    every = torch.tensor(list(itertools.permutations(range(K))))
+    brute = torch.stack([log_probability.gather(
+        2, p[None, :, None].expand(256, -1, -1)).squeeze(-1).sum(1) for p in every])
+    _check(torch.allclose(chosen_score, brute.max(dim=0).values, atol=1e-5),
+           "_assign finds the highest-scoring permutation (checked against all K! by hand)")
+    confident = F.one_hot(torch.arange(K), K).float()[None].expand(64, -1, -1) * 20
+    _check((_assign(confident) == torch.arange(K)).all(),
+           "a confident correct head decodes to the identity permutation")
+    degenerate = torch.zeros(64, K, K); degenerate[:, :, 1] = 10.0
+    _check(all(sorted(row.tolist()) == list(range(K)) for row in _assign(degenerate)),
+           "even when every tile votes for the SAME slot, _assign still returns a permutation")
+
     print("4. the head is permutation equivariant")
     head = _OrderHead(6, 16, K)
     z = torch.randn(8, K, 6)
@@ -863,6 +1048,24 @@ def _self_test():
     _check(float(share.max()) < 0.75,
            f"quantile edges avoid mode collapse (largest class share {float(share.max()):.2f}) "
            "-> the forecast CE is not minimized by always predicting one class")
+
+    print("6b. the reconstruction target is the tile itself, bin for bin")
+    window, tiles_k, neurons = model.window_size, model.n_tiles, 12
+    tiles = torch.from_numpy(data[:5 * tiles_k * window].reshape(5, tiles_k, window, neurons)
+                             ).permute(0, 1, 3, 2).contiguous()          # (B,K,N,W)
+    flat = tiles.permute(0, 1, 3, 2).reshape(-1, neurons)
+    target = model._bucketize(flat).reshape(-1, window, neurons).permute(0, 2, 1)
+    _check(target.shape == (5 * tiles_k, neurons, window),
+           f"target is (B*K, N, W)={tuple(target.shape)}, matching the head's logit layout")
+    direct = model._bucketize(tiles[0, 0].T).T                           # (N, W), the honest way
+    _check(torch.equal(target[0], direct),
+           "tile (0,0) round-trips: the reshape/permute chain preserves the (neuron, bin) pairing")
+    head = _ReconstructHead(8, 12, neurons, window, model.forecast_levels)
+    logits = head(torch.randn(5 * tiles_k, 8))
+    _check(logits.shape == (5 * tiles_k, neurons, window, model.forecast_levels),
+           f"head logits {tuple(logits.shape)} line up with the target elementwise")
+    _check(logits.reshape(-1, model.forecast_levels).shape[0] == target.reshape(-1).shape[0],
+           "flattening logits and target for cross_entropy keeps them aligned")
 
     print("7. end to end: training must not destroy decodable structure")
     data, latent = _synthetic(7000, 24, seed=1)
@@ -913,6 +1116,8 @@ def _self_test():
 
     print("10. controls run and bad configs are rejected")
     for override in ({"lambda_order": 0.0, "lambda_pair": 0.0}, {"lambda_forecast": 0.0},
+                     {"lambda_reconstruct": 0.0}, {"lambda_forecast": 0.0, "lambda_order": 0.0,
+                                                   "lambda_pair": 0.0},
                      {"order_grad_scale": 0.0}, {"trunk_block": "separable"},
                      {"tile_norm": "none"}, {"n_tiles": 2}):
         settings = dict(shared, max_epochs=2); settings.update(override)
@@ -921,7 +1126,9 @@ def _self_test():
                f"control {override} trains and transforms cleanly")
     for bad in ({"window_size": 3}, {"n_tiles": 1}, {"tile_gap": (0, 3)},
                 {"trunk_block": "mobilenet"}, {"tile_norm": "l2"},
-                {"lambda_order": 0.0, "lambda_pair": 0.0, "lambda_forecast": 0.0}):
+                {"lambda_reconstruct": -1.0},
+                {"lambda_order": 0.0, "lambda_pair": 0.0, "lambda_forecast": 0.0,
+                 "lambda_reconstruct": 0.0}):
         try:
             JigsawNet(**dict(shared, **bad))
             raise AssertionError(f"{bad} should have been rejected")
@@ -956,25 +1163,33 @@ def _demo():
                   num_hidden_units=48, head_hidden_units=48, batch_size=256,
                   learning_rate=2e-3, device="cuda_if_available", verbose=False, random_state=0)
     arms = {
-        "proposed (order + forecast)": dict(max_epochs=25),
-        "order only": dict(max_epochs=25, lambda_forecast=0.0),
-        "forecast only": dict(max_epochs=25, lambda_order=0.0, lambda_pair=0.0),
+        "proposed (all three)": dict(max_epochs=25),
+        "no reconstruct anchor": dict(max_epochs=25, lambda_reconstruct=0.0),
+        "order only": dict(max_epochs=25, lambda_forecast=0.0, lambda_reconstruct=0.0),
+        "forecast only": dict(max_epochs=25, lambda_order=0.0, lambda_pair=0.0,
+                              lambda_reconstruct=0.0),
+        "reconstruct only": dict(max_epochs=25, lambda_order=0.0, lambda_pair=0.0,
+                                 lambda_forecast=0.0),
         "random encoder": dict(max_epochs=0),
         "normalize=True (sphere)": dict(max_epochs=25, normalize=True),
-        "mobilenet trunk": dict(max_epochs=25, trunk_block="separable"),
+        "separable trunk": dict(max_epochs=25, trunk_block="separable"),
     }
-    print(f"{'arm':<30}{'R2':>9}{'raw R2':>9}{'delta':>9}{'pair %':>9}{'shortcut':>10}")
-    print("-" * 76)
+    print(f"{'arm':<26}{'R2':>9}{'raw R2':>9}{'delta':>9}{'p.ratio':>9}"
+          f"{'pair %':>9}{'ties %':>8}{'shortcut':>10}")
+    print("-" * 89)
     for name, override in arms.items():
         model = JigsawNet(**dict(shared, **override)).fit(data[:cut])
         decoding = model.evaluate_decoding(data[:cut], latent[:cut], data[cut:], latent[cut:])
         pretext = model.evaluate_pretext(data[cut:], max_spans=400, verbose=False)
-        print(f"{name:<30}{decoding['embedding']['r2']:>9.4f}"
+        print(f"{name:<26}{decoding['embedding']['r2']:>9.4f}"
               f"{decoding['raw_window']['r2']:>9.4f}{decoding['embedding_minus_raw']:>9.4f}"
+              f"{decoding['embedding']['participation_ratio']:>9.2f}"
               f"{pretext['pair_accuracy_percent']:>9.2f}"
+              f"{pretext['argmax_tie_rate_percent']:>8.1f}"
               f"{pretext['baseline_mean_sort_pair_percent']:>10.2f}")
-    print("-" * 76)
+    print("-" * 89)
     print("delta < 0 means the encoder is removing information the raw window already had.")
+    print("p.ratio is the participation ratio of the embedding: if it collapses, so does R2.")
 
 
 def main():
