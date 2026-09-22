@@ -35,7 +35,6 @@ from Neural_Jigsaw import JigsawNet, _ridge_r2
 PERICH_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 OUTPUT_ROOT = Path("/home/mirzaei/sam/result/Aggregate")
 SEED = 42
-TRAIN_FRACTION = 0.8
 
 WINDOW_SIZE = 10
 N_TILES = 4
@@ -173,34 +172,59 @@ def versus_chance(successes, trials, chance):
 
 
 def load_session(path):
-    with np.load(path, allow_pickle=True) as handle:
-        keys = set(handle.files)
-        spikes_key = next((k for k in ("spikes", "neural", "rates", "X", "counts")
-                           if k in keys), None)
-        behavior_key = next((k for k in ("behavior", "velocity", "vel", "Y", "y", "kin")
-                            if k in keys), None)
-        if spikes_key is None or behavior_key is None:
-            raise KeyError(f"{path.name}: need a spike key and a behavior key; has {sorted(keys)}")
-        spikes = np.asarray(handle[spikes_key], dtype=np.float32)
-        behavior = np.asarray(handle[behavior_key], dtype=np.float32)
-    if spikes.ndim != 2:
-        raise ValueError(f"{path.name}: spikes must be 2D, got {spikes.shape}")
-    if behavior.ndim == 1:
-        behavior = behavior[:, None]
-    if spikes.shape[0] != behavior.shape[0] and spikes.shape[1] == behavior.shape[0]:
-        spikes = spikes.T
-    length = min(len(spikes), len(behavior))
-    spikes, behavior = spikes[:length], behavior[:length]
-    if behavior.shape[1] > 2:
-        behavior = behavior[:, :2]
-    keep = np.isfinite(spikes).all(1) & np.isfinite(behavior).all(1)
-    if not keep.all():
-        first, last = int(np.argmax(keep)), length - int(np.argmax(keep[::-1]))
-        spikes, behavior = spikes[first:last], behavior[first:last]
+    """Load the existing NPZ train/validation split without splitting again.
+
+    Keep the original runner's first-two-label selection. The neuron mask is
+    fitted on training data only and applied identically to both splits.
+    """
+    path = Path(path)
+    required = ("train_data", "train_label", "valid_data", "valid_label")
+    with np.load(path, allow_pickle=False) as handle:
+        missing = [key for key in required if key not in handle.files]
+        if missing:
+            raise KeyError(
+                f"{path.name}: missing NPZ keys {missing}; has {sorted(handle.files)}")
+        arrays = [np.asarray(handle[key], dtype=np.float32) for key in required]
+
+    splits = []
+    for name, spikes, behavior in (("train", arrays[0], arrays[1]),
+                                  ("valid", arrays[2], arrays[3])):
+        if behavior.ndim == 1:
+            behavior = behavior[:, None]
+        if spikes.ndim != 2 or behavior.ndim != 2:
+            raise ValueError(
+                f"{path.name}: {name} data/labels must be 2D; "
+                f"got {spikes.shape} and {behavior.shape}")
+        # Preserve support for neural arrays stored as (neurons, time).
+        if len(spikes) != len(behavior) and spikes.shape[1] == len(behavior):
+            spikes = spikes.T
+        if len(spikes) != len(behavior):
+            raise ValueError(
+                f"{path.name}: {name} data/label length mismatch: "
+                f"{len(spikes)} vs {len(behavior)}")
+        if len(spikes) == 0 or spikes.shape[1] == 0 or behavior.shape[1] == 0:
+            raise ValueError(f"{path.name}: {name} contains an empty array")
         if not (np.isfinite(spikes).all() and np.isfinite(behavior).all()):
-            raise ValueError(f"{path.name}: nonfinite values in the interior, not just the edges")
-    alive = spikes.std(0) > 0
-    return np.ascontiguousarray(spikes[:, alive]), np.ascontiguousarray(behavior)
+            raise ValueError(f"{path.name}: {name} contains NaN or Inf")
+        splits.append((spikes, behavior))
+
+    spikes_train, behavior_train = splits[0]
+    spikes_valid, behavior_valid = splits[1]
+    if spikes_train.shape[1] != spikes_valid.shape[1]:
+        raise ValueError(f"{path.name}: train/valid neuron counts differ")
+    if behavior_train.shape[1] != behavior_valid.shape[1]:
+        raise ValueError(f"{path.name}: train/valid label counts differ")
+
+    # Same label selection as the supplied runner; no assumption about names.
+    behavior_train = behavior_train[:, :2]
+    behavior_valid = behavior_valid[:, :2]
+    alive = spikes_train.std(0) > 0
+    if not alive.any():
+        raise ValueError(f"{path.name}: no varying neurons in train_data")
+    return (np.ascontiguousarray(spikes_train[:, alive]),
+            np.ascontiguousarray(behavior_train),
+            np.ascontiguousarray(spikes_valid[:, alive]),
+            np.ascontiguousarray(behavior_valid))
 
 
 class Decoder(nn.Module):
@@ -434,14 +458,14 @@ def main():
     stamp = time.strftime("%Y%m%d_%H%M%S")
 
     for path in files:
-        spikes, behavior = load_session(path)
-        cut = int(TRAIN_FRACTION * len(spikes))
-        data = (spikes[:cut], behavior[:cut], spikes[cut:], behavior[cut:])
+        data = load_session(path)
+        spikes_train, behavior_train, spikes_valid, behavior_valid = data
         out_dir = options.out_dir / f"{options.tag}_{path.stem}_{stamp}"
         out_dir.mkdir(parents=True, exist_ok=True)
         print("\n" + "#" * 78)
-        print(f"# {path.stem}: {len(spikes)} bins, {spikes.shape[1]} neurons, "
-              f"{behavior.shape[1]} behavior dims | train {cut} / valid {len(spikes) - cut}")
+        print(f"# {path.stem}: {len(spikes_train) + len(spikes_valid)} bins, "
+              f"{spikes_train.shape[1]} neurons, {behavior_train.shape[1]} behavior dims | "
+              f"train {len(spikes_train)} / valid {len(spikes_valid)} (NPZ split)")
         print(f"# device={device} epochs={options.epochs} -> {out_dir}")
         print("#" * 78, flush=True)
 
@@ -476,6 +500,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 # """Sweep NeuralJigsaw's tile_normalize modes on one session and compare them
