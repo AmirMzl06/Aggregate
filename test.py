@@ -43,9 +43,9 @@ def run_acorn():
     # X_test = X[split:]
     # Y_test = Y[split:]
     X_train = X[:split]
-    Y_train = Y[:split, :2]
+    Y_train = Y[:split, :1]
     X_test = X[split:]
-    Y_test = Y[split:, :2]
+    Y_test = Y[split:, :1]
 
     print("train:", X_train.shape, "test:", X_test.shape)
 
