@@ -152,8 +152,18 @@ def matching_update_budget(train_bins, jigsaw_epochs):
 class Decoder(nn.Module):
     def __init__(self, dimension, targets, hidden, dropout):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(dimension, hidden), nn.LayerNorm(hidden),
-                                 nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, targets))
+
+        self.net = nn.Sequential(
+            nn.Linear(dimension, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden, targets)
+        )
 
     def forward(self, x):
         return self.net(x)
