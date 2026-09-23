@@ -48,7 +48,7 @@ def run_acorn():
     model = CEBRA(
         model_architecture="offset36-model",
         batch_size=102,
-        max_iterations=30000,
+        max_iterations=3000,
         output_dimension=32,
         training_mode="adversarial",
         adv_epsilon=0.5,
