@@ -30,7 +30,7 @@ def run_acorn():
     loader = DatasetLoader(data_root_dir=DATA_ROOT)
 
     # CO-M day0
-    spike, behavior = loader.load_dataset_day(0,"CO-M")
+    spike, behavior = loader.load_dataset_day(0,"Mihili_CO_2014_raw")
 
     X = np.asarray(spike)
     Y = np.asarray(behavior)
