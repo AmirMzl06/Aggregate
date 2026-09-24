@@ -63,7 +63,7 @@ OUTPUT_DIMENSION = 64
 NUM_HIDDEN_UNITS = 64
 HEAD_HIDDEN_UNITS = 64
 BATCH_SIZE = 512
-EPOCHS = 10000
+EPOCHS = 6000
 LEARNING_RATE = 1e-3
 TILE_NORM = "mean"
 NEURON_DROPOUT = 0.1
@@ -946,7 +946,7 @@ def main():
     if not files:
         raise SystemExit(f"no .npz files under {options.data_dir}")
     # files = files[:max(1, options.sessions)]
-    files = [files[5]]
+    files = [files[68]]
     stamp = time.strftime("%Y%m%d_%H%M%S")
 
     for path in files:
