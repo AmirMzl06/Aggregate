@@ -7,7 +7,7 @@ import torch
 from sklearn.metrics import r2_score
 
 ROOT = Path(__file__).resolve().parent
-ACORN_DIR = ROOT / "CEBRA-idea2"  # "acorn-main"
+ACORN_DIR = ROOT / "acorn-main" #"CEBRA-idea2"  # "acorn-main"
 CYCLEGAN_DIR = Path("/mnt/upmwmathis/scratch/hossein/aj_project/adversarial_BCI")
 DATA_ROOT = "/data/hossein/data"
 sys.path.insert(0, str(ACORN_DIR))
@@ -57,42 +57,42 @@ def run_acorn():
     print(f"Input neurons: {n_neurons} | adv_neuron_count = {neuron_count} (25%)")
 
     # Baseline (all neurons)
-    # model = CEBRA(model_architecture="offset36-model",
-    #               batch_size=102,
-    #               max_iterations=3000,
-    #               output_dimension=32,
-    #               training_mode="adversarial",
-    #               adv_epsilon=0.5,
-    #               adv_alpha=0.1,
-    #               adv_steps=10,
-    #               attack_norm="linf",
-    #               device="cuda")
+    model = CEBRA(model_architecture="offset36-model",
+                  batch_size=102,
+                  max_iterations=3000,
+                  output_dimension=32,
+                  training_mode="adversarial",
+                  adv_epsilon=0.5,
+                  adv_alpha=0.1,
+                  adv_steps=10,
+                  attack_norm="linf",
+                  device="cuda")
 
     # IDEA2 (attack only on 25% of neurons)
-    model = CEBRA(
-        model_architecture="offset36-model",
-        batch_size=102,
-        max_iterations=3000,
-        output_dimension=32,
-        training_mode="adversarial",
-        adv_epsilon=0.5,
-        adv_alpha=0.1,
-        adv_steps=10,
-        attack_norm="linf",
-        device="cuda",
+    # model = CEBRA(
+    #     model_architecture="offset36-model",
+    #     batch_size=102,
+    #     max_iterations=3000,
+    #     output_dimension=32,
+    #     training_mode="adversarial",
+    #     adv_epsilon=0.5,
+    #     adv_alpha=0.1,
+    #     adv_steps=10,
+    #     attack_norm="linf",
+    #     device="cuda",
 
-        adv_neuron_count=neuron_count,
-        adv_neuron_selection="gradient",
+    #     adv_neuron_count=neuron_count,
+    #     adv_neuron_selection="gradient",
 
-        attack_target="reference",
-        adv_restarts=1,
-        adv_best_iterate=False,
-        adv_random_start=True,
-        adv_eval_mode=False,
-        adv_budget_mode="per_view",
-        adv_clip_min=None,
-        adv_clip_max=None,
-    )
+    #     attack_target="reference",
+    #     adv_restarts=1,
+    #     adv_best_iterate=False,
+    #     adv_random_start=True,
+    #     adv_eval_mode=False,
+    #     adv_budget_mode="per_view",
+    #     adv_clip_min=None,
+    #     adv_clip_max=None,
+    # )
 
     model.fit(X_train, Y_train)
 
