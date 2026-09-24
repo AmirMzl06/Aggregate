@@ -182,7 +182,7 @@ SESSION_NAME = "Mihili_CO_2014_raw"
 N_DAYS = 11             
 TRAIN_FRACTION = 0.8    
 N_LAGS = 4             
-USE_ALL_BEHAVIOR = True 
+USE_ALL_BEHAVIOR = False 
 
 
 def run_acorn():
