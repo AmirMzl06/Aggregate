@@ -72,7 +72,7 @@ def main():
         model_architecture="offset36-model-more-dropout",
         batch_size=2048,
         temperature=0.4,
-        time_offsets=4,
+        time_offsets=1,
         max_iterations=args.max_iterations,
         output_dimension=LATENT,
         num_hidden_units=32,
