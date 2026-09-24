@@ -162,6 +162,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 ACORN_DIR = ROOT / "acorn-main" #"CEBRA-idea2"  # "acorn-main"
@@ -193,6 +194,15 @@ def run_acorn():
 
     loader = DatasetLoader(data_root_dir=DATA_ROOT)
 
+    # all_data = {}
+    # for day in range(N_DAYS):
+    #     spike, behavior = loader.load_dataset_day(day, SESSION_NAME)
+    #     X = np.asarray(spike)
+    #     Y = np.asarray(behavior)
+    #     if not USE_ALL_BEHAVIOR:
+    #         Y = Y[:, :1]
+    #     all_data[day] = (X, Y)
+    #     print(f"day {day:2d}: spike={X.shape}, behavior={Y.shape}")
     all_data = {}
     for day in range(N_DAYS):
         spike, behavior = loader.load_dataset_day(day, SESSION_NAME)
@@ -200,9 +210,14 @@ def run_acorn():
         Y = np.asarray(behavior)
         if not USE_ALL_BEHAVIOR:
             Y = Y[:, :1]
+        # # ==========================
+        # # neuron-wise normalization
+        # # independently for each day
+        # # ==========================
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
         all_data[day] = (X, Y)
         print(f"day {day:2d}: spike={X.shape}, behavior={Y.shape}")
-
 
     X0, Y0 = all_data[0]
     split0 = int(TRAIN_FRACTION * len(X0))
