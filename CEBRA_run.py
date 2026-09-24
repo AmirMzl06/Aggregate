@@ -12,7 +12,7 @@ import sys
 import importlib
 
 
-LATENT = 48
+LATENT = 128
 DECODER_EPOCHS = 10000
 
 
