@@ -93,7 +93,7 @@ def run_acorn():
 
     return {
         "model": "ACORN",
-        "dataset": "CO-M-day0",
+        "dataset": "CO-M-day1",
         "r2_mean": float(np.mean(r2)),
         "r2_each": r2.tolist(),
     }
