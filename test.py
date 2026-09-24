@@ -40,9 +40,9 @@ def run_acorn():
     split = int(0.8 * n)
 
     X_train = X[:split]
-    Y_train = Y[:split, :1]
+    Y_train = Y[:split,]
     X_test = X[split:]
-    Y_test = Y[split:, :1]
+    Y_test = Y[split:,]
 
     print("train:", X_train.shape, "test:", X_test.shape)
 
