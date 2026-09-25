@@ -331,8 +331,10 @@ def load_session(path):
             f"{path.name}: train has {spikes_train.shape[1]} neurons but valid has "
             f"{spikes_valid.shape[1]}")
         
-    behavior_train = behavior_train[:, :2]   ## Only train on 2 firsts label 
-    behavior_valid = behavior_valid[:, :2]   ## Only train on 2 firsts label 
+    # behavior_train = behavior_train[:, :2]   ## Only train on 2 firsts label 
+    # behavior_valid = behavior_valid[:, :2]   ## Only train on 2 firsts label 
+    behavior_train = behavior_train[:, :] #All lable train for decoder 
+    behavior_valid = behavior_valid[:, :] #All label train for decoder
     
     # Fitted on TRAIN only: deciding which neurons exist using the validation
     # split would be a (small) leak, and it costs nothing to avoid.
