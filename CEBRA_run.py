@@ -61,9 +61,9 @@ def main():
 
     with np.load(args.data) as f:
         x_train = f["train_data"].astype(np.float32)
-        y_train = f["train_label"].astype(np.float32)[:, :2]
+        y_train = f["train_label"].astype(np.float32)[:, :]#[:, :2]
         x_valid = f["valid_data"].astype(np.float32)
-        y_valid = f["valid_label"].astype(np.float32)[:, :2]
+        y_valid = f["valid_label"].astype(np.float32)[:, :]
 
     print("train:", x_train.shape, y_train.shape)
     print("valid:", x_valid.shape, y_valid.shape)
