@@ -208,6 +208,10 @@ DEFAULT_ARMS = ("proposed", "reconstruct_only", "order_only", "random_encoder",
 EPOCH_ARMS = ("epochs_10", "epochs_100", "epochs_1000", "epochs_3000",
               "epochs_10000", "random_encoder")
 
+
+from jigsaw_audit import register
+register(MODELS, ARMS)
+
 MOBILE_ARMS = tuple(k for k, v in ARMS.items() if v.get("_model") == "mobile")
 
 
