@@ -682,7 +682,7 @@ class JigsawNet:
             parts["position"], parts["pair"] = position_loss, pair_loss
             total = total + self.lambda_order * position_loss + self.lambda_pair * pair_loss
             with torch.no_grad():
-                predicted = _ranks(scores) if self.lambda_order == 0 \
+                predicted = _ranks(-scores) if self.lambda_order == 0 \
                     else _assign(position_logits)
                 exact, pair_accuracy, tie_rate = _order_metrics(predicted, labels)
                 parts["exact"], parts["pair_accuracy"] = exact.mean(), pair_accuracy.mean()
@@ -870,11 +870,11 @@ class JigsawNet:
                 position_logits, scores = self.order_head_(
                     z.reshape(len(block), self.n_tiles, self.output_dimension))
                 # Headline decode: a real permutation, so chance is 1/K! and 50% exactly.
-                predicted = _assign(position_logits) if self.lambda_order > 0 else _ranks(scores)
+                predicted = _assign(position_logits) if self.lambda_order > 0 else _ranks(-scores)
                 exact, pair, tie = _order_metrics(predicted, positions)
                 # Kept for comparison: the naive argmax, which is NOT a permutation.
                 _, argmax_pair, argmax_tie = _order_metrics(position_logits.argmax(-1), positions)
-                rank_exact, rank_pair, _ = _order_metrics(_ranks(scores), positions)
+                rank_exact, rank_pair, _ = _order_metrics(_ranks(-scores), positions)
                 mean_exact, mean_pair, _ = _order_metrics(_ranks(tiles.mean(dim=(2, 3))), positions)
                 norm_exact, norm_pair, _ = _order_metrics(
                     _ranks(tiles.reshape(len(block), self.n_tiles, -1).norm(dim=2)), positions)
