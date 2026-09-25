@@ -24,20 +24,32 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+# class Decoder(nn.Module):
+#     def __init__(self, dim):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(dim, 64),
+#             nn.LayerNorm(64),
+#             nn.ReLU(),
+#             nn.Dropout(0.4),
+#             nn.Linear(64, 6),
+#         )
+
+#     def forward(self, x):
+#         return self.net(x)
 class Decoder(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, output_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, 64),
             nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(64, 2),
+            nn.Linear(64, output_dim),
         )
 
     def forward(self, x):
         return self.net(x)
-
 
 def mean_r2(y, p):
     return float(np.mean([r2_score(y[:, i], p[:, i]) for i in range(2)]))
@@ -87,7 +99,11 @@ def main():
     z_train = np.asarray(model.transform(x_train))
     z_valid = np.asarray(model.transform(x_valid))
 
-    dec = Decoder(z_train.shape[1]).to(device)
+    # dec = Decoder(z_train.shape[1]).to(device)
+    dec = Decoder(
+        z_train.shape[1],
+        y_train.shape[1]
+    ).to(device)
     opt = torch.optim.Adam(dec.parameters(), lr=1e-3, weight_decay=2e-4)
 
     xt = torch.tensor(z_train).float().to(device)
