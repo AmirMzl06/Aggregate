@@ -18,7 +18,6 @@ This file intentionally contains no dataset-specific loading or splitting logic.
 from __future__ import annotations
 
 import copy
-import inspect
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,16 +72,10 @@ def load_cebra_fork():
     if not imported_from.is_relative_to(CEBRA_DIR.resolve()):
         raise RuntimeError(f"Wrong CEBRA imported: {imported_from}")
 
-    # Same fork check used in your existing scripts. It is not required by the
-    # plain InfoNCE-vs-MSE trainer itself, but it guarantees that this is the
-    # matching adversarial-capable fork rather than a pip-installed CEBRA.
-    parameters = inspect.signature(_cebra.CEBRA.__init__).parameters
-    required = ("adv_negative_grad_scale",)
-    missing = [name for name in required if name not in parameters]
-    if missing:
-        raise RuntimeError(
-            f"This fork lacks {missing}. Use the matching CEBRA-original fork."
-        )
+    # No adversarial-only API check here. This comparison needs only the
+    # standard CEBRA model/data/InfoNCE APIs plus the local model registry.
+    # In particular, `adv_negative_grad_scale` belongs to a separate
+    # adversarial fork and is NOT required for CEBRA-vs-MSE.
 
     print("Using CEBRA fork:", imported_from, flush=True)
     return _cebra
