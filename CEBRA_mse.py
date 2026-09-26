@@ -519,6 +519,8 @@ def main():
 
     all_results = []
     for seed in SEEDS:
+        # Order chosen so objective changes slowly; it has no effect on initialization
+        # because each arm is explicitly re-seeded and rebuilt from scratch.
         for objective, label_mode in (
             ("infonce", "all"),
             ("infonce", "label0"),
