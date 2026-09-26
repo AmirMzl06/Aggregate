@@ -209,8 +209,15 @@ EPOCH_ARMS = ("epochs_10", "epochs_100", "epochs_1000", "epochs_3000",
               "epochs_10000", "random_encoder")
 
 
-from jigsaw_audit import register
-register(MODELS, ARMS)
+# from jigsaw_audit import register
+# register(MODELS, ARMS)
+
+from jigsaw_audit import register as register_audit
+register_audit(MODELS, ARMS)
+
+from jigsaw_order import register as register_order
+register_order(MODELS, ARMS)
+
 
 MOBILE_ARMS = tuple(k for k, v in ARMS.items() if v.get("_model") == "mobile")
 
