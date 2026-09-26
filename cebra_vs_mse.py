@@ -113,8 +113,9 @@ class CompareConfig:
     time_offset: int = 4
     conditional: str = "time_delta"  # label-conditioned CEBRA positives
 
-    # MSE head.
-    mse_head_hidden: Optional[int] = None  # None -> a single Linear layer
+    # MSE head. Keep this identical to the downstream probe decoder.
+    mse_head_hidden: int = 64
+    mse_head_dropout: float = 0.4
 
     seed: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -177,12 +178,32 @@ def build_offset36_encoder(
     )
 
 
-class CEBRAMSE(nn.Module):
-    """Same CEBRA convolutional encoder + a small regression head.
+class TwoLayerMLP(nn.Module):
+    """Two-layer decoder used for the MSE arm.
 
-    MSE gradients flow through BOTH the head and the encoder, so this is not a
-    frozen-CEBRA decoder. It is an end-to-end MSE-trained version of the same
-    convolutional backbone.
+    This matches the decoder used by the comparison runner:
+      Linear -> LayerNorm -> ReLU -> Dropout -> Linear
+    """
+
+    def __init__(self, dim: int, out: int, hidden: int = 64, dropout: float = 0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class CEBRAMSE(nn.Module):
+    """Same CEBRA convolutional encoder + the TwoLayerMLP regression head.
+
+    MSE gradients flow through BOTH the decoder and the encoder, so this is an
+    end-to-end MSE-trained version of the same convolutional backbone.
     """
 
     def __init__(
@@ -190,18 +211,17 @@ class CEBRAMSE(nn.Module):
         encoder: nn.Module,
         embedding_dim: int,
         target_dim: int,
-        head_hidden: Optional[int] = None,
+        head_hidden: int = 64,
+        head_dropout: float = 0.4,
     ):
         super().__init__()
         self.encoder = encoder
-        if head_hidden is None:
-            self.head = nn.Linear(embedding_dim, target_dim)
-        else:
-            self.head = nn.Sequential(
-                nn.Linear(embedding_dim, head_hidden),
-                nn.GELU(),
-                nn.Linear(head_hidden, target_dim),
-            )
+        self.head = TwoLayerMLP(
+            embedding_dim,
+            target_dim,
+            hidden=head_hidden,
+            dropout=head_dropout,
+        )
 
     def forward_windows(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """windows: (B, N, 36) -> (prediction, embedding)."""
@@ -233,6 +253,7 @@ def build_paired_models(
         embedding_dim=cfg.embedding_dim,
         target_dim=target_dim,
         head_hidden=cfg.mse_head_hidden,
+        head_dropout=cfg.mse_head_dropout,
     )
     return info_encoder.to(cfg.device), mse_model.to(cfg.device)
 
