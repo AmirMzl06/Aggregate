@@ -30,7 +30,7 @@ NPZ_PATH = PERICH_DATA_DIR / f"{SESSION}.npz"
 OUT_ROOT = ROOT / "ACORN_CONSTANT_EPS_GRID_CCO12"
 
 EPSILON_GRID = (0.1, 0.2, 0.5, 0.7, 1.0, 2.0, 5.0)
-SEEDS = (42)
+SEEDS = (42,)
 
 # Encoder config: identical for every arm except adv_epsilon.
 LATENT_DIM = 64
