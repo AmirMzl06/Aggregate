@@ -242,6 +242,27 @@ try:
 except ImportError:                                  # pragma: no cover
     jigsaw_order = None
 
+
+# --------------------------------------------------------------------------- #
+# Extra lag controls
+# --------------------------------------------------------------------------- #
+
+ARMS["order_time_axis_frozen"] = dict(
+    _model="order",
+    lambda_order=0.0,
+    lambda_pair=0.0,
+    lambda_lag=1.0,
+    order_head_kind="linear",
+    lag_classes=8,
+    label_control="frozen_random",
+)
+
+ARMS["order_lag_frozen"] = dict(
+    _model="order",
+    lambda_lag=1.0,
+    label_control="frozen_random",
+)
+
 # The headline contrast, in priority order: the first pair that both ran wins.
 # Anchor pairs come first now. `order_gapped - anchor_gapped` differs in ONE
 # thing (the order weights) at a geometry where neither the level nor tile
