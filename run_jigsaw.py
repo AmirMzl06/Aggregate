@@ -1283,7 +1283,8 @@ def main():
     files = sorted(p for p in options.data_dir.glob("*.npz"))
     if not files:
         raise SystemExit(f"no .npz files under {options.data_dir}")
-    files = files[:max(1, options.sessions)]
+    # files = files[:max(1, options.sessions)]
+    files = [files[68]]
     stamp = time.strftime("%Y%m%d_%H%M%S")
 
     for path in files:
