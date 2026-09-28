@@ -93,6 +93,60 @@ InfoNCE). It defaults to 0 so that nothing in the headline number comes from it
 unless you ask; there is an arm that turns it on so its contribution stays
 attributable.
 
+WHAT THE 20260928 RUN SAID -- read this before the sections above
+-----------------------------------------------------------------
+Three seeds, 6000 epochs, Perich. R2 (MLP) against the FROZEN RANDOM ENCODER at
+0.3199, which is the only floor that means anything:
+
+    solo_full       0.4345    everything on
+    solo_no_stitch  0.4158    - stitch
+    solo_random     0.3199    frozen, untrained
+    solo_rank8      0.3186    the grouped TEMPORAL puzzle, alone
+    solo_no_space   0.2538    temporal + stitch, no spatial term
+    solo_full_frozen 0.1592   everything on, labels meaningless
+    solo_shared8    0.0269    the shared-permutation control
+
+Two things follow, and they point in opposite directions.
+
+The good one: the jigsaw now stands alone. 0.4345 MLP / 0.3292 ridge with
+`reconstruct CE=0.0000` printed on every epoch of every arm, against a RAW
+WINDOW ceiling of 0.4997 / 0.4283 -- 87% and 77% of what the decoder gets from
+the unprocessed spikes. That is the first time in this project a number came out
+of a puzzle with no autoencoder underneath it.
+
+The bad one: mechanism 1, the thing the file was named after, is worth zero.
+`solo_rank8` 0.3186 versus `solo_random` 0.3199 is a dead heat with an UNTRAINED
+encoder, and `solo_no_space` at 0.2538 says the temporal puzzle plus stitch is
+actively worse than not training at all. Every point of the result is
+mechanism 4, the NEURON-AXIS puzzle. `solo_rank8 - solo_shared8` came out
++0.2916 and seed-consistent, but that contrast only says the labels have to be
+independent; it does not say sorting time is useful, and the frozen-encoder
+comparison says it is not.
+
+So the spatial term is the finding and the temporal ladder is now a control.
+
+WHAT IS NOT YET ESTABLISHED ABOUT THE SPATIAL TERM
+--------------------------------------------------
+Held-out block accuracy was 85.2 / 94.0 / 95.8% against 12.5% chance, with train
+accuracy LOWER than held-out (no memorization) and the frozen-label twin at
+exactly chance out of sample. All real. But the label-free baseline it was
+measured against, at 13-16%, was built from a ROW-AVERAGED block template, and
+averaging over the rows deletes the single most likely shortcut: "in this block
+neuron 7 outfires neuron 12", a constant of the session that the encoder can
+learn once and reuse on every span. The baseline was blindfolded, so the 85-96%
+is not yet evidence about dynamics.
+
+This round fixes that rather than assuming either answer. `space_oracle` is now
+a full (S,W) patch template, `space_oracle_rate` is the pure static-identity
+rule, and two new arms delete the cue at the source: `space_norm="row_zscore"`
+removes every neuron's own mean and gain inside the window, and
+`space_time_shuffle` permutes the time bins so every static statistic survives
+and only the order dies. If `solo_space_only - solo_space_rowz` is near zero the
+claim is about dynamics; if it is large the claim is "the embedding must encode
+which cells these are", which is still a real self-supervised objective and
+still beats the autoencoder if the R2 says so -- just a different sentence in
+the paper.
+
 THE GUARANTEE
 -------------
 `lambda_reconstruct` and `lambda_forecast` are forced to zero in the constructor
@@ -103,11 +157,12 @@ number at the end came from the puzzle.
 
 WHAT WOULD FALSIFY THE IDEA
 ---------------------------
-`solo_rank8 - solo_shared8`. Same architecture, same head, same G subspaces,
-same parameter count, same number of cross-entropy terms; the ONLY difference is
-whether the G permutations are drawn independently or are all copies of one
-permutation. If independence is worth nothing, that contrast is zero and the
-rank story is wrong. Run it before you believe anything else in this file.
+`solo_space_only - solo_random` and `solo_space_only - solo_space_frozen`. The
+first asks whether the spatial puzzle beats an untrained encoder at all -- the
+test the temporal puzzle failed on 20260928. The second asks whether it needs
+the labels to mean anything. Both must be clearly positive, on every seed,
+before any of the rest of this file is worth reading. `solo_space_only -
+ae_matched` is then the number the project is about.
 
 API is the same as the rest of the project: fit / transform / fit_transform /
 evaluate_pretext / save / load, sklearn-style, no CEBRA, no contrastive loss.
@@ -129,7 +184,17 @@ from jigsaw_order import (ANCHOR_MATCH_KEYS, OrderJigsaw, block_bootstrap,
                           continuity_strength, roll_tiles, select_span,
                           shortcut_strength)
 
-SPACE_NORMS = ("none", "block_mean", "block_zscore")
+# Two families, and the difference between them is the whole audit.
+#   block_* removes a statistic of the WHOLE block, so "neuron 7 fires twice as
+#           often as its blockmate neuron 12" survives -- a constant of the
+#           session, learnable once and reusable on every span.
+#   row_*   removes that statistic PER NEURON, so no neuron's mean rate (and
+#           under row_zscore no neuron's gain either) can name the block. What
+#           is left is the temporal shape of each row, which is a fact about
+#           this span and not about the session.
+# The 20260928 run only ever used block_mean, so its 85-96% space accuracy is
+# not yet evidence of anything beyond static neuron identity.
+SPACE_NORMS = ("none", "block_mean", "block_zscore", "row_mean", "row_zscore")
 
 
 # --------------------------------------------------------------------------- #
@@ -288,17 +353,75 @@ def permute_blocks(window, slots, sigma):
 
 
 def normalize_blocks(window, slots, mode):
-    """Remove the per-block level cue the space task would otherwise ride on."""
+    """Remove a cue the space task would otherwise ride on. (B,N,W) -> (B,N,W).
+
+    Every mode here is computed per BLOCK or per ROW of a block, never over the
+    whole window, so the statistic travels with the block wherever the row
+    permutation puts it. That is what keeps the normalization from leaking the
+    answer: slot s is normalized by the contents of slot s, and those contents
+    are whichever group landed there.
+
+    none          nothing removed. The rate cue is fully available.
+    block_mean    the block's scalar level. Relative rates WITHIN the block
+                  survive, and those are session constants.
+    block_zscore  the level and the overall scale, same caveat.
+    row_mean      each neuron's own mean over the window. No neuron's rate can
+                  name its block any more; gains still can.
+    row_zscore    each neuron's mean AND gain. Only the temporal shape of each
+                  row is left, which is the one cue that is about this span.
+                  Rows that never fire in the window become exactly zero, so a
+                  silent neuron stops being an identity beacon.
+    """
     if mode == "none":
         return window
     rows = slots.reshape(-1)
-    blocks = window[:, rows, :].reshape(window.shape[0], slots.shape[0], -1)
-    centered = blocks - blocks.mean(dim=2, keepdim=True)
-    if mode == "block_zscore":
-        centered = centered / (blocks.std(dim=2, keepdim=True) + 1e-5)
+    groups, block = slots.shape
+    patch = window[:, rows, :].reshape(len(window), groups, block, -1)
+    if mode in ("row_mean", "row_zscore"):
+        centered = patch - patch.mean(dim=3, keepdim=True)
+        if mode == "row_zscore":
+            deviation = patch.std(dim=3, keepdim=True)
+            centered = torch.where(deviation > 1e-4, centered / (deviation + 1e-5),
+                                   torch.zeros_like(centered))
+    else:
+        flat = patch.reshape(len(window), groups, -1)
+        centered = flat - flat.mean(dim=2, keepdim=True)
+        if mode == "block_zscore":
+            centered = centered / (flat.std(dim=2, keepdim=True) + 1e-5)
+        centered = centered.reshape(patch.shape)
     out = window.clone()
-    out[:, rows, :] = centered.reshape(window.shape[0], len(rows), -1)
+    out[:, rows, :] = centered.reshape(len(window), len(rows), -1)
     return out
+
+
+def shuffle_time(window, generator):
+    """Permute the W time bins, one permutation per sample, shared by all rows.
+
+    The control for "does the spatial puzzle need dynamics at all?". Every
+    instantaneous population vector is preserved exactly and so is every
+    neuron's mean rate, variance and cross-neuron covariance; the only thing
+    destroyed is the ORDER of the bins. A model reading static neuron identity
+    scores exactly the same with this on. A model reading each block's temporal
+    signature does not.
+    """
+    samples, channels, width = window.shape
+    order = torch.rand(samples, width, device=window.device,
+                       generator=generator).argsort(dim=1)
+    return torch.gather(window, 2, order[:, None, :].expand(-1, channels, -1))
+
+
+def nearest_template(patch, template):
+    """(B,G,F) candidates against (G,F) templates -> (B,G) predicted group.
+
+    The label-free opponent for the spatial puzzle. Cosine and not squared
+    distance on purpose: the template is accumulated during training, under
+    neuron dropout and gain jitter, so it carries a global scale the evaluation
+    window does not have. Under L2 that scale alone shifts the argmin toward
+    whichever template happens to be smallest, and the oracle would then lose
+    for a bookkeeping reason instead of a real one.
+    """
+    return (F.normalize(patch, dim=-1)
+            @ F.normalize(template, dim=-1).t()).argmax(-1)
 
 
 def group_partition(channels, n_groups, seed):
@@ -333,8 +456,12 @@ class SoloJigsaw(OrderJigsaw):
     lambda_stitch    weight on the successor CE (bilinear head, no lookup table)
     stitch_rank      rank of that bilinear form
     lambda_space     weight on the neuron-axis (spatial) jigsaw
-    space_norm       "none" | "block_mean" | "block_zscore" -- removes the
-                     per-block firing-rate cue from the spatial puzzle
+    space_norm       which cue to delete from the spatial puzzle. See
+                     `normalize_blocks`: the block_* modes leave per-neuron
+                     rates intact, the row_* modes do not.
+    space_time_shuffle
+                     permute the window's time bins before the spatial puzzle.
+                     Keeps every static statistic, destroys temporal order.
     lambda_spread    variance floor on the embedding. NOT a puzzle: a
                      degeneracy guard, off by default, with its own arm so its
                      contribution never hides inside a headline number.
@@ -352,12 +479,12 @@ class SoloJigsaw(OrderJigsaw):
     _PARAM_NAMES = OrderJigsaw._PARAM_NAMES + (
         "n_groups", "group_chimera", "group_subspace", "group_seed",
         "lambda_stitch", "stitch_rank", "lambda_space", "space_norm",
-        "lambda_spread")
+        "space_time_shuffle", "lambda_spread")
 
     def __init__(self, *, n_groups=1, group_chimera=True, group_subspace=True,
                  group_seed=101, lambda_stitch=0.0, stitch_rank=32,
-                 lambda_space=0.0, space_norm="none", lambda_spread=0.0,
-                 **kwargs):
+                 lambda_space=0.0, space_norm="none", space_time_shuffle=False,
+                 lambda_spread=0.0, **kwargs):
         for forbidden in ("lambda_reconstruct", "lambda_forecast"):
             if float(kwargs.pop(forbidden, 0.0)) != 0.0:
                 raise ValueError(
@@ -384,6 +511,7 @@ class SoloJigsaw(OrderJigsaw):
         self.stitch_rank = _integer("stitch_rank", stitch_rank, 1, 512)
         self.lambda_space = _real("lambda_space", lambda_space, 0)
         self.space_norm = space_norm
+        self.space_time_shuffle = _boolean("space_time_shuffle", space_time_shuffle)
         self.lambda_spread = _real("lambda_spread", lambda_spread, 0)
         if self.group_subspace and self.output_dimension % self.n_groups:
             raise ValueError(
@@ -485,17 +613,56 @@ class SoloJigsaw(OrderJigsaw):
         row = (starts // max(block, 1)) % table.shape[0]
         return table[row]
 
-    def _block_stats(self, window):
-        """(B,N,W) -> (B,G,W): each row slot's block averaged over its rows.
+    def _block_patches(self, window):
+        """(B,N,W) -> (B,G,S,W): the block sitting in each row slot, intact.
 
-        The summary a label-free rule gets to use. Averaging over rows and not
-        over time is deliberate: a scalar per block would be exactly the cue
-        `space_norm="block_mean"` removes, so the baseline would collapse to
-        chance for a reason that has nothing to do with how hard the task is.
+        The 20260928 run measured its label-free baseline on this tensor
+        AVERAGED OVER THE ROWS, which was a mistake worth naming. Averaging
+        over S destroys exactly the cue the encoder is most likely to be using
+        -- "in this block neuron 7 fires twice as often as neuron 12", a
+        constant of the session that is visible to the network on every span
+        and invisible to a row-averaged template. The baseline therefore sat at
+        13-16% against a model at 85-96%, and the gap was an artefact of the
+        baseline being blindfolded. Keep the rows; let the opponent see what
+        the model sees.
         """
         rows = self.space_slots_.reshape(-1)
         return window[:, rows].reshape(len(window), self.n_groups,
-                                       self.space_block_, -1).mean(dim=2)
+                                       self.space_block_, -1)
+
+    def space_block_rows(self):
+        """Rows per spatial block (S), or 0 when there is no spatial puzzle.
+
+        Reported because every spatial number depends on it: with S=1 there is
+        no within-block structure at all, so the rate oracle has a single
+        scalar to work with and stops being informative.
+        """
+        return int(getattr(self, "space_block_", 0))
+
+    def _space_view(self, window, generator):
+        """Time shuffle (optional) -> block permutation -> normalization.
+
+        One function so that training and `evaluate_pretext` cannot drift
+        apart, which is the classic way a pretext number stops meaning
+        anything. Returns the shown window, the truth `sigma[b, s]` = the group
+        placed in row slot s, and the pre-permutation window, which is what the
+        label-free template has to be built from if it is to be an opponent
+        rather than a formality.
+        """
+        if self.space_time_shuffle:
+            window = shuffle_time(window, generator)
+        sigma = torch.rand(len(window), self.n_groups, device=window.device,
+                           generator=generator).argsort(dim=1)
+        shown = normalize_blocks(permute_blocks(window, self.space_slots_, sigma),
+                                 self.space_slots_, self.space_norm)
+        return shown, sigma, window
+
+    def _order_forward(self, view, batch):
+        """Encoder over the K tiles, then the grouped head. (z, logits, scores)."""
+        z = self.encoder_(view.reshape(-1, self.n_features_in_, self.window_size))
+        z = _GradScale.apply(z, self.order_grad_scale)
+        z = z.reshape(batch, self.n_tiles, self.output_dimension)
+        return (z,) + tuple(self.order_head_(z))
 
     # -- one step ----------------------------------------------------------- #
     def _step(self, data, starts):
@@ -528,10 +695,20 @@ class SoloJigsaw(OrderJigsaw):
         labels = self._control(self._group_labels(batch), starts,
                                self._frozen_groups)
         view = place_groups(view, labels, self.group_index_)
-        z = self.encoder_(view.reshape(-1, self.n_features_in_, self.window_size))
-        z = _GradScale.apply(z, self.order_grad_scale)
-        z = z.reshape(batch, n_tiles, self.output_dimension)
-        position_logits, scores = self.order_head_(z)         # (B,G,K,K) (B,G,K)
+        # The permutation forward pass has to happen even on the space-only
+        # arms -- the summary table, the shortcut audit and the memorization
+        # gap are all read off it -- but its BACKWARD does not, because a term
+        # multiplied by 0.0 contributes exactly no gradient. Running it under
+        # no_grad leaves every reported number identical and drops most of the
+        # step cost, which is what makes a space ladder affordable at 6000
+        # epochs.
+        order_live = (self.lambda_order + self.lambda_pair
+                      + self.lambda_stitch) > 0
+        if order_live:
+            z, position_logits, scores = self._order_forward(view, batch)
+        else:
+            with torch.no_grad():
+                z, position_logits, scores = self._order_forward(view, batch)
 
         flat_labels = labels.reshape(-1, n_tiles)                    # (B*G, K)
         position_each = F.cross_entropy(
@@ -561,23 +738,22 @@ class SoloJigsaw(OrderJigsaw):
         if self.lambda_space > 0:
             window = _augment(tiles[:, :1], self.neuron_dropout, self.gain_jitter,
                               self._generator)[:, 0]                 # (B,N,W)
-            sigma = torch.rand(batch, self.n_groups, device=self.device_,
-                               generator=self._generator).argsort(dim=1)
-            window = normalize_blocks(
-                permute_blocks(window, self.space_slots_, sigma),
-                self.space_slots_, self.space_norm)
+            window, sigma, home = self._space_view(window, self._generator)
             if self.group_profile_ is None:
                 # The per-group template for the label-free baseline in
-                # `evaluate_pretext`, measured ON THE NORMALIZED VIEW -- the same
-                # thing the encoder is shown. Taking it from the raw window would
-                # build a baseline out of a cue that `space_norm` has already
-                # deleted, and the model would then be "beating" a rule it was
-                # never up against. Averaged over the block's rows but NOT over
-                # time, so under block_mean (which removes only the scalar level)
-                # the block's temporal shape still makes this a real opponent.
+                # `evaluate_pretext`, built from `home`: the same augmentation,
+                # the same time shuffle and the same normalization the encoder
+                # is shown, with only the block permutation left out. Taking it
+                # from the raw window would build a baseline out of cues that
+                # `space_norm` has already deleted, and the model would then be
+                # "beating" a rule it was never up against. The rows are KEPT
+                # (see `_block_patches`): a row-averaged template cannot use
+                # relative rates within a block, which is the single most
+                # likely shortcut, so averaging them away would hand the model
+                # a win it had not earned.
                 with torch.no_grad():
-                    self.group_profile_ = self._block_stats(
-                        normalize_blocks(tiles[:, 0], self.space_slots_,
+                    self.group_profile_ = self._block_patches(
+                        normalize_blocks(home, self.space_slots_,
                                          self.space_norm)).mean(dim=0)
             sigma = self._control(sigma, starts, self._frozen_space)
             space_logits = self.order_head_.space(self.encoder_(window))
@@ -628,8 +804,13 @@ class SoloJigsaw(OrderJigsaw):
             parts["shortcut"] = shortcut_strength(tiles.sum(dim=(2, 3))).mean()
             self._train_exact_ = float(parts["exact"])
             self._train_pair_ = float(parts["pair_accuracy"])
-            self._train_stitch_ = float(parts["stitch_accuracy"])
-            self._train_space_ = float(parts["space_accuracy"])
+            # None and not 0.0. A switched-off term that reports 0% invites the
+            # reader to line it up against a 25% or 12.5% chance row and
+            # conclude the head is broken, when in fact it was never asked.
+            self._train_stitch_ = (float(parts["stitch_accuracy"])
+                                   if self.lambda_stitch > 0 else None)
+            self._train_space_ = (float(parts["space_accuracy"])
+                                  if self.lambda_space > 0 else None)
         parts["total"] = total
         self._trace(parts)
         return parts
@@ -697,7 +878,8 @@ class SoloJigsaw(OrderJigsaw):
         pool = 1 if self.span_selection == "random" else self.selection_pool
         shown = min(baseline_groups, n_groups)
         keys = ("exact", "pair", "tie", "mean_exact", "mean_pair", "level_oracle",
-                "continuity", "stitch", "space", "space_oracle")
+                "continuity", "stitch", "space", "space_oracle",
+                "space_oracle_rate", "space_oracle_level")
         per_span = {k: torch.zeros(len(chosen), device=self.device_) for k in keys}
         position_ce = 0.0
         self.encoder_.eval()
@@ -767,31 +949,51 @@ class SoloJigsaw(OrderJigsaw):
                         per_span["stitch"][begin:stop] += hit.reshape(
                             size, -1).to(torch.float32).mean(1) / repeats
                     if self.lambda_space > 0:
-                        sigma = torch.rand(size, n_groups, device=self.device_,
-                                           generator=generator).argsort(dim=1)
-                        shown_window = normalize_blocks(
-                            permute_blocks(tiles[:, 0], self.space_slots_, sigma),
-                            self.space_slots_, self.space_norm)
+                        shown_window, sigma, _ = self._space_view(tiles[:, 0],
+                                                                 generator)
                         guess = self.order_head_.space(
                             self.encoder_(shown_window)).argmax(-1)
                         per_span["space"][begin:stop] += (guess == sigma).to(
                             torch.float32).mean(1) / repeats
-                        # The label-free opponent: name each block by matching it
-                        # to the per-group template, on the SAME view the encoder
-                        # got. If the model cannot beat this, it has learned which
-                        # cells fire how much, not which cells they are.
-                        # `group_profile_` is a training-time statistic and is not
-                        # in the state_dict, so a reloaded model reports None here
-                        # rather than a number built from the wrong thing.
+                        # THE label-free opponent, in three strengths, on the
+                        # SAME view the encoder got. Name each block by matching
+                        # it to that group's template:
+                        #   space_oracle       the whole (S,W) patch. The
+                        #                      strongest rule, and the one the
+                        #                      model has to beat to be
+                        #                      interesting.
+                        #   ..._rate           each row's mean over time only.
+                        #                      Pure static neuron identity:
+                        #                      "this block is the one where the
+                        #                      second row outfires the first".
+                        #                      A session constant, so if THIS is
+                        #                      already high the puzzle is not
+                        #                      about the current span at all.
+                        #   ..._level          the row-AVERAGED profile. This is
+                        #                      the only one the 20260928 run
+                        #                      reported, and it is the weakest of
+                        #                      the three by construction.
+                        # `group_profile_` is a training-time statistic and is
+                        # not in the state_dict, so a reloaded model reports None
+                        # here rather than a number built from the wrong thing.
                         profile = getattr(self, "group_profile_", None)
                         if profile is None:
-                            per_span["space_oracle"][begin:stop] = float("nan")
+                            for name in ("space_oracle", "space_oracle_rate",
+                                         "space_oracle_level"):
+                                per_span[name][begin:stop] = float("nan")
                         else:
-                            stats = self._block_stats(shown_window)   # (B,G,W)
-                            distance = (stats[:, :, None, :]
-                                        - profile[None, None, :, :]).pow(2).sum(-1)
-                            per_span["space_oracle"][begin:stop] += (
-                                distance.argmin(-1) == sigma).to(
+                            patch = self._block_patches(shown_window)  # (B,G,S,W)
+                            views = (                 # profile is (G,S,W)
+                                ("space_oracle",
+                                 patch.reshape(size, n_groups, -1),
+                                 profile.reshape(n_groups, -1)),
+                                ("space_oracle_rate",          # over time -> (.,S)
+                                 patch.mean(dim=3), profile.mean(dim=2)),
+                                ("space_oracle_level",         # over rows -> (.,W)
+                                 patch.mean(dim=2), profile.mean(dim=1)))
+                            for name, candidate, template in views:
+                                hit = nearest_template(candidate, template) == sigma
+                                per_span[name][begin:stop] += hit.to(
                                     torch.float32).mean(1) / repeats
                     position_ce += float(F.cross_entropy(
                         position_logits.reshape(-1, n_tiles),
@@ -856,13 +1058,25 @@ class SoloJigsaw(OrderJigsaw):
             # logit is masked, so there are only K live options. Quoting the
             # smaller number would make a useless head look educated.
             chance_stitch_percent=100.0 / n_tiles,
-            train_stitch_accuracy_percent=(100 * self._train_stitch_
-                                           if hasattr(self, "_train_stitch_") else None),
+            train_stitch_accuracy_percent=(
+                None if getattr(self, "_train_stitch_", None) is None
+                else 100 * self._train_stitch_),
             space_accuracy_percent=percent("space", self.lambda_space > 0),
             space_oracle_percent=percent("space_oracle", self.lambda_space > 0),
-            chance_space_percent=100.0 / n_groups,
-            train_space_accuracy_percent=(100 * self._train_space_
-                                          if hasattr(self, "_train_space_") else None),
+            space_oracle_rate_percent=percent("space_oracle_rate",
+                                              self.lambda_space > 0
+                                              and self.space_block_rows() > 1),
+            space_oracle_level_percent=percent("space_oracle_level",
+                                               self.lambda_space > 0),
+            # None at G=1: "chance is 100%" is arithmetically true and reads as
+            # a result. There is no spatial permutation of one block.
+            chance_space_percent=(100.0 / n_groups if n_groups > 1 else None),
+            space_norm=self.space_norm,
+            space_time_shuffle=bool(self.space_time_shuffle),
+            space_block_rows=self.space_block_rows(),
+            train_space_accuracy_percent=(
+                None if getattr(self, "_train_space_", None) is None
+                else 100 * self._train_space_),
             position_cross_entropy=position_ce / max(repeats * len(chosen), 1),
             uniform_cross_entropy=math.log(n_tiles),
             decode="assignment" if self.lambda_order > 0 else "score_rank",
@@ -885,10 +1099,20 @@ class SoloJigsaw(OrderJigsaw):
                   f"| level-oracle={result['baseline_level_oracle_pair_percent']:.2f}% "
                   f"continuity={show('baseline_continuity_pair_percent', 'n/a')} "
                   f"| stitch={show('stitch_accuracy_percent')} "
-                  f"(chance {result['chance_stitch_percent']:.2f}%) "
-                  f"| space={show('space_accuracy_percent')} "
-                  f"(chance {result['chance_space_percent']:.2f}%, rate-oracle "
-                  f"{show('space_oracle_percent', 'n/a')})", flush=True)
+                  f"(chance {result['chance_stitch_percent']:.2f}%)", flush=True)
+            # The spatial puzzle gets its own line because it needs three
+            # baselines next to it to mean anything, and a one-line version
+            # would push them off the right-hand side of the log.
+            if result["space_accuracy_percent"] is not None:
+                print(f"      space[{self.space_norm}"
+                      f"{', time-shuffled' if self.space_time_shuffle else ''}, "
+                      f"S={result['space_block_rows']}]: "
+                      f"{show('space_accuracy_percent')} "
+                      f"(chance {show('chance_space_percent', 'n/a')}) "
+                      f"vs template oracles -- patch "
+                      f"{show('space_oracle_percent', 'n/a')}, rate "
+                      f"{show('space_oracle_rate_percent', 'n/a')}, level "
+                      f"{show('space_oracle_level_percent', 'n/a')}", flush=True)
         return result
 
 
@@ -905,6 +1129,18 @@ class SoloJigsaw(OrderJigsaw):
 #                    arm can be decomposed rather than admired.
 _SOLO = dict(_model="solo")
 _LADDER = dict(_SOLO, lambda_stitch=1.0, lambda_space=0.5, space_norm="block_mean")
+
+
+def _space(groups, norm, **extra):
+    """A SPACE-ONLY arm: permutation terms off, neuron-axis puzzle on.
+
+    With `lambda_order`, `lambda_pair` and `lambda_stitch` all zero the model
+    still runs the K-tile forward pass (the tables need it) but skips its
+    backward, so these arms are the cheap ones despite looking like the others.
+    """
+    return dict(_SOLO, n_groups=groups, lambda_order=0.0, lambda_pair=0.0,
+                lambda_space=1.0, space_norm=norm, **extra)
+
 
 SOLO_ARMS = {
     # -- the ladder ------------------------------------------------------- #
@@ -940,13 +1176,43 @@ SOLO_ARMS = {
     # decomposition adds up instead of being asserted.
     "solo_stitch_only": dict(_SOLO, n_groups=8, lambda_order=0.0, lambda_pair=0.0,
                              lambda_stitch=1.0),
-    "solo_space_only": dict(_SOLO, n_groups=8, lambda_order=0.0, lambda_pair=0.0,
-                            lambda_space=1.0, space_norm="block_mean"),
-    # The spatial puzzle WITHOUT the rate cue removed. If this beats
-    # `solo_space_only` the model was reading firing rates, which the
-    # space_oracle column in the audit will confirm or deny.
-    "solo_space_raw": dict(_SOLO, n_groups=8, lambda_order=0.0, lambda_pair=0.0,
-                           lambda_space=1.0, space_norm="none"),
+    # -- the spatial puzzle, which is the part that actually worked ---------- #
+    # 20260928, three seeds. Read against the FROZEN random encoder at R2
+    # 0.3199, not against zero:
+    #     solo_rank8    0.3186   the grouped TEMPORAL puzzle, alone -> a dead
+    #                            heat with an untrained encoder.
+    #     solo_no_space 0.2538   temporal puzzle + stitch, no spatial term ->
+    #                            BELOW the frozen encoder. Actively harmful.
+    #     solo_no_stitch 0.4158  temporal puzzle + spatial term.
+    #     solo_full      0.4345  everything.
+    # The entire result is the neuron-axis term, so from here it is the
+    # experiment and the temporal ladder is the control. The open question is
+    # NOT whether it helps -- it plainly does -- but whether it is solvable from
+    # static neuron identity, which is a session constant the encoder can
+    # memorize once, or from this span's dynamics. That is what space_norm and
+    # space_time_shuffle are for, and what the three template oracles measure.
+    "solo_space_only":   _space(8, "block_mean"),
+    # The rate cue left fully in place. If this MATCHES solo_space_only then
+    # block_mean was removing nothing the model was using.
+    "solo_space_raw":    _space(8, "none"),
+    # Each neuron's own mean over the window removed, then its gain too. Under
+    # row_zscore no neuron's firing rate can name its block: what survives is
+    # the temporal shape of each row, which is a fact about this span. If the
+    # spatial puzzle still transfers here, the claim is about dynamics.
+    "solo_space_rowm":   _space(8, "row_mean"),
+    "solo_space_rowz":   _space(8, "row_zscore"),
+    # Same static statistics, temporal order destroyed. Scores identically to
+    # solo_space_only if and only if the task never needed time.
+    "solo_space_tshuf":  _space(8, "block_mean", space_time_shuffle=True),
+    # The label control for the spatial term on its own, matching what
+    # solo_full_frozen did for the whole model (train 88-93%, held out 12.3-12.7%
+    # -- exactly chance -- and R2 0.1592, well BELOW the frozen encoder).
+    "solo_space_frozen": _space(8, "block_mean", label_control="frozen_random"),
+    # The ladder on the axis that works. Not a one-variable contrast and the
+    # comment should say so: raising G raises the class count AND shrinks the
+    # block to 38//G rows, so a harder question is being asked of less evidence.
+    "solo_space_g4":     _space(4, "block_mean"),
+    "solo_space_g16":    _space(16, "block_mean"),
     # -- the regularizer, kept separate on purpose -------------------------- #
     # Not a puzzle. Here so that "the embedding did not collapse" can be
     # attributed to the task rather than to a variance floor -- if
@@ -971,13 +1237,30 @@ SOLO_ARMS = {
                        order_head_reset_every=400),
 }
 
-# `group_chimera`, the four lambdas and `lambda_spread` are deliberately absent:
-# those are the variables under test, exactly as the order weights are absent
-# from ANCHOR_MATCH_KEYS. `n_groups` IS here, because changing it changes the
-# subspace width and therefore the readout capacity -- a rank-1-versus-rank-8
+# The autoencoder this project has been leaning on since the start, run through
+# the SAME class family and the same defaults so "the jigsaw alone" has an
+# honest opponent in the same table. It is not a SoloJigsaw -- that class refuses
+# a reconstruction weight on purpose -- so it is registered under its own model
+# key and kept out of SOLO_ARMS, whose every entry must be constructible as a
+# SoloJigsaw. The 20260928 run listed `reconstruct_only` in its defaults and it
+# silently never ran, so the one contrast the project is actually about was
+# missing from the output. This is the fix.
+SOLO_BASELINE_ARMS = {
+    "ae_matched": dict(_model="solo_ae", lambda_order=0.0, lambda_pair=0.0,
+                       lambda_lag=0.0, lambda_reconstruct=1.0),
+}
+
+# `group_chimera`, the four lambdas, `space_norm`, `space_time_shuffle` and
+# `lambda_spread` are deliberately absent: those are the variables under test,
+# exactly as the order weights are absent from ANCHOR_MATCH_KEYS. A
+# `space_norm` entry here (v1 had one) made the runner shout "NOT ONE VARIABLE"
+# at the rowz and raw contrasts, which are the whole point of this round.
+# `n_groups` IS here, because changing it changes the subspace width and the
+# block height and therefore the readout capacity -- a rank-1-versus-rank-8
 # comparison is not a one-variable contrast and the runner should say so.
 SOLO_MATCH_KEYS = ANCHOR_MATCH_KEYS + ("n_groups", "group_subspace", "group_seed",
-                                       "space_norm", "stitch_rank")
+                                       "stitch_rank")
+
 
 SOLO_CONTRASTS = (
     ("solo_rank8", "solo_shared8", "RANK effect (independent puzzles)",
@@ -1004,28 +1287,70 @@ SOLO_CONTRASTS = (
     ("solo_rank8", "solo_spread", "what a variance floor adds on top",
      "if this is large, the puzzle is not preventing collapse on its own and the "
      "honest description of the result includes a regularizer."),
-    ("solo_full", "reconstruct_only", "JIGSAW ALONE vs THE AUTOENCODER",
-     "the number the project is actually about. reconstruct_only is the arm that "
-     "carried every previous result; solo_full never sees a reconstruction "
-     "target. Positive means the puzzle stands on its own."),
+    # -- the spatial round -------------------------------------------------- #
+    ("solo_space_only", "ae_matched", "JIGSAW ALONE vs THE AUTOENCODER",
+     "the number the project is actually about. ae_matched is the arm that "
+     "carried every previous result; the spatial jigsaw never sees a "
+     "reconstruction target. Positive means the puzzle stands on its own."),
+    ("solo_space_only", "solo_random", "SPACE ALONE vs FROZEN ENCODER",
+     "the floor that matters. On 20260928 the temporal puzzle failed exactly "
+     "this test -- solo_rank8 0.3186 against solo_random 0.3199 -- so an arm "
+     "that does not clear it has not earned the word 'learned'."),
+    ("solo_space_only", "solo_space_frozen", "SPACE LABEL effect",
+     "same loss, same head, same gradient path, block identities that mean "
+     "nothing. This is what makes the spatial number evidence rather than a "
+     "side effect of training on something."),
+    ("solo_space_only", "solo_space_rowz", "what the STATIC RATE cue was worth",
+     "row_zscore deletes every neuron's own mean and gain inside the window, so "
+     "no session-constant firing rate can name a block. Near zero means the "
+     "spatial puzzle is about this span's dynamics. Large and positive means it "
+     "was largely 'memorize which cell is which', which is still a real "
+     "objective but a much smaller claim."),
+    ("solo_space_only", "solo_space_tshuf", "what TEMPORAL ORDER was worth to it",
+     "the time bins are permuted, so every static statistic survives and only "
+     "the order of the window is destroyed. Zero here plus zero above would "
+     "mean the task needs neither identity nor time, which would be a bug, not "
+     "a finding."),
+    ("solo_space_g16", "solo_space_only", "SPACE GROUPS effect",
+     "G=16 asks a 16-way question of 2-row blocks where G=8 asks an 8-way "
+     "question of 4-row blocks. Two variables, so read it as a dose curve and "
+     "not as a contrast."),
+    ("solo_rank8", "solo_random", "TEMPORAL PUZZLE vs FROZEN ENCODER",
+     "the 20260928 null, kept in the table so it is re-measured rather than "
+     "remembered: +0.0 means sorting time-tiles is worth nothing on its own."),
     ("solo_full", "solo_random", "vs FROZEN ENCODER",
      "what training is worth at all. Must be positive or nothing else counts."),
 )
 
-DEFAULT_SOLO_ARMS = ("solo_rank1", "solo_rank4", "solo_rank8", "solo_shared8",
-                     "solo_full", "solo_full_frozen", "solo_no_stitch",
-                     "solo_no_space", "solo_random", "reconstruct_only")
+# The spatial puzzle is the experiment now and the temporal ladder is the
+# control, so these ten are chosen to answer one question -- is the neuron-axis
+# jigsaw reading dynamics or memorizing neuron identity? -- while keeping
+# solo_full and solo_rank8 in the table so the 20260928 numbers can be lined up
+# against the new ones on the same seeds.
+DEFAULT_SOLO_ARMS = ("solo_space_only", "solo_space_rowz", "solo_space_tshuf",
+                     "solo_space_frozen", "solo_space_g16", "solo_no_stitch",
+                     "solo_rank8", "solo_random", "solo_full", "ae_matched")
 
 
 def register(models, arms, contrasts=None):
     """Wire this module into run_jigsaw.py without editing its tables by hand."""
     models["solo"] = SoloJigsaw
-    for name, settings in SOLO_ARMS.items():
-        arms[name] = dict(settings)
+    models["solo_ae"] = OrderJigsaw
+    for table in (SOLO_ARMS, SOLO_BASELINE_ARMS):
+        for name, settings in table.items():
+            arms[name] = dict(settings)
     if contrasts is not None:
         for row in SOLO_CONTRASTS:
             if row not in contrasts:
                 contrasts.append(row)
+    missing = [name for name in DEFAULT_SOLO_ARMS if name not in arms]
+    if missing:
+        # Loud on purpose. On 20260928 `reconstruct_only` sat in the default
+        # list, resolved to nothing, and the run finished without the one
+        # comparison it existed to make -- with no warning anywhere in the log.
+        print(f"  WARNING: default solo arms not registered: {missing}. They "
+              f"will be skipped and any contrast that names them will be "
+              f"missing from the output.", flush=True)
     return models, arms
 
 
@@ -1137,6 +1462,56 @@ def _smoke_test():
     means = zeroed[:, slots.reshape(-1)].reshape(5, 3, -1).mean(2)
     _check(torch.allclose(means, torch.zeros_like(means), atol=1e-5),
            "block_mean leaves every block at zero mean (the rate cue is gone)")
+    # block_mean does NOT remove the cue the model is most likely to be using.
+    # Spell it out, because the 20260928 baseline was built as if it did.
+    rows = slots.reshape(-1)
+    per_row = zeroed[:, rows].reshape(5, 3, 3, -1).mean(3)
+    _check(float(per_row.std()) > 1e-3,
+           "block_mean leaves per-NEURON rates inside the block intact -- this "
+           "is the static-identity shortcut, and it is why the row_* modes exist")
+    for mode in ("row_mean", "row_zscore"):
+        stripped = normalize_blocks(moved, slots, mode)
+        row_means = stripped[:, rows].mean(dim=2)
+        _check(torch.allclose(row_means, torch.zeros_like(row_means), atol=1e-5),
+               f"{mode} puts EVERY row at zero mean over the window")
+        _check(torch.equal(stripped[:, 9:], moved[:, 9:]),
+               f"{mode} touches only the slotted channels")
+    scaled = normalize_blocks(moved * 7.0, slots, "row_zscore")
+    plain = normalize_blocks(moved, slots, "row_zscore")
+    _check(torch.allclose(scaled[:, rows], plain[:, rows], atol=1e-3),
+           "row_zscore is invariant to a global gain, so no neuron's gain can "
+           "name its block either")
+    silent = moved.clone()
+    silent[:, 0] = 0.0
+    _check(float(normalize_blocks(silent, slots, "row_zscore")[:, 0].abs().max()) == 0.0,
+           "a row that never fires becomes exactly zero rather than amplified noise")
+
+    # 5b. the time shuffle keeps every static statistic and destroys order
+    generator = torch.Generator().manual_seed(5)
+    rolled = shuffle_time(window, generator)
+    _check(torch.allclose(rolled.sum(2), window.sum(2), atol=1e-5),
+           "shuffle_time conserves each neuron's total, so rates are untouched")
+    _check(all(torch.allclose(rolled[b].sum(0).sort().values,
+                              window[b].sum(0).sort().values, atol=1e-5)
+               for b in range(5)),
+           "the population vectors are the same multiset, only reordered")
+    # One permutation per SAMPLE, shared by every row. Tested on a constant ramp
+    # because on real values each row's sort order is its own and proves nothing.
+    ramp = torch.arange(4, dtype=torch.float32).expand(5, 11, 4).contiguous()
+    mixed = shuffle_time(ramp, torch.Generator().manual_seed(6))
+    _check(all(torch.equal(mixed[b, 0], mixed[b, j]) for b in range(5) for j in range(11)),
+           "one permutation per sample, shared by every row")
+    _check(not torch.equal(mixed[0, 0], mixed[1, 0]),
+           "and a different one for the next sample")
+    _check(not torch.equal(rolled, window), "and the order really did change")
+
+    # 5c. the template oracle: a perfect template must win
+    template = torch.randn(4, 6)
+    order = torch.rand(7, 4).argsort(1)
+    _check(torch.equal(nearest_template(template[order], template), order),
+           "nearest_template recovers the permutation from exact templates")
+    _check(torch.equal(nearest_template(3.5 * template[order], template), order),
+           "and is invariant to a global scale, which is why it is cosine")
 
     # 6. balanced random partition
     index = group_partition(38, 8, 7)
@@ -1207,6 +1582,50 @@ def _smoke_test():
            "six epochs on synthetic counts, so this is a smoke test of the "
            "MECHANISM, not evidence about Perich")
 
+    # 9b. a SPACE-ONLY arm: the three oracles, and the fast path must still
+    #     deliver gradient to the encoder. This is the arm the next run leans
+    #     on, so it gets checked end to end rather than by inspection.
+    space = SoloJigsaw(n_groups=4, window_size=6, n_tiles=3, tile_gap=(1, 3),
+                       output_dimension=24, num_hidden_units=32,
+                       head_hidden_units=32, lambda_order=0.0, lambda_pair=0.0,
+                       lambda_space=1.0, space_norm="row_zscore",
+                       batch_size=128, max_epochs=6, device="cpu",
+                       random_state=3, verbose=False)
+    space.fit(counts)
+    metrics = space.evaluate_pretext(counts, max_spans=128, repeats=2,
+                                     verbose=False, n_boot=0)
+    for key in ("space_accuracy_percent", "space_oracle_percent",
+                "space_oracle_rate_percent", "space_oracle_level_percent"):
+        _check(metrics[key] is not None, f"space-only arm reports {key}")
+    _check(metrics["stitch_accuracy_percent"] is None
+           and metrics["train_stitch_accuracy_percent"] is None,
+           "a switched-off term reports None, not 0.0 against a 25% chance line")
+    _check(metrics["space_norm"] == "row_zscore"
+           and metrics["space_time_shuffle"] is False
+           and metrics["space_block_rows"] == space.space_block_rows() > 1,
+           "the spatial configuration is reported alongside its numbers")
+    _check(metrics["chance_space_percent"] == 25.0,
+           "chance for a 4-block spatial puzzle is 25%")
+    # The no_grad fast path is the one change in this round that could silently
+    # break training, so it is checked against its own zero-epoch twin: same
+    # seed, same init, no steps. If the encoder weights come out identical the
+    # spatial term never reached them and every space-only number would be a
+    # frozen encoder wearing a hat.
+    frozen = SoloJigsaw(n_groups=4, window_size=6, n_tiles=3, tile_gap=(1, 3),
+                        output_dimension=24, num_hidden_units=32,
+                        head_hidden_units=32, lambda_order=0.0, lambda_pair=0.0,
+                        lambda_space=1.0, space_norm="row_zscore",
+                        batch_size=128, max_epochs=0, device="cpu",
+                        random_state=3, verbose=False)
+    frozen.fit(counts)
+    moved_weights = [not torch.allclose(a, b) for a, b in
+                     zip(space.encoder_.parameters(), frozen.encoder_.parameters())]
+    _check(any(moved_weights),
+           "the spatial term ALONE moves the encoder -- the no_grad fast path "
+           "skips the permutation backward, not the spatial one")
+    _check(float(space.history_[-1]["position"]) > 0.0,
+           "the permutation head is still measured on a space-only arm")
+
     # 10. the arm table
     stray, broke = [], []
     known = set(SoloJigsaw._PARAM_NAMES) | {"_model"}
@@ -1218,16 +1637,31 @@ def _smoke_test():
             broke.append(f"{name}: {error}")
     _check(not stray, f"every arm key is a real parameter{'' if not stray else stray}")
     _check(not broke, f"every arm constructs{'' if not broke else broke}")
-    named = set(SOLO_ARMS)
+    # The baseline arm is an OrderJigsaw, not a SoloJigsaw, and must construct
+    # as one -- otherwise the autoencoder contrast vanishes again.
+    for name, settings in SOLO_BASELINE_ARMS.items():
+        OrderJigsaw(**{k: v for k, v in settings.items() if k != "_model"})
+        _check(settings["_model"] == "solo_ae",
+               f"{name} is dispatched to the baseline model key")
+    named = set(SOLO_ARMS) | set(SOLO_BASELINE_ARMS)
     missing = [f"{a}-{b}" for a, b, _, _ in SOLO_CONTRASTS
-               if a not in named or (b not in named and b != "reconstruct_only")]
+               if a not in named or b not in named]
     _check(not missing, f"every contrast names real arms{'' if not missing else missing}")
-    _check(all(a in named for a in DEFAULT_SOLO_ARMS if a != "reconstruct_only"),
-           "DEFAULT_SOLO_ARMS resolves")
-    pair = (SOLO_ARMS["solo_rank8"], SOLO_ARMS["solo_shared8"])
-    differ = [k for k in SOLO_MATCH_KEYS if pair[0].get(k) != pair[1].get(k)]
-    _check(not differ,
-           f"the headline contrast is geometry-matched{'' if not differ else differ}")
+    _check(all(a in named for a in DEFAULT_SOLO_ARMS),
+           "DEFAULT_SOLO_ARMS resolves -- every one of them, which is what the "
+           "20260928 run could not say about reconstruct_only")
+    registered, arm_table = register({}, {}, [])
+    _check("solo" in registered and "solo_ae" in registered
+           and not [a for a in DEFAULT_SOLO_ARMS if a not in arm_table],
+           "register() wires both model keys and every default arm")
+    for left, right in (("solo_rank8", "solo_shared8"),
+                        ("solo_space_only", "solo_space_rowz"),
+                        ("solo_space_only", "solo_space_tshuf"),
+                        ("solo_space_only", "solo_space_frozen")):
+        differ = [k for k in SOLO_MATCH_KEYS
+                  if SOLO_ARMS[left].get(k) != SOLO_ARMS[right].get(k)]
+        _check(not differ,
+               f"{left} - {right} is geometry-matched{'' if not differ else differ}")
     print("\nall checks passed.")
 
 
