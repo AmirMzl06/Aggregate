@@ -251,10 +251,8 @@ try:
     jigsaw_solo.register(MODELS, ARMS, CONTRASTS)
     # Use only the new SoloJigsaw family by default.
     # reconstruct_only is intentionally excluded.
-    SOLO_DEFAULT_ARMS = tuple(
-        name for name in jigsaw_solo.DEFAULT_SOLO_ARMS
-        if name.startswith("solo_")
-    )
+    SOLO_DEFAULT_ARMS = tuple(jigsaw_solo.DEFAULT_SOLO_ARMS)
+    
 except ImportError:
     jigsaw_solo = None
 
@@ -374,7 +372,11 @@ def geometry_mismatch(left, right):
     left_model = ARMS[left].get("_model", "jigsaw")
     right_model = ARMS[right].get("_model", "jigsaw")
 
-    if left_model == "solo" or right_model == "solo":
+    # if left_model == "solo" or right_model == "solo":
+    #     keys = getattr(jigsaw_solo, "SOLO_MATCH_KEYS", None)
+    # else:
+    #     keys = getattr(jigsaw_order, "ANCHOR_MATCH_KEYS", None)
+    if left_model in ("solo", "solo_ae") or right_model in ("solo", "solo_ae"):
         keys = getattr(jigsaw_solo, "SOLO_MATCH_KEYS", None)
     else:
         keys = getattr(jigsaw_order, "ANCHOR_MATCH_KEYS", None)
@@ -1356,11 +1358,22 @@ def main():
         ARMS[a].get("_model", "jigsaw")
         for a in resolved
     }
+    # if "solo" in families:
+    #     needed.add("solo_random")
+    # if "mobile" in families:
+    #     needed.add("mobile_random")
+    # if any(family not in ("solo", "mobile") for family in families):
+    #     needed.add("random_encoder")
     if "solo" in families:
         needed.add("solo_random")
+    
     if "mobile" in families:
         needed.add("mobile_random")
-    if any(family not in ("solo", "mobile") for family in families):
+    
+    if any(
+        family not in ("solo", "solo_ae", "mobile")
+        for family in families
+    ):
         needed.add("random_encoder")
     
     # ... and every order arm needs its LABEL control, for the same reason: the
