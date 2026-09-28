@@ -241,7 +241,26 @@ try:
     ORDER_DEFAULT_ARMS = jigsaw_order.DEFAULT_ORDER_ARMS
 except ImportError:                                  # pragma: no cover
     jigsaw_order = None
+# --------------------------------------------------------------------------- #
+# solo jigsaw extension -- NO reconstruction
+# --------------------------------------------------------------------------- #
 
+SOLO_DEFAULT_ARMS = ()
+try:
+    import jigsaw_solo
+    jigsaw_solo.register(MODELS, ARMS, CONTRASTS)
+    # Use only the new SoloJigsaw family by default.
+    # reconstruct_only is intentionally excluded.
+    SOLO_DEFAULT_ARMS = tuple(
+        name for name in jigsaw_solo.DEFAULT_SOLO_ARMS
+        if name.startswith("solo_")
+    )
+except ImportError:
+    jigsaw_solo = None
+
+
+# From now on, running run_jigsaw.py with no --arms means SOLO ONLY.
+DEFAULT_ARMS = SOLO_DEFAULT_ARMS
 
 # --------------------------------------------------------------------------- #
 # Extra lag controls
@@ -270,12 +289,29 @@ ARMS["order_lag_frozen"] = dict(
 # `order_X - anchor_X` answers "is the order term worth anything";
 # `order_full - order_full_frozen` answers "is it the TIME in the labels or
 # just the extra loss surface". Both are needed and they are not the same test.
-HEADLINE = (("order_gapped", "anchor_gapped"),
-            ("order_full", "anchor_full"),
-            ("order_full", "order_full_frozen"),
-            ("order_default", "anchor_default"),
-            ("order_default", "ctrl_frozen_labels"),
-            ("proposed", "reconstruct_only"))
+
+
+####################################################
+# HEADLINE = (("order_gapped", "anchor_gapped"),
+#             ("order_full", "anchor_full"),
+#             ("order_full", "order_full_frozen"),
+#             ("order_default", "anchor_default"),
+#             ("order_default", "ctrl_frozen_labels"),
+#             ("proposed", "reconstruct_only"))
+###################################################
+HEADLINE = (
+    ("solo_rank8", "solo_shared8"),
+    ("solo_full", "solo_full_frozen"),
+
+    # old experiments, kept for backward compatibility
+    ("order_gapped", "anchor_gapped"),
+    ("order_full", "anchor_full"),
+    ("order_full", "order_full_frozen"),
+    ("order_default", "anchor_default"),
+    ("order_default", "ctrl_frozen_labels"),
+    ("proposed", "reconstruct_only"),
+)
+
 
 # Controls that are meaningless to omit: if the left arm is in the run, the
 # right one is added automatically, because the left arm's number cannot be
@@ -309,26 +345,50 @@ REQUIRED_CONTROLS = {"order_full": ("order_full_frozen", "anchor_full"),
                      "order_count_match": ("anchor_default",),
                      "proposed": ("reconstruct_only",)}
 
+####################################################
+# def (left, right):
+#     """Keys on which two arms differ that have nothing to do with the order term.
+
+#     A non-empty answer means the contrast `left - right` is NOT one variable.
+#     jigsaw_order owgeometry_mismatchns the key list, because it owns the parameters; the fallback
+#     covers the case where this file runs without it. `order_final_scale` and the
+#     head/view knobs are excluded there on purpose -- they are exact no-ops once
+#     the order weights are zero, so forcing a separate anchor per head variant
+#     would double the GPU bill and change nothing.
+#     """
+#     keys = getattr(jigsaw_order, "ANCHOR_MATCH_KEYS", None) or (
+#         "window_size", "n_tiles", "tile_gap", "output_dimension",
+#         "num_hidden_units", "head_hidden_units", "normalize", "neuron_dropout",
+#         "gain_jitter", "lambda_reconstruct", "anchor_final_scale",
+#         "span_selection", "selection_pool", "selection_jitter",
+#         "gap_curriculum", "frozen_block")
+#     if left not in ARMS or right not in ARMS:
+#         return []
+#     return [k for k in keys if ARMS[left].get(k) != ARMS[right].get(k)]
+####################################################
 
 def geometry_mismatch(left, right):
-    """Keys on which two arms differ that have nothing to do with the order term.
-
-    A non-empty answer means the contrast `left - right` is NOT one variable.
-    jigsaw_order owns the key list, because it owns the parameters; the fallback
-    covers the case where this file runs without it. `order_final_scale` and the
-    head/view knobs are excluded there on purpose -- they are exact no-ops once
-    the order weights are zero, so forcing a separate anchor per head variant
-    would double the GPU bill and change nothing.
-    """
-    keys = getattr(jigsaw_order, "ANCHOR_MATCH_KEYS", None) or (
-        "window_size", "n_tiles", "tile_gap", "output_dimension",
-        "num_hidden_units", "head_hidden_units", "normalize", "neuron_dropout",
-        "gain_jitter", "lambda_reconstruct", "anchor_final_scale",
-        "span_selection", "selection_pool", "selection_jitter",
-        "gap_curriculum", "frozen_block")
     if left not in ARMS or right not in ARMS:
         return []
+
+    left_model = ARMS[left].get("_model", "jigsaw")
+    right_model = ARMS[right].get("_model", "jigsaw")
+
+    if left_model == "solo" or right_model == "solo":
+        keys = getattr(jigsaw_solo, "SOLO_MATCH_KEYS", None)
+    else:
+        keys = getattr(jigsaw_order, "ANCHOR_MATCH_KEYS", None)
+
+    keys = keys or (
+        "window_size", "n_tiles", "tile_gap", "output_dimension",
+        "num_hidden_units", "head_hidden_units", "normalize",
+        "neuron_dropout", "gain_jitter", "lambda_reconstruct",
+        "anchor_final_scale", "span_selection", "selection_pool",
+        "selection_jitter", "gap_curriculum", "frozen_block",
+    )
+
     return [k for k in keys if ARMS[left].get(k) != ARMS[right].get(k)]
+
 
 # The epoch sweep. Run this FIRST on a new session: every other comparison is
 # conditional on being in a sane epoch regime.
@@ -1285,9 +1345,24 @@ def main():
         raise SystemExit(f"unknown arm(s) {unknown}\nvalid: {sorted(ARMS)}")
     # Each trunk family needs its OWN frozen control, otherwise d.random
     # confounds the architecture with the initialization scale.
-    needed = {"random_encoder"}
-    if any(ARMS[a].get("_model") == "mobile" for a in resolved):
+    ###################################################
+    # needed = {"random_encoder"}
+    # if any(ARMS[a].get("_model") == "mobile" for a in resolved):
+    #     needed.add("mobile_random")
+    ###################################################
+    needed = set()
+
+    families = {
+        ARMS[a].get("_model", "jigsaw")
+        for a in resolved
+    }
+    if "solo" in families:
+        needed.add("solo_random")
+    if "mobile" in families:
         needed.add("mobile_random")
+    if any(family not in ("solo", "mobile") for family in families):
+        needed.add("random_encoder")
+    
     # ... and every order arm needs its LABEL control, for the same reason: the
     # number on its own cannot distinguish "the jigsaw helped" from "an extra
     # loss term regularized the encoder". This is not a nicety -- it is the
