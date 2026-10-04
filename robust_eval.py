@@ -323,6 +323,107 @@ def run_labels(run_dirs):
     return labels
 
 
+def load_run_metadata(run_dir):
+    """Read session/data location from both old and new runner schemas.
+
+    Older runners stored ``session`` and ``data_path`` at the top level of
+    run_config.json.  The newer runners store command-line values under
+    ``args`` (including ``data_dir``).  Missing metadata is allowed here so a
+    command-line ``--session``/``--data-dir`` override can still be used.
+    """
+    config_path = run_dir / 'run_config.json'
+    if not config_path.is_file():
+        return dict(run_dir=run_dir, config_path=None, session=None,
+                    data_dir=None, data_path=None)
+
+    try:
+        raw = json.loads(config_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f'Cannot read valid JSON from {config_path}: {exc}') from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f'{config_path} must contain a JSON object.')
+
+    nested = raw.get('args', {})
+    if nested is None:
+        nested = {}
+    if not isinstance(nested, dict):
+        raise ValueError(f'{config_path}: "args" must be a JSON object when present.')
+
+    def first(*values):
+        return next((value for value in values if value not in (None, '')), None)
+
+    session = first(nested.get('session'), raw.get('session'))
+    data_dir_value = first(nested.get('data_dir'), raw.get('data_dir'))
+    data_path_value = first(nested.get('data_path'), raw.get('data_path'),
+                            nested.get('npz_path'), raw.get('npz_path'))
+
+    data_path = Path(data_path_value).expanduser() if data_path_value else None
+    data_dir = Path(data_dir_value).expanduser() if data_dir_value else None
+    if data_dir is None and data_path is not None:
+        data_dir = data_path.parent
+    if session is None and data_path is not None and data_path.suffix == '.npz':
+        session = data_path.stem
+
+    return dict(run_dir=run_dir, config_path=config_path, session=session,
+                data_dir=data_dir, data_path=data_path)
+
+
+def resolve_dataset(run_dirs, session_override=None, data_dir_override=None):
+    """Resolve one common dataset and reject conflicting run metadata."""
+    metadata = [load_run_metadata(run_dir) for run_dir in run_dirs]
+
+    known_sessions = {item['session'] for item in metadata if item['session'] is not None}
+    if session_override is None:
+        if len(known_sessions) > 1:
+            details = ', '.join(f"{m['run_dir']} -> {m['session']}" for m in metadata
+                                if m['session'] is not None)
+            raise ValueError(f'Run folders contain different sessions: {details}')
+        session = next(iter(known_sessions), None)
+    else:
+        session = session_override
+        conflicts = [m for m in metadata
+                     if m['session'] is not None and m['session'] != session]
+        if conflicts:
+            details = ', '.join(f"{m['run_dir']} -> {m['session']}" for m in conflicts)
+            raise ValueError(f'--session={session} conflicts with: {details}')
+
+    if data_dir_override is not None:
+        data_dir = data_dir_override.expanduser()
+    else:
+        known_dirs = {str(item['data_dir'].resolve()) for item in metadata
+                      if item['data_dir'] is not None}
+        if len(known_dirs) > 1:
+            details = ', '.join(f"{m['run_dir']} -> {m['data_dir']}" for m in metadata
+                                if m['data_dir'] is not None)
+            raise ValueError(f'Run folders reference different data directories: {details}')
+        data_dir = Path(next(iter(known_dirs))) if known_dirs else None
+
+    if session is None or data_dir is None:
+        missing = []
+        if session is None:
+            missing.append('--session')
+        if data_dir is None:
+            missing.append('--data-dir')
+        raise ValueError(
+            'Could not infer ' + ' and '.join(missing) +
+            ' from run_config.json; provide the missing command-line argument(s).'
+        )
+
+    expected = (data_dir / f'{session}.npz').resolve()
+    path_conflicts = []
+    for item in metadata:
+        configured = item['data_path']
+        if configured is not None and configured.suffix == '.npz':
+            if configured.resolve() != expected:
+                path_conflicts.append(f"{item['run_dir']} -> {configured}")
+    if path_conflicts:
+        raise ValueError(
+            f'Chosen dataset is {expected}, but these run configs disagree: ' +
+            '; '.join(path_conflicts)
+        )
+    return session, data_dir, metadata
+
+
 def summarize(rows, threats, out):
     summary = {}
     keys = sorted({(r['run'], r['arm']) for r in rows})
@@ -397,16 +498,16 @@ def parse_args():
 def main():
     args = parse_args()
     run_dirs = expand_run_dirs(args.run_dirs)
-    config_path = run_dirs[0] / 'run_config.json'
-    run_config = json.loads(config_path.read_text())['args'] if config_path.is_file() else {}
-    session = args.session or run_config.get('session')
-    data_dir = args.data_dir or (Path(run_config['data_dir']) if 'data_dir' in run_config else None)
-    if session is None or data_dir is None:
-        raise ValueError('Give --session and --data-dir (no run_config.json found).')
-    for run_dir in run_dirs[1:]:
-        other = run_dir / 'run_config.json'
-        if other.is_file() and json.loads(other.read_text())['args'].get('session') != session:
-            raise ValueError(f'{run_dir} was trained on another session than {session}.')
+    session, data_dir, metadata = resolve_dataset(
+        run_dirs,
+        session_override=args.session,
+        data_dir_override=args.data_dir,
+    )
+    print('Resolved run metadata:', flush=True)
+    for item in metadata:
+        schema = ('missing run_config.json' if item['config_path'] is None else
+                  'session=' + str(item['session']) + ', data_dir=' + str(item['data_dir']))
+        print(f"  {item['run_dir']}: {schema}", flush=True)
 
     if args.device == 'cuda_if_available':
         args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
