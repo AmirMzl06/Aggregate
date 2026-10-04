@@ -1,4 +1,3 @@
-hossein@server7-Lambda-Vector:/mnt/data/hossein/Hossein_workspace/nips_cetra/sam/adaptive$ cat robust_eval.py 
 """Robust decoding evaluation for the C-CO12 CEBRA+LABEL runners.
 
 For every trained arm (``seed_*/<arm>/cebra.pt`` + ``decoder.pt``) found in the
