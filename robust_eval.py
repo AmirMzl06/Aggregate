@@ -1,23 +1,3 @@
-"""Robust decoding evaluation for the C-CO12 CEBRA+LABEL runners.
-
-For every trained arm (``seed_*/<arm>/cebra.pt`` + ``decoder.pt``) found in the
-given run directories, the VALID inputs are attacked under several threat
-models and the decoding R2 under attack is reported. The result is the
-train-arm x attack matrix (mean +- std over seeds).
-
-Threat models (all L-inf boxes, one perturbation per input window):
-    clean          no attack (sanity check against metrics.json)
-    constant       |delta| <= eps                          (ordinary PGD)
-    noise          |delta| <= coef * sigma_j(local level)  (Acorn-noise-eps)
-    gain           x * (1 + g),       |g| <= gain_eps       (Acorn-structured-attack)
-    baseline       x + b * s_j,       |b| <= baseline_eps
-    gain_baseline  x * (1 + g) + b * s_j
-
-The attacks and the noise model are implemented here (mirroring the two forks),
-so checkpoints from ANY fork can be evaluated with the same code. The fork given
-by --cebra-dir is only used for its model registry. The encoder and the decoder
-run in eval mode (no dropout) during the attack.
-"""
 from pathlib import Path
 from datetime import datetime, timezone
 import argparse
@@ -371,9 +351,10 @@ def save_json(path, data):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('run_dirs', nargs='+', type=Path,
+    parser.add_argument('run_dirs', nargs='*', type=Path, default=[ROOT],
                         help='Runner output folders (holding run_config.json and seed_*/), or any '
-                             'parent folder: every run folder below it is evaluated.')
+                             'parent folder: every run folder below it is evaluated. '
+                             'Default: the folder of this script, where the runners save their results.')
     parser.add_argument('--cebra-dir', type=Path, default=CEBRA_DIR)
     parser.add_argument('--data-dir', type=Path, default=None, help='Default: from run_config.json.')
     parser.add_argument('--session', default=None, help='Default: from run_config.json.')
