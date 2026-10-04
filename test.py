@@ -52,7 +52,7 @@ TIME_OFFSETS = 1
 LEARNING_RATE = 3e-4
 DEVICE = 'cuda_if_available'
 ADV_STEPS = 10
-ATTACK_NORM = 'linf'
+ATTACK_NORM = 'l2'
 TRAIN_ALPHA_RATIO = 0.2  # adv_alpha = epsilon / 5
 
 # Comparison arms.
