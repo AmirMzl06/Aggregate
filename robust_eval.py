@@ -1,3 +1,4 @@
+hossein@server7-Lambda-Vector:/mnt/data/hossein/Hossein_workspace/nips_cetra/sam/adaptive$ cat robust_eval.py 
 """Robust decoding evaluation for the C-CO12 CEBRA+LABEL runners.
 
 For every trained arm (``seed_*/<arm>/cebra.pt`` + ``decoder.pt``) found in the
@@ -22,6 +23,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 import argparse
 import csv
+import difflib
 import json
 import sys
 import numpy as np
@@ -307,6 +309,34 @@ def find_arms(run_dirs, labels):
     return found
 
 
+def explain_missing(path):
+    """Error message for a missing path, naming the first missing part and close matches."""
+    parent = path
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    missing = path.relative_to(parent).parts[0]
+    options = sorted(p.name for p in parent.iterdir() if p.is_dir())
+    close = difflib.get_close_matches(missing, options, n=3, cutoff=0.6)
+    hint = f'Did you mean: {", ".join(close)}' if close else f'Folders there: {", ".join(options[:20])}'
+    return f'Not a directory: {path}\n  "{missing}" does not exist in {parent}. {hint}'
+
+
+def expand_run_dirs(paths):
+    """Accept run folders or any parent folder; return every run folder below them."""
+    run_dirs = []
+    for path in paths:
+        path = path.expanduser().resolve()
+        if any(path.glob('seed_*/*/cebra.pt')):
+            found = [path]
+        else:
+            found = sorted({ckpt.parents[2] for ckpt in path.glob('**/seed_*/*/cebra.pt')})
+        if not found:
+            raise FileNotFoundError(f'No seed_*/<arm>/cebra.pt found in or below {path}.')
+        run_dirs += [d for d in found if d not in run_dirs]
+    print('Run folders:', *[f'  {d}' for d in run_dirs], sep='\n', flush=True)
+    return run_dirs
+
+
 def run_labels(run_dirs):
     labels = [d.parent.name for d in run_dirs]
     if len(set(labels)) < len(labels):
@@ -343,7 +373,8 @@ def save_json(path, data):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('run_dirs', nargs='+', type=Path,
-                        help='Runner output folders (the ones holding run_config.json and seed_*/).')
+                        help='Runner output folders (holding run_config.json and seed_*/), or any '
+                             'parent folder: every run folder below it is evaluated.')
     parser.add_argument('--cebra-dir', type=Path, default=CEBRA_DIR)
     parser.add_argument('--data-dir', type=Path, default=None, help='Default: from run_config.json.')
     parser.add_argument('--session', default=None, help='Default: from run_config.json.')
@@ -378,14 +409,14 @@ def parse_args():
     if 'gain_baseline' in args.attacks and len(args.gain_epsilon) != len(args.baseline_epsilon):
         parser.error('gain_baseline zips --gain-epsilon with --baseline-epsilon; give them the same length.')
     for run_dir in args.run_dirs:
-        if not run_dir.is_dir():
-            parser.error(f'Not a directory: {run_dir}')
+        if not run_dir.expanduser().resolve().is_dir():
+            parser.error(explain_missing(run_dir.expanduser().resolve()))
     return args
 
 
 def main():
     args = parse_args()
-    run_dirs = [d.expanduser().resolve() for d in args.run_dirs]
+    run_dirs = expand_run_dirs(args.run_dirs)
     config_path = run_dirs[0] / 'run_config.json'
     run_config = json.loads(config_path.read_text())['args'] if config_path.is_file() else {}
     session = args.session or run_config.get('session')
