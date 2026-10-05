@@ -12,12 +12,15 @@ Stages:
   2. TRAIN      Every arm x seed: supervised CEBRA (all label columns) trained with
                 its calibrated budget, then the same full-batch MLP decoder as the
                 previous runners. Checkpoints go to <out>/seed_<s>/<arm>/.
-  3. EVALUATE   Every trained arm is attacked on VALID under every threat model at
-                the calibrated budget (PGD on encoder + decoder, eval mode).
+  3. EVALUATE   Every trained arm is perturbed on VALID under every threat model at
+                0.25 / 0.5 / 1 x its calibrated budget (--eval-scales), both by
+                PGD on encoder + decoder (worst case, eval mode) and by one uniform
+                random draw inside the same budget (--no-eval-random to skip).
 
 Output: <out>/summary.txt (send this one), plus calibration.json, results.csv,
-summary.json and the checkpoints. Re-running with --out <same folder> skips arms
-that are already trained (resume) and redoes the evaluation.
+summary.json and the checkpoints. Re-running with --out <same folder> resumes:
+trained arms are skipped and finished evaluations (seed_*/<arm>/robust_eval.json)
+are reused, so an old run folder only gets the missing evaluations.
 """
 from pathlib import Path
 from datetime import datetime, timezone
@@ -520,7 +523,35 @@ def load_decoder(path, device):
     return decoder.to(device).eval()
 
 
-def evaluate_arm(cebra, folder, x_valid, y_valid, y_train_std, threats, stats, args, device):
+def eval_specs(budgets, args):
+    """Every evaluation of one model: clean, then each threat x scale x mode.
+
+    ``pgd``: worst case found by PGD on encoder + decoder. ``random``: one uniform
+    random draw inside the same budget (no optimisation), the counterpart of the
+    random calibration oracle.
+    """
+    specs = [dict(key='clean', mode='none', threat='clean', scale=0.0, budget=None)]
+    modes = ('pgd', 'random') if args.eval_random else ('pgd',)
+    for mode in modes:
+        for scale in args.eval_scales:
+            for kind in THREATS[1:]:
+                budget = budgets[kind]
+                budget = tuple(scale * b for b in budget) if isinstance(budget, tuple) else scale * budget
+                specs.append(dict(key=f'{mode}:{kind}@{scale:g}', mode=mode, threat=kind, scale=scale,
+                                  budget=budget))
+    return specs
+
+
+def evaluate_arm(cebra, folder, x_valid, y_valid, y_train_std, specs, stats, budgets, args, device):
+    """Results of every spec for one trained model, cached in <folder>/robust_eval.json (resume)."""
+    cache_path = folder / 'robust_eval.json'
+    settings = dict(eval_steps=args.eval_steps, eval_restarts=args.eval_restarts,
+                    attack_seed=args.attack_seed, budgets={k: format_budget(v) for k, v in budgets.items()})
+    cache = json.loads(cache_path.read_text()) if cache_path.is_file() else {}
+    results = cache.get('results', {}) if cache.get('settings') == settings else {}
+    todo = [s for s in specs if s['key'] not in results]
+    if not todo:
+        return results
     encoder = load_encoder(cebra, folder / 'cebra.pt', device)
     decoder = load_decoder(folder / 'decoder.pt', device)
     for p in list(encoder.parameters()) + list(decoder.parameters()):
@@ -530,59 +561,68 @@ def evaluate_arm(cebra, folder, x_valid, y_valid, y_train_std, threats, stats, a
     padded = padded_series(x_valid, offset.left, offset.right, device)
     y = torch.from_numpy(y_valid).to(device)
     encode = lambda x: encoder(x).squeeze(-1)
-    results = {}
-    for kind, budget in threats:
+    for spec in todo:
+        steps, restarts = (args.eval_steps, args.eval_restarts) if spec['mode'] == 'pgd' else (0, 1)
         torch.manual_seed(args.attack_seed)
         preds, rel = [], []
         for index, x0 in window_batches(padded, len(y), window, ATTACK_BATCH_SIZE):
             target = y[index]
             loss = lambda x: (((decoder(encode(x)) - target) / y_train_std)**2).mean(dim=1)
-            x_adv = attack_windows(kind, budget, x0, loss, stats, args.eval_steps,
-                                   2.5 / args.eval_steps, args.eval_restarts)
+            x_adv = attack_windows(spec['threat'], spec['budget'], x0, loss, stats, steps,
+                                   2.5 / args.eval_steps, restarts)
             with torch.no_grad():
                 preds.append(decoder(encode(x_adv)))
                 rel.append(((x_adv - x0).abs() / stats['scale'].view(1, -1, 1)).mean(dim=(1, 2)))
         per_output = r2_per_output(y, torch.cat(preds)).tolist()
-        results[kind] = dict(valid_mean_r2=float(np.mean(per_output)), valid_r2_per_output=per_output,
-                             mean_abs_delta_over_std=float(torch.cat(rel).mean()))
+        results[spec['key']] = dict(valid_mean_r2=float(np.mean(per_output)), valid_r2_per_output=per_output,
+                                    mean_abs_delta_over_std=float(torch.cat(rel).mean()))
+        save_json(cache_path, dict(settings=settings, results=results))
     del encoder, decoder, padded
     cleanup()
     return results
 
 
 def write_summary(out, rows, arms, budgets, calibration, train_r2, data_path, args):
-    names = list(THREATS)
     lines = [f'ACORN calibrated experiment | {args.session} | data {data_path}',
              f'oracle={calibration["oracle"]} tau={calibration["tau"]:g} | reference ridge held-out R2='
              f'{calibration["ridge_held_out_r2"]:.4f} | seeds={args.seeds} | max_iter={args.max_iter} | '
-             f'eval: PGD {args.eval_steps} steps x {args.eval_restarts} restarts on VALID',
-             '', 'CALIBRATED BUDGETS (used for training AND evaluation)']
+             f'eval on VALID: PGD {args.eval_steps} steps x {args.eval_restarts} restarts; '
+             f'scales={args.eval_scales}; random={args.eval_random}',
+             '', 'CALIBRATED BUDGETS (1.0 x; used for training AND evaluation)']
     for kind in ('constant', 'noise', 'gain', 'baseline', 'gain_baseline'):
         lines.append(f'  {kind:<14} {format_budget(budgets[kind]):<20} [{calibration["details"][kind]["status"]}]')
-    sizes = {k: np.mean([r['mean_abs_delta_over_std'] for r in rows if r['threat'] == k]) for k in names}
-    lines += ['', 'mean |delta| / neuron std of each attack: ' +
-              ', '.join(f'{k}={sizes[k]:.3f}' for k in names if k != 'clean'), '',
-              'VALID mean R2 under attack (mean +- std over seeds; rows = training arm)']
-    width = 18
-    lines.append(f'{"arm":<16}' + ''.join(f'{n:>{width}}' for n in names))
+    modes = ('pgd', 'random') if args.eval_random else ('pgd',)
+    scales = sorted(args.eval_scales, reverse=True)
+    titles = dict(pgd='PGD (worst case)', random='RANDOM (one uniform draw, no optimisation)')
+    width, names = 18, list(THREATS)
     summary = {}
-    for arm in arms:
-        line, summary[arm] = f'{arm:<16}', {}
-        for name in names:
-            scores = np.array([r['valid_mean_r2'] for r in rows if r['arm'] == arm and r['threat'] == name])
-            if len(scores) == 0:
-                line += f'{"-":>{width}}'
-                continue
-            std = float(scores.std(ddof=1)) if len(scores) > 1 else None
-            summary[arm][name] = dict(mean=float(scores.mean()), sample_std=std, n_seeds=len(scores))
-            cell = f'{scores.mean():.4f}' + (f' +-{std:.3f}' if std is not None else '')
-            line += f'{cell:>{width}}'
-        lines.append(line)
+    for mode in modes:
+        for scale in scales:
+            table = f'{mode}@{scale:g}'
+            keys = {k: 'clean' if k == 'clean' else f'{mode}:{k}@{scale:g}' for k in names}
+            sizes = {k: np.mean([r['mean_abs_delta_over_std'] for r in rows if r['key'] == keys[k]])
+                     for k in names[1:]}
+            lines += ['', f'{titles[mode]} at {scale:g} x calibrated budget: VALID mean R2 (mean +- std over seeds)',
+                      '  mean |delta| / neuron std: ' + ', '.join(f'{k}={v:.3f}' for k, v in sizes.items()),
+                      f'{"arm":<16}' + ''.join(f'{n:>{width}}' for n in names)]
+            summary[table] = {}
+            for arm in arms:
+                line, summary[table][arm] = f'{arm:<16}', {}
+                for name in names:
+                    scores = np.array([r['valid_mean_r2'] for r in rows if r['arm'] == arm and r['key'] == keys[name]])
+                    if len(scores) == 0:
+                        line += f'{"-":>{width}}'
+                        continue
+                    std = float(scores.std(ddof=1)) if len(scores) > 1 else None
+                    summary[table][arm][name] = dict(mean=float(scores.mean()), sample_std=std, n_seeds=len(scores))
+                    cell = f'{scores.mean():.4f}' + (f' +-{std:.3f}' if std is not None else '')
+                    line += f'{cell:>{width}}'
+                lines.append(line)
     lines += ['', 'Sanity: clean R2 recomputed vs. training metrics (max abs diff): '
-              f'{max((abs(r["valid_mean_r2"] - train_r2[(r["arm"], r["seed"])]) for r in rows if r["threat"] == "clean"), default=float("nan")):.2e}']
+              f'{max((abs(r["valid_mean_r2"] - train_r2[(r["arm"], r["seed"])]) for r in rows if r["key"] == "clean"), default=float("nan")):.2e}']
     text = '\n'.join(lines)
     (out / 'summary.txt').write_text(text + '\n', encoding='utf-8')
-    save_json(out / 'summary.json', dict(budgets={k: v for k, v in budgets.items()}, by_arm=summary))
+    save_json(out / 'summary.json', dict(budgets={k: v for k, v in budgets.items()}, by_table=summary))
     print('\n' + text, flush=True)
 
 
@@ -608,6 +648,10 @@ def parse_args():
     parser.add_argument('--calibration-steps', type=int, default=20)
     parser.add_argument('--eval-steps', type=int, default=50)
     parser.add_argument('--eval-restarts', type=int, default=2)
+    parser.add_argument('--eval-scales', nargs='+', type=float, default=[0.25, 0.5, 1.0],
+                        help='Evaluate every threat at these multiples of its calibrated budget.')
+    parser.add_argument('--no-eval-random', dest='eval_random', action='store_false',
+                        help='Skip the random-perturbation evaluation (on by default).')
     parser.add_argument('--attack-seed', type=int, default=0)
     parser.add_argument('--device', default='cuda_if_available')
     args = parser.parse_args()
@@ -618,6 +662,10 @@ def parse_args():
     if min(args.max_iter, args.decoder_epochs, args.adv_steps, args.calibration_steps,
            args.eval_steps, args.eval_restarts) < 1:
         parser.error('Iterations, epochs, steps and restarts must be positive.')
+    if 1.0 not in args.eval_scales:
+        args.eval_scales.append(1.0)  # the main table is at the calibrated budget
+    if min(args.eval_scales) <= 0 or len(set(args.eval_scales)) != len(args.eval_scales):
+        parser.error('--eval-scales must be unique and positive.')
     return args
 
 
@@ -680,29 +728,32 @@ def main():
             cebra.CEBRA(**config)  # fail early on a constructor mismatch
             train_arm(cebra, arm, seed, config, arrays, out / f'seed_{seed}' / arm, args)
 
-    # Stage 3.
-    print(f'\nSTAGE 3: ROBUST EVALUATION on VALID (PGD {args.eval_steps} steps x {args.eval_restarts} restarts)',
-          flush=True)
+    # Stage 3 (per-model results are cached, so an interrupted evaluation resumes).
+    specs = eval_specs(budgets, args)
+    print(f'\nSTAGE 3: ROBUST EVALUATION on VALID: {len(specs)} evaluations per model '
+          f'(PGD {args.eval_steps} steps x {args.eval_restarts} restarts; scales {args.eval_scales}; '
+          f'random={args.eval_random})', flush=True)
     cebra = load_cebra_fork(forks['noise' if 'noise' in needed else 'structured'])  # model registry only
-    threats = [(k, None if k == 'clean' else budgets[k]) for k in THREATS]
     y_train_std = torch.from_numpy(y_train.std(axis=0)).clamp(min=1e-8).to(device)
     rows, train_r2 = [], {}
+    main_keys = ['clean'] + [f'pgd:{k}@1' for k in THREATS[1:]]
     for seed in args.seeds:
         for arm in args.arms:
             folder = out / f'seed_{seed}' / arm
             metrics = json.loads((folder / 'metrics.json').read_text())
             train_r2[(arm, seed)] = metrics['valid_mean_r2']
-            results = evaluate_arm(cebra, folder, x_valid, y_valid, y_train_std, threats, stats, args, device)
-            print(f'  seed {seed} {arm:<14} ' + '  '.join(f'{k}={r["valid_mean_r2"]:.4f}' for k, r in results.items()),
-                  flush=True)
-            for kind, r in results.items():
-                rows.append(dict(seed=seed, arm=arm, threat=kind, budget=format_budget(dict(threats)[kind]), **r))
+            results = evaluate_arm(cebra, folder, x_valid, y_valid, y_train_std, specs, stats, budgets, args, device)
+            print(f'  seed {seed} {arm:<14} ' + '  '.join(f'{k}={results[k]["valid_mean_r2"]:.4f}'
+                                                         for k in main_keys if k in results), flush=True)
+            for spec in specs:
+                rows.append(dict(seed=seed, arm=arm, key=spec['key'], mode=spec['mode'], threat=spec['threat'],
+                                 scale=spec['scale'], budget=format_budget(spec['budget']), **results[spec['key']]))
     with (out / 'results.csv').open('w', newline='', encoding='utf-8') as handle:
         writer = csv.writer(handle)
-        writer.writerow(['seed', 'arm', 'threat', 'budget', 'valid_mean_r2', 'mean_abs_delta_over_std'] +
-                        [f'valid_r2_output_{i}' for i in range(y_valid.shape[1])])
+        writer.writerow(['seed', 'arm', 'attack', 'threat', 'scale', 'budget', 'valid_mean_r2',
+                         'mean_abs_delta_over_std'] + [f'valid_r2_output_{i}' for i in range(y_valid.shape[1])])
         for r in rows:
-            writer.writerow([r['seed'], r['arm'], r['threat'], r['budget'], r['valid_mean_r2'],
+            writer.writerow([r['seed'], r['arm'], r['mode'], r['threat'], r['scale'], r['budget'], r['valid_mean_r2'],
                              r['mean_abs_delta_over_std']] + r['valid_r2_per_output'])
     write_summary(out, rows, args.arms, budgets, calibration, train_r2, data_path, args)
     print('\nDone. Send this file:', out / 'summary.txt', flush=True)
