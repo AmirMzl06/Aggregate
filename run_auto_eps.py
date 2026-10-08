@@ -1,4 +1,9 @@
-"""Automatic epsilon vs hand-set epsilon on randomly chosen Perich sessions (both arms trained here).
+"""Automatic epsilon vs hand-set epsilon on randomly chosen Perich sessions.
+
+To run 50 held-out sessions on four visible GPUs:
+    python -u run_auto_eps_parallel.py --num-sessions 50 --gpus 0,1,2,3
+One worker process is assigned to each GPU; each trains both arms on its sessions.
+Without --gpus this program uses the original single-process execution.
 
 For every session two arms are trained from scratch with the ORIGINAL PGD (constant mode of
 Acorn-margin-eps; alpha = epsilon / 5; every other setting as in the previous fixed_eps_3 runs):
@@ -29,14 +34,15 @@ from datetime import datetime
 import argparse
 import csv
 import gc
+import hashlib
 import inspect
 import json
 import math
 import random
+import subprocess
 import sys
 import time
 import numpy as np
-import torch
 from sklearn.metrics import r2_score
 
 ROOT = Path(__file__).resolve().parent
@@ -116,7 +122,8 @@ def load_session(data_dir, session):
     for key, arr in zip(NPZ_KEYS, (xtr, xva, ytr, yva)):
         if arr.ndim != 2 or min(arr.shape) < 1 or not np.isfinite(arr).all():
             raise ValueError(f'{path}: {key} must be a finite, nonempty 2D array')
-    if len(xtr) != len(ytr) or len(xva) != len(yva) or xtr.shape[1] != xva.shape[1]:
+    if (len(xtr) != len(ytr) or len(xva) != len(yva) or xtr.shape[1] != xva.shape[1]
+            or ytr.shape[1] != yva.shape[1] or min(len(xtr), len(xva)) < 2):
         raise ValueError(f'{path}: inconsistent shapes')
     return xtr, xva, ytr, yva
 
@@ -126,6 +133,8 @@ def choose_sessions(args, out):
     saved = out / 'sessions.txt'
     if args.sessions:
         sessions = list(dict.fromkeys(args.sessions))
+        if saved.is_file() and sessions != saved.read_text().split():
+            raise RuntimeError(f'{saved} has a different session list. Use a new --out path.')
     elif saved.is_file():
         sessions = [s for s in saved.read_text().split() if s]
         print(f'Resuming with the {len(sessions)} sessions of {saved}', flush=True)
@@ -156,7 +165,9 @@ def choose_sessions(args, out):
 def session_epsilons(xtr, ytr, fixed_epsilon):
     std = torch.from_numpy(xtr).float().std(dim=0, unbiased=False)  # as in Acorn-margin-eps
     active = std[std > 0]
-    median_std = float(active.median()) if active.numel() > 0 else 1.0
+    if active.numel() == 0:
+        raise ValueError('No active neurons in the training split.')
+    median_std = float(active.median())
     n_active, n_labels = int(active.numel()), int(ytr.shape[1])
     k_auto = math.sqrt(n_active / n_labels)
     return dict(neurons=int(xtr.shape[1]), active_neurons=n_active, labels=n_labels, median_std=median_std,
@@ -191,7 +202,7 @@ def encoder_config(epsilon, args):
                 model_architecture=ARCHITECTURE, time_offsets=1, max_iterations=args.iterations,
                 output_dimension=LATENT_DIM, num_hidden_units=ENCODER_HIDDEN, learning_rate=ENCODER_LR,
                 pad_before_transform=True, hybrid=False, training_mode='adversarial', attack_norm='linf',
-                adv_epsilon=float(epsilon), adv_alpha=float(ALPHA_RATIO * epsilon), adv_steps=ATTACK_STEPS,
+                adv_epsilon=float(epsilon), adv_alpha=float(epsilon / 5.0), adv_steps=ATTACK_STEPS,
                 adv_epsilon_mode='constant', device=args.device, verbose=True)
 
 
@@ -382,6 +393,8 @@ def parse_args():
     parser.add_argument('--iterations', type=int, default=ITERATIONS)
     parser.add_argument('--decoder-epochs', type=int, default=DECODER_EPOCHS)
     parser.add_argument('--device', default='cuda_if_available')
+    parser.add_argument('--gpus', default=None,
+                        help='GPU IDs visible to this process, e.g. 0,1,2,3. One worker per GPU.')
     args = parser.parse_args()
     if args.num_sessions < 1 or min(args.iterations, args.decoder_epochs) < 1:
         parser.error('--num-sessions, --iterations and --decoder-epochs must be positive.')
@@ -391,8 +404,114 @@ def parse_args():
     return args
 
 
+def run_parallel(args, out, sessions):
+    """Run disjoint sets of sessions in separate processes, then merge their reports."""
+    gpus = [g.strip() for g in args.gpus.split(',')]
+    if not gpus or any(not g.isdecimal() for g in gpus) or len(set(gpus)) != len(gpus):
+        raise ValueError('--gpus must contain distinct numeric IDs, for example 0,1,2,3')
+    if args.device == 'cpu' or not torch.cuda.is_available():
+        raise RuntimeError('--gpus requires GPUs visible inside this container (and a CUDA PyTorch build).')
+    if torch.cuda.device_count() < len(gpus):
+        raise RuntimeError(f'Only {torch.cuda.device_count()} GPUs visible; requested {len(gpus)}. '
+                           'Allocate four GPUs to this job before passing --gpus 0,1,2,3.')
+    # Put both training arms for a session on the same GPU and keep assignment stable on resume.
+    assignments = {g: sessions[i::len(gpus)] for i, g in enumerate(gpus)}
+    manifest = dict(sessions=sessions, gpus=gpus, selection_seed=args.selection_seed,
+                    include_used=args.include_used, seeds=args.seeds,
+                    fixed_epsilon=args.fixed_epsilon, equivalence_margin=args.equivalence_margin,
+                    iterations=args.iterations, decoder_epochs=args.decoder_epochs,
+                    data_dir=str(args.data_dir.expanduser().resolve()),
+                    cebra_dir=str(args.cebra_dir.expanduser().resolve()),
+                    fork_sha256={name: hashlib.sha256((args.cebra_dir.expanduser().resolve() / name).read_bytes()).hexdigest()
+                                 for name in ('cebra/integrations/sklearn/cebra.py', 'cebra/solver/base.py')})
+    manifest_path = out / 'parallel_manifest.json'
+    if manifest_path.is_file():
+        if json.loads(manifest_path.read_text()) != manifest:
+            raise RuntimeError(f'{out} has different sessions/config/fork/GPU assignment. '
+                               'Use a fresh --out, or rerun with exactly the original options.')
+    else:
+        save_json(manifest_path, manifest)
+
+    children = {}
+    cpu_threads = max(1, (os.cpu_count() or len(gpus)) // len(gpus))
+    try:
+        for gpu, subset in assignments.items():
+            if not subset:
+                continue
+            worker_out = out / 'workers' / f'gpu_{gpu}'
+            worker_out.mkdir(parents=True, exist_ok=True)
+            log_path = out / f'gpu_{gpu}.log'
+            cmd = [sys.executable, '-u', str(Path(__file__).resolve()),
+                   '--sessions', *subset, '--out', str(worker_out),
+                   '--data-dir', str(args.data_dir), '--cebra-dir', str(args.cebra_dir),
+                   '--fixed-epsilon', str(args.fixed_epsilon),
+                   '--equivalence-margin', str(args.equivalence_margin),
+                   '--iterations', str(args.iterations), '--decoder-epochs', str(args.decoder_epochs),
+                   '--seeds', *map(str, args.seeds), '--device', 'cuda']
+            env = os.environ.copy()
+            env.update(CUDA_VISIBLE_DEVICES=gpu, PYTHONUNBUFFERED='1',
+                       OMP_NUM_THREADS=str(cpu_threads), MKL_NUM_THREADS=str(cpu_threads))
+            log = log_path.open('a', encoding='utf-8')
+            try:
+                process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+            except BaseException:
+                log.close()
+                raise
+            children[gpu] = (process, log, worker_out)
+            print(f'GPU {gpu}: {len(subset)} sessions, PID={process.pid}, log={log_path}', flush=True)
+        status = {}
+        while len(status) < len(children):
+            for gpu, (process, log, _) in children.items():
+                if gpu in status:
+                    continue
+                exit_code = process.poll()
+                if exit_code is not None:
+                    status[gpu] = exit_code
+                    log.close()
+                    print(f'GPU {gpu}: exit={exit_code}', flush=True)
+            if len(status) < len(children):
+                time.sleep(5)
+    except KeyboardInterrupt:
+        for process, log, _ in children.values():
+            if process.poll() is None:
+                process.terminate()
+        for process, log, _ in children.values():
+            process.wait()
+            if not log.closed:
+                log.close()
+        print('Interrupted; rerun with the same --out and options to resume.', flush=True)
+        raise
+    except Exception:
+        for process, _, _ in children.values():
+            if process.poll() is None:
+                process.terminate()
+        for process, log, _ in children.values():
+            process.wait()
+            if not log.closed:
+                log.close()
+        raise
+    # The workers never write in the same directory. The parent alone creates the joint table.
+    stats, rows = {}, []
+    for _, _, worker_out in children.values():
+        path = worker_out / 'results.json'
+        if path.is_file():
+            result = json.loads(path.read_text(encoding='utf-8'))
+            stats.update(result['part1'])
+            rows.extend(result['runs'])
+    rows.sort(key=lambda r: (sessions.index(r['session']), r['seed'], ARMS.index(r['arm'])))
+    if stats:
+        write_summary(out, stats, sessions, rows, args)
+    failures = [gpu for gpu, exit_code in status.items() if exit_code != 0]
+    if failures:
+        raise RuntimeError(f'Workers failed on GPUs {failures}; inspect gpu_<id>.log in {out}. '
+                           f'Completed arms are saved; rerun with --out {out} to resume.')
+    print(f'All GPUs finished. Joint report: {out / "summary.txt"}', flush=True)
+
+
 def main():
     args = parse_args()
+    global torch
+    import torch
     if args.device == 'cuda_if_available':
         args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(args.device)
@@ -403,6 +522,9 @@ def main():
     missing = [s for s in sessions if not (args.data_dir.expanduser() / f'{s}.npz').is_file()]
     if missing:
         raise FileNotFoundError(f'NPZ not found in {args.data_dir} for sessions: {missing}')
+    if args.gpus:
+        run_parallel(args, out, sessions)
+        return
     cebra = load_fork(args.cebra_dir)
     cebra.CEBRA(**encoder_config(1.0, args))  # fail early on a constructor mismatch
     save_json(out / 'config.json', dict(args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
