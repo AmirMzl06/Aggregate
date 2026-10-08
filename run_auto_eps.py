@@ -201,7 +201,7 @@ def encoder_config(epsilon, args):
     return dict(batch_size=BATCH_SIZE, temperature=TEMPERATURE, temperature_mode='constant', distance='cosine',
                 model_architecture=ARCHITECTURE, time_offsets=1, max_iterations=args.iterations,
                 output_dimension=LATENT_DIM, num_hidden_units=ENCODER_HIDDEN, learning_rate=ENCODER_LR,
-                pad_before_transform=True, hybrid=False, training_mode='adversarial', attack_norm='linf',
+                pad_before_transform=True, hybrid=False, training_mode='adversarial', attack_norm='l2',
                 adv_epsilon=float(epsilon), adv_alpha=float(epsilon / 5.0), adv_steps=ATTACK_STEPS,
                 adv_epsilon_mode='constant', device=args.device, verbose=True)
 
