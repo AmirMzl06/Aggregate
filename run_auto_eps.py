@@ -23,7 +23,7 @@ Output: <out>/summary.txt (send this one), with
     Part 2  every training run: R2 train / valid
     Part 3  paired comparison of clean-input VALID R2 and the equivalence test
 plus sessions.txt, summary.csv, results.json and the checkpoints. Re-running with
---out <same folder> resumes (finished runs and the session list are reused).
+--out <same folder> resumes finished arms, including after a change in GPU count.
 """
 import os
 
@@ -404,6 +404,23 @@ def parse_args():
     return args
 
 
+def finished_arm_locations(out, sessions, seeds):
+    """Find finished arms in previous GPU layouts for a safe change in GPU count."""
+    locations = {}
+    root = out / 'workers'
+    if not root.is_dir():
+        return locations
+    for metrics in sorted(root.rglob('metrics.json')):
+        try:
+            row = json.loads(metrics.read_text(encoding='utf-8'))
+            key = row['session'], int(row['seed']), row['arm']
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # An interrupted write does not mark an arm as finished.
+        if key[0] in sessions and key[1] in seeds and key[2] in ARMS:
+            locations.setdefault(key, metrics.parent)
+    return locations
+
+
 def run_parallel(args, out, sessions):
     """Run disjoint sets of sessions in separate processes, then merge their reports."""
     gpus = [g.strip() for g in args.gpus.split(',')]
@@ -413,7 +430,7 @@ def run_parallel(args, out, sessions):
         raise RuntimeError('--gpus requires GPUs visible inside this container (and a CUDA PyTorch build).')
     if torch.cuda.device_count() < len(gpus):
         raise RuntimeError(f'Only {torch.cuda.device_count()} GPUs visible; requested {len(gpus)}. '
-                           'Allocate four GPUs to this job before passing --gpus 0,1,2,3.')
+                           'Allocate that many GPUs to this job before setting --gpus.')
     # Put both training arms for a session on the same GPU and keep assignment stable on resume.
     assignments = {g: sessions[i::len(gpus)] for i, g in enumerate(gpus)}
     manifest = dict(sessions=sessions, gpus=gpus, selection_seed=args.selection_seed,
@@ -426,21 +443,44 @@ def run_parallel(args, out, sessions):
                                  for name in ('cebra/integrations/sklearn/cebra.py', 'cebra/solver/base.py')})
     manifest_path = out / 'parallel_manifest.json'
     if manifest_path.is_file():
-        if json.loads(manifest_path.read_text()) != manifest:
-            raise RuntimeError(f'{out} has different sessions/config/fork/GPU assignment. '
-                               'Use a fresh --out, or rerun with exactly the original options.')
+        previous = json.loads(manifest_path.read_text())
+        # GPU layout changes only execution, not the experimental comparison.
+        previous_layout = previous.pop('gpus', None)
+        if previous != {k: v for k, v in manifest.items() if k != 'gpus'}:
+            raise RuntimeError(f'{out} has different sessions/config/fork. '
+                               'Use a fresh --out, or rerun with the original experiment settings.')
+        if previous_layout != gpus:
+            print(f'Changing GPU layout {previous_layout} -> {gpus}; reusing finished arms.', flush=True)
     else:
         save_json(manifest_path, manifest)
 
+    finished = finished_arm_locations(out, sessions, args.seeds)
     children = {}
     cpu_threads = max(1, (os.cpu_count() or len(gpus)) // len(gpus))
     try:
         for gpu, subset in assignments.items():
             if not subset:
                 continue
-            worker_out = out / 'workers' / f'gpu_{gpu}'
+            # A separate folder per GPU layout avoids overwriting the old workers' sessions.txt.
+            worker_out = out / 'workers' / ('layout_' + '_'.join(gpus)) / f'gpu_{gpu}'
             worker_out.mkdir(parents=True, exist_ok=True)
-            log_path = out / f'gpu_{gpu}.log'
+            reused = 0
+            for session in subset:
+                for seed in args.seeds:
+                    for arm in ARMS:
+                        key = session, seed, arm
+                        if key not in finished:
+                            continue
+                        target = worker_out / session / f'seed_{seed}' / arm
+                        if (target / 'metrics.json').is_file():
+                            continue
+                        if target.exists() or target.is_symlink():
+                            raise RuntimeError(f'{target} exists but is not complete while a finished '
+                                               'copy exists in another layout; inspect before resuming.')
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.symlink_to(os.path.relpath(finished[key], target.parent), target_is_directory=True)
+                        reused += 1
+            log_path = out / f'layout_{"_".join(gpus)}_gpu_{gpu}.log'
             cmd = [sys.executable, '-u', str(Path(__file__).resolve()),
                    '--sessions', *subset, '--out', str(worker_out),
                    '--data-dir', str(args.data_dir), '--cebra-dir', str(args.cebra_dir),
@@ -458,7 +498,8 @@ def run_parallel(args, out, sessions):
                 log.close()
                 raise
             children[gpu] = (process, log, worker_out)
-            print(f'GPU {gpu}: {len(subset)} sessions, PID={process.pid}, log={log_path}', flush=True)
+            print(f'GPU {gpu}: {len(subset)} sessions, {reused} completed arms reused, '
+                  f'PID={process.pid}, log={log_path}', flush=True)
         status = {}
         while len(status) < len(children):
             for gpu, (process, log, _) in children.items():
@@ -503,7 +544,7 @@ def run_parallel(args, out, sessions):
         write_summary(out, stats, sessions, rows, args)
     failures = [gpu for gpu, exit_code in status.items() if exit_code != 0]
     if failures:
-        raise RuntimeError(f'Workers failed on GPUs {failures}; inspect gpu_<id>.log in {out}. '
+        raise RuntimeError(f'Workers failed on GPUs {failures}; inspect layout_{"_".join(gpus)}_gpu_<id>.log in {out}. '
                            f'Completed arms are saved; rerun with --out {out} to resume.')
     print(f'All GPUs finished. Joint report: {out / "summary.txt"}', flush=True)
 
