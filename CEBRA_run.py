@@ -35,7 +35,7 @@ def prepare_labels(labels):
     if labels.ndim == 1:
         labels = labels[:, None]
     elif labels.ndim == 2:
-        labels = labels[:, :2]
+        labels = labels[:, :]
     else:
         raise ValueError(
             f"Labels must be 1D or 2D, got shape {labels.shape}"
