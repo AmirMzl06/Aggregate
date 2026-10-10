@@ -16,7 +16,7 @@ from sklearn.metrics import r2_score
 
 
 LATENT = 128
-DECODER_EPOCHS = 10000
+DECODER_EPOCHS = 2500
 
 
 def seed_all(seed):
