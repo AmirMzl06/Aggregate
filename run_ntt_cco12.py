@@ -41,6 +41,8 @@ Protocol:
   that architecture/seed's step-0 encoder. Also save MSE, MAE, Pearson, a ridge
   probe, collapse diagnostics, held-out pretext ranks, negative controls,
   finite-difference geometry, permutation shortcuts, learning curves and CIs.
+* Ordinal pair accuracy is computed on pretraining minibatches AND separately
+  on NPZ validation (without labels), with raw/spectral baselines and clean z rank.
 * Validation checkpoints are descriptive. No automatic best-valid selection.
   Repeatedly inspecting this split makes it a development set, not a fresh test.
 * Trial IDs are honored if train_trial_id/valid_trial_id exist (keys configurable).
@@ -468,29 +470,47 @@ def fixed_centers(centers, count, seed):
 
 @torch.inference_mode()
 def pretext_diagnostics(model, data, args, seed, device):
-    centers = fixed_centers(data['held_centers'], args.diagnostic_samples, seed + 701)
-    windows = data['train'].get(centers)
+    """Label-free ordinal audits on SSL-train holdout AND untouched NPZ valid.
+
+    'valid' is the *development/validation* split, NOT a locked final test set.
+    Augmentations are generated after sampling and never used for optimization.
+    Geometry diagnostics cover clean h and clean z, even when only h is decoded.
+    """
     result = {}
-    for name, levels, shared in [
-        ('heldout_seen_strengths', args.levels, False),
-        ('heldout_unseen_strengths', args.eval_levels, False),
-        ('shared_neuron_time_transform', args.levels, True),
-    ]:
+    cases = [
+        ('heldout_seen_strengths', data['train'], data['held_centers'], args.levels, False),
+        ('heldout_unseen_strengths', data['train'], data['held_centers'], args.eval_levels, False),
+        ('shared_neuron_time_transform', data['train'], data['held_centers'], args.levels, True),
+        ('valid_seen_strengths', data['valid'], data['valid'].interior, args.levels, False),
+        ('valid_unseen_strengths', data['valid'], data['valid'].interior, args.eval_levels, False),
+    ]
+    for name, source, candidates, levels, shared in cases:
         if shared and args.transform == 'count_jitter':
             continue
-        generator = torch.Generator().manual_seed(seed + 711)
+        if not len(candidates):
+            result[name] = {'status': 'no_interior_windows'}
+            continue
+        # Fixed, reproducible samples; different random streams across splits.
+        on_valid = source is data['valid']
+        centers = fixed_centers(candidates, args.diagnostic_samples,
+                                seed + (1701 if on_valid else 701))
+        windows = source.get(centers)
+        generator = torch.Generator().manual_seed(seed + (1711 if on_valid else 711))
         views, audit = make_tournament(windows, build_transform(args, levels), generator, shared)
         encoded = encode_views(model, views, device, args.encoder_eval_batch)
-        entry = dict(levels=levels, samples=len(centers),
+        entry = dict(levels=list(levels), samples=len(centers),
+                     split='npz_valid' if on_valid else 'ssl_train_holdout',
+                     behavior_labels_used=False,
                      transform_audit={k: v.mean(1).tolist() if torch.is_tensor(v) else v
                                       for k, v in audit.items()})
         for space, values in encoded.items():
             distances = (values[1:] - values[0]).square().sum(-1).T
             entry[space + '_ranking'] = ranking_diagnostics(distances)
+            entry[space + '_clean_geometry'] = representation_diagnostics(values[0])
         raw_distances = (views[1:] - views[0]).square().mean((2, 3)).T
         entry['raw_l2_ranking'] = ranking_diagnostics(raw_distances)
-        # Features standardized using clean TRAIN windows, never valid data.
         stats = torch.stack([statistical_features(view) for view in views])
+        # The same normalization within this sampled diagnostic set as v1.
         denom = stats[0].std(0, unbiased=False).clamp_min(1e-5)
         entry['statistical_distance_ranking'] = ranking_diagnostics(
             (((stats[1:] - stats[0]) / denom).square().mean(-1)).T)
@@ -499,34 +519,71 @@ def pretext_diagnostics(model, data, args, seed, device):
             (power[1:] - power[0]).square().mean((2, 3)).T)
         entry['strict_full_order_random_chance'] = 1 / math.factorial(len(levels))
         result[name] = entry
+    result['note'] = ('All ranking measures use transformed views of the selected split. '
+                      'NPZ valid is a development split, not a final unseen test. '
+                      'A high raw/spectrum ranking means the pretext ordering may be solved '
+                      'by nuisance statistics; it does not prove the encoder used them.')
     return result
 
 
 def fit_shortcut_audit(data, args, seed):
-    """Label-free in neuroscience terms: predict synthetic severity, not behavior."""
+    """How accurately can SIMPLE statistical features rank nominal corruption?
+
+    All nuisance classifiers train on the pretext-fit subset only, and are
+    evaluated on disjoint TRAIN holdout and on NPZ validation. No behavior labels.
+    """
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import make_pipeline
     centers_fit = fixed_centers(data['fit_centers'], args.diagnostic_samples, seed + 951)
     centers_held = fixed_centers(data['held_centers'], args.diagnostic_samples, seed + 952)
+    centers_valid = fixed_centers(data['valid'].interior, args.diagnostic_samples, seed + 954)
+    if not len(centers_valid):
+        raise ValueError('No interior validation windows for shortcut audit.')
     parts = []
-    for centers in (centers_fit, centers_held):
-        windows = data['train'].get(centers)
-        views, _ = make_tournament(windows, build_transform(args), torch.Generator().manual_seed(seed + 953))
+    for source, centers, split in ((data['train'], centers_fit, 'train_fit'),
+                                   (data['train'], centers_held, 'train_holdout'),
+                                   (data['valid'], centers_valid, 'npz_valid')):
+        windows = source.get(centers)
+        views, _ = make_tournament(windows, build_transform(args),
+                                   torch.Generator().manual_seed(seed + (955 if split == 'npz_valid' else 953)))
         features = torch.cat([statistical_features(view) for view in views[1:]]).numpy()
         labels = np.repeat(np.arange(len(args.levels)), len(centers))
         parts.append((features, labels, len(centers)))
-    x, labels, _ = parts[0]
-    held_x, held_y, count = parts[1]
-    model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1500, random_state=seed))
-    model.fit(x, labels)
-    probabilities = model.predict_proba(held_x)
-    expectation = probabilities @ np.arange(len(args.levels))
-    ranking = ranking_diagnostics(torch.from_numpy(expectation.reshape(len(args.levels), count).T))
+    n = data['xt'].shape[1]
+    indices = {
+        'mean_only': np.arange(0, n),
+        'std_only': np.arange(n, 2*n),
+        'lag1_only': np.arange(2*n, 3*n),
+        'roughness_only': np.arange(3*n, 4*n),
+        'mean_std': np.arange(0, 2*n),
+        'temporal_lag_roughness': np.arange(2*n, 4*n),
+        'all_statistics': np.arange(0, 4*n),
+    }
+    family_results = {}
+    for family, feature_cols in indices.items():
+        train_x, train_y, _ = parts[0]
+        model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1500, random_state=seed))
+        model.fit(train_x[:, feature_cols], train_y)
+        scores = {}
+        for split, (held_x, held_y, count) in zip(('heldout', 'valid'), parts[1:]):
+            probabilities = model.predict_proba(held_x[:, feature_cols])
+            expectation = probabilities @ np.arange(len(args.levels))
+            ranking = ranking_diagnostics(torch.from_numpy(
+                expectation.reshape(len(args.levels), count).T))
+            scores[split] = dict(accuracy=float((probabilities.argmax(1) == held_y).mean()),
+                                 ranking=ranking, n_anchors=count,
+                                 split='npz_valid' if split == 'valid' else 'ssl_train_holdout')
+        family_results[family] = scores
+    original = family_results['all_statistics']['heldout']
     return dict(features='per-neuron mean/std/lag1 covariance/difference energy',
-                heldout_accuracy=float((probabilities.argmax(1) == held_y).mean()),
-                class_chance=1 / len(args.levels), heldout_ranking=ranking,
-                interpretation='A successful nuisance probe demonstrates a shortcut is available; '
-                               'a failed probe does not establish shortcut freedom.')
+                heldout_accuracy=original['accuracy'],
+                class_chance=1 / len(args.levels),
+                heldout_ranking=original['ranking'],
+                feature_family_probes=family_results,
+                interpretation=('Probe demonstrates how much corruption level can be recovered from '
+                                'simple nuisance features. High accuracy provides a viable shortcut, '
+                                'NOT direct evidence the TCN uses that shortcut. '
+                                'Validation is a development split, not an independent final test.'))
 
 
 @torch.inference_mode()
@@ -634,7 +691,19 @@ def evaluate_checkpoint(model, data, args, device, root, architecture, seed, arm
         pretrained_sha = state_digest(model.state_dict())
         z_train = extract_embeddings(model, data['train'], args.decode_spaces, device, args.encoder_eval_batch)
         z_valid = extract_embeddings(model, data['valid'], args.decode_spaces, device, args.encoder_eval_batch)
-        save_json(folder / 'pretext.json', pretext_diagnostics(model, data, args, seed, device))
+        pretext = pretext_diagnostics(model, data, args, seed, device)
+        save_json(folder / 'pretext.json', pretext)
+        if 'valid_seen_strengths' in pretext and 'z_ranking' in pretext['valid_seen_strengths']:
+            fit_pair = pretext['heldout_seen_strengths']['z_ranking']['pair_accuracy']
+            valid_pair = pretext['valid_seen_strengths']['z_ranking']['pair_accuracy']
+            unseen_pair = pretext['valid_unseen_strengths']['z_ranking']['pair_accuracy']
+            raw_pair = pretext['valid_seen_strengths']['raw_l2_ranking']['pair_accuracy']
+            z_geometry = pretext['valid_seen_strengths']['z_clean_geometry']
+            print(f'  PRETEXT {architecture}/{arm} seed={seed} step={step}: '
+                  f'ssl_heldout_pair_z={fit_pair:.4f} npz_valid_pair_z={valid_pair:.4f} '
+                  f'npz_valid_unseen_pair_z={unseen_pair:.4f} '
+                  f'npz_valid_raw_l2_pair={raw_pair:.4f} '
+                  f'npz_valid_z_effective_rank={z_geometry["effective_rank"]:.2f}', flush=True)
         metadata = dict(session=args.session, seed=seed, architecture=architecture, arm=arm,
                         iteration=step, label_use='encoder:none; decoder:all columns',
                         init_sha256=init_sha, encoder_sha256=pretrained_sha,
@@ -935,11 +1004,17 @@ def summarize(root, args, plots=False):
             entry['valid_unpadded_mean_r2'] = row['valid_unpadded']['mean_r2']
         if row.get('pretext_path') and Path(row['pretext_path']).exists():
             pretext = json.loads(Path(row['pretext_path']).read_text())
-            for name in ('heldout_seen_strengths', 'heldout_unseen_strengths'):
+            for name in ('heldout_seen_strengths', 'heldout_unseen_strengths',
+                         'valid_seen_strengths', 'valid_unseen_strengths'):
+                if name not in pretext or 'z_ranking' not in pretext[name]:
+                    continue
                 rank = pretext[name]['z_ranking']
                 entry[name + '_pair_accuracy'] = rank['pair_accuracy']
                 entry[name + '_tie_fraction'] = rank['tie_fraction']
                 entry[name + '_full_order_accuracy'] = rank['full_order_accuracy']
+                entry[name + '_raw_l2_pair_accuracy'] = pretext[name]['raw_l2_ranking']['pair_accuracy']
+                entry[name + '_z_effective_rank'] = pretext[name]['z_clean_geometry']['effective_rank']
+                entry[name + '_z_mean_std'] = pretext[name]['z_clean_geometry']['mean_std']
         flat.append(entry)
         key = (row['architecture'], row['arm'], row['iteration'], row['feature_space'])
         groups.setdefault(key, []).append(row)
@@ -1416,6 +1491,3 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
-
-
-
