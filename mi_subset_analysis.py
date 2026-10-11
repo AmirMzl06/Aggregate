@@ -112,6 +112,8 @@ def main():
     p.add_argument("--session", type=str, default="C-CO12")
     p.add_argument("--npz", type=str, default="", help="overrides --session")
     p.add_argument("--n_b", type=int, default=16, help="neurons in the reference population B")
+    p.add_argument("--b_frac", type=float, default=0.0,
+                   help="if > 0, |B| = round(b_frac * active neurons) (overrides --n_b; use it across sessions)")
     p.add_argument("--ks", type=str, default="5,10,20,40,60,70,80", help="nested subset sizes of A")
     p.add_argument("--b_draws", type=int, default=5, help="random reference populations B")
     p.add_argument("--reps", type=int, default=20, help="random orders of A per B (nested prefixes)")
@@ -131,8 +133,11 @@ def main():
                                                                 args.min_valid_std)
     print(f"dropped {dropped} neurons (silent in train or nearly silent in valid), "
           f"{dropped_y} constant behavior dims")
-    ks = [k for k in (int(s) for s in args.ks.split(",")) if k <= n - args.n_b]
-    print(f"{n} active neurons -> |B| = {args.n_b}, |A| = {n - args.n_b}, subset sizes {ks}")
+    if args.b_frac > 0:
+        args.n_b = max(2, int(round(args.b_frac * n)))
+    n_a = n - args.n_b
+    ks = sorted({k for k in (int(s) for s in args.ks.split(",")) if k < n_a} | {n_a})  # always include all of A
+    print(f"{n} active neurons -> |B| = {args.n_b}, |A| = {n_a}, subset sizes {ks}")
 
     rng = np.random.default_rng(args.seed)
     shape = (args.b_draws, args.reps, len(ks))
