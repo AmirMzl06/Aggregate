@@ -66,20 +66,30 @@ def load_data(npz_path):
     return tuple(np.ascontiguousarray(a) for a in (x_train, x_valid, y_train, y_valid))
 
 
-def preprocess(x_tr, x_va, y_tr, y_va, sigma, lag):
-    """Gaussian smoothing over time, drop silent neurons, z-score with train statistics, apply lag."""
+def preprocess(x_tr, x_va, y_tr, y_va, sigma, lag, min_valid_std):
+    """Gaussian smoothing over time, drop silent neurons, z-score with train statistics, apply lag.
+
+    A neuron is dropped if it is silent in train, or if (after z-scoring with train statistics) its
+    std in valid is below min_valid_std: a neuron that (almost) stops firing in valid has ~zero target
+    variance there and makes log det Cov(B) blow up to a huge negative number.
+    """
     if sigma > 0:
         x_tr = gaussian_filter1d(x_tr, sigma, axis=0)
         x_va = gaussian_filter1d(x_va, sigma, axis=0)
-    keep = x_tr.std(0) > 1e-6
+    sd_tr = x_tr.std(0)
+    keep = (sd_tr > 1e-6) & (x_va.std(0) > min_valid_std * np.maximum(sd_tr, 1e-6))
+    dropped = int((~keep).sum())
     x_tr, x_va = x_tr[:, keep], x_va[:, keep]
     mu, sd = x_tr.mean(0), x_tr.std(0)
     x_tr, x_va = (x_tr - mu) / sd, (x_va - mu) / sd
+    keep_y = y_va.std(0) > 1e-6  # constant behavior dims carry no information
+    y_tr, y_va = y_tr[:, keep_y], y_va[:, keep_y]
     ymu, ysd = y_tr.mean(0), y_tr.std(0) + 1e-8
     y_tr, y_va = (y_tr - ymu) / ysd, (y_va - ymu) / ysd
     if lag > 0:  # neural activity at t predicts behavior at t + lag
         x_tr, y_tr, x_va, y_va = x_tr[:-lag], y_tr[lag:], x_va[:-lag], y_va[lag:]
-    return x_tr.astype(np.float64), x_va.astype(np.float64), y_tr.astype(np.float64), y_va.astype(np.float64), int(keep.sum())
+    return (x_tr.astype(np.float64), x_va.astype(np.float64), y_tr.astype(np.float64), y_va.astype(np.float64),
+            int(keep.sum()), dropped, int((~keep_y).sum()))
 
 
 def logdet_cov(z, eps=1e-6):
@@ -108,6 +118,8 @@ def main():
     p.add_argument("--sigma", type=float, default=2.0, help="Gaussian smoothing in bins (0 = off)")
     p.add_argument("--lag", type=int, default=0, help="behavior lag in bins (neural leads behavior)")
     p.add_argument("--alpha", type=float, default=1e-3, help="ridge strength (relative to n samples)")
+    p.add_argument("--min_valid_std", type=float, default=0.2,
+                   help="drop neurons whose valid std is below this fraction of their train std")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_dir", type=str, default="mi_analysis")
     args = p.parse_args()
@@ -115,7 +127,10 @@ def main():
     npz = Path(args.npz) if args.npz else PERICH_DATA_DIR / f"{args.session}.npz"
     x_tr, x_va, y_tr, y_va = load_data(npz)
     print(f"{npz.name}: train {x_tr.shape}, valid {x_va.shape}, behavior dims {y_tr.shape[1]}")
-    x_tr, x_va, y_tr, y_va, n = preprocess(x_tr, x_va, y_tr, y_va, args.sigma, args.lag)
+    x_tr, x_va, y_tr, y_va, n, dropped, dropped_y = preprocess(x_tr, x_va, y_tr, y_va, args.sigma, args.lag,
+                                                                args.min_valid_std)
+    print(f"dropped {dropped} neurons (silent in train or nearly silent in valid), "
+          f"{dropped_y} constant behavior dims")
     ks = [k for k in (int(s) for s in args.ks.split(",")) if k <= n - args.n_b]
     print(f"{n} active neurons -> |B| = {args.n_b}, |A| = {n - args.n_b}, subset sizes {ks}")
 
