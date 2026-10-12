@@ -52,6 +52,9 @@ def get_parser():
     p.add_argument("--fixed_b", action="store_true", help="one B for the whole training (Exp. 1 control)")
     p.add_argument("--levels", type=str, default="1,0.5,0.25,0.125", help="fractions of A, largest first")
     p.add_argument("--k_min", type=int, default=4)
+    p.add_argument("--subset_per", type=str, default="sample", choices=["sample", "batch"],
+                   help="sample: every time point gets its own random nested subsets; batch: one set of "
+                        "nested subsets shared by the whole batch (as in mi_subset_analysis.py)")
     p.add_argument("--decoy", type=str, default="time", choices=["time", "zero", "drop"],
                    help="time: activity of the same neuron from another time (default); zero: constant "
                         "input (size visible); drop: smaller sets, no decoys (the original proposal)")
@@ -72,6 +75,9 @@ def get_parser():
     p.add_argument("--margin", type=float, default=0.05, help="ranking margin in nats")
     p.add_argument("--rank_order", type=str, default="correct", choices=["correct", "shuffled"],
                    help="shuffled: random order of the levels in the ranking term (Exp. 5 control)")
+    p.add_argument("--null_shift", type=int, default=360,
+                   help="diagnostic only: MI of the full level with B shifted by this many bins (slow, "
+                        "not time-specific shared structure) and with B rows permuted (finite-sample floor)")
     p.add_argument("--mi_eps", type=float, default=1e-2, help="shrinkage of the correlation matrices (1e-3 + lr 1e-3 + bf16 collapsed)")
     # optimization
     p.add_argument("--steps", type=int, default=5000)
@@ -185,11 +191,19 @@ class SessionData:
         bad = (td < 0) | (td >= T)
         return torch.where(bad, ts[:, None] - sign * mag, td).clamp(0, T - 1)
 
-    def train_batch(self, n, b_idx, a_idx, ks, decoy, gap, max_gap, gen):
-        """Returns (inputs per level, neuron ids per level, reference activity (n, |B|), real-count mask info)."""
+    def train_batch(self, n, b_idx, a_idx, ks, decoy, gap, max_gap, gen, decoy_gen=None, subset_per="sample"):
+        """Returns (inputs per level, neuron ids per level, reference activity (n, |B|), time points).
+
+        gen draws the time points and the subsets; decoy times use decoy_gen, so conditions that differ only
+        in the decoy type see exactly the same time points and subsets.
+        """
         dev, n_a = self.device, len(a_idx)
+        decoy_gen = gen if decoy_gen is None else decoy_gen
         ts = torch.randint(0, self.T_tr, (n,), device=dev, generator=gen)
-        order = torch.argsort(torch.rand(n, n_a, device=dev, generator=gen), dim=1)
+        if subset_per == "batch":
+            order = torch.argsort(torch.rand(1, n_a, device=dev, generator=gen), dim=1).expand(n, n_a)
+        else:
+            order = torch.argsort(torch.rand(n, n_a, device=dev, generator=gen), dim=1)
         neurons = a_idx[order]  # (n, |A|): per-sample random order of A; prefixes = nested real subsets
         target = self.ref_tr[ts][:, b_idx]
         if decoy == "drop":
@@ -197,7 +211,7 @@ class SessionData:
             return xs, [neurons[:, :k] for k in ks], target, ts
         real = self.windows(self.xp_tr, ts[:, None].expand(n, n_a), neurons)
         if decoy == "time":
-            fake = self.windows(self.xp_tr, self.decoy_times(ts, (n, n_a), gap, max_gap, gen), neurons)
+            fake = self.windows(self.xp_tr, self.decoy_times(ts, (n, n_a), gap, max_gap, decoy_gen), neurons)
         else:  # zero = the z-scored mean, a constant window
             fake = torch.zeros_like(real)
         pos = torch.arange(n_a, device=dev)
@@ -226,6 +240,12 @@ class SessionData:
 # =====================================================================
 # probes
 # =====================================================================
+def tapped(x, taps):
+    """(T, N) -> (T, len(taps) * N): x at t + tap for every tap (clamped at the edges)."""
+    idx = (torch.arange(len(x), device=x.device)[:, None] + torch.tensor(taps, device=x.device)).clamp(0, len(x) - 1)
+    return x[idx].reshape(len(x), -1)
+
+
 def _r2(y, p):
     return 1.0 - ((y - p) ** 2).sum(0) / ((y - y.mean(0)) ** 2).sum(0).clamp_min(1e-12)
 
@@ -330,9 +350,14 @@ def main(argv=None):
           f"rank_weight = {args.rank_weight}, order = {args.rank_order}, mi_levels = {args.mi_levels}, "
           f"fixed_b = {args.fixed_b}")
 
+    # separate random streams: conditions that differ only in decoy type / ranking order see the same
+    # reference populations, time points and subsets
     gen = torch.Generator(device=device).manual_seed(args.seed)
+    gen_decoy = torch.Generator(device=device).manual_seed(args.seed + 1000)
+    gen_shuffle = torch.Generator(device=device).manual_seed(args.seed + 2000)
+    gen_fixed = torch.Generator(device=device).manual_seed(args.seed + 3000)
     all_ids = torch.arange(n, device=device)
-    fixed_b = torch.randperm(n, device=device, generator=gen)[:n_b] if args.fixed_b else None
+    fixed_b = torch.randperm(n, device=device, generator=gen_fixed)[:n_b] if args.fixed_b else None
     model = NeuronSetEncoder(n, args.window, args.d_tok, args.conv_channels, args.n_layers, args.n_heads,
                              args.n_queries, args.d_out, args.dropout).to(device)
     print(f"encoder: {sum(p.numel() for p in model.parameters()) / 1e3:.1f}k parameters")
@@ -349,8 +374,12 @@ def main(argv=None):
                                for _ in range(args.eval_subsets)]
 
     raw_r2, raw_dims, _ = ridge_r2(data.ref_tr, data.y_tr, data.ref_va, data.y_va)
+    # same temporal context as the encoder: the smoothed neurons at 6 taps covering the 36-bin window
+    taps = list(range(-data.half, args.window - data.half, max(1, args.window // 6)))
+    raw_win_r2, raw_win_dims, _ = ridge_r2(tapped(data.ref_tr, taps), data.y_tr, tapped(data.ref_va, taps), data.y_va)
     init = evaluate(model, data, eval_sets, amp)
-    print(f"[baseline] raw neurons ridge R2 = {raw_r2:.4f} | random-init encoder R2 = {init['r2_all']:.4f}"
+    print(f"[baseline] raw neurons ridge R2 = {raw_r2:.4f} | raw neurons over the window ({len(taps)} taps) "
+          f"R2 = {raw_win_r2:.4f} | random-init encoder R2 = {init['r2_all']:.4f}"
           + (f" (subset avg {init['r2_subset']:.4f})" if "r2_subset" in init else ""))
     history = {"log": [], "eval": [{"step": 0, **init}]}
 
@@ -360,8 +389,8 @@ def main(argv=None):
     for step in range(1, args.steps + 1):
         b_idx = fixed_b if fixed_b is not None else torch.randperm(n, device=device, generator=gen)[:n_b]
         a_idx = all_ids[~torch.isin(all_ids, b_idx)]
-        xs, ids, target, _ = data.train_batch(args.batch, b_idx, a_idx, ks, args.decoy, gap,
-                                              args.decoy_max_gap, gen)
+        xs, ids, target, ts = data.train_batch(args.batch, b_idx, a_idx, ks, args.decoy, gap,
+                                               args.decoy_max_gap, gen, gen_decoy, args.subset_per)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             if args.decoy == "drop":  # different set sizes: one forward per level
                 zs = [model(x, i) for x, i in zip(xs, ids)]
@@ -369,7 +398,7 @@ def main(argv=None):
                 zs = model(torch.cat(xs), ids[0].repeat(n_lv, 1)).split(args.batch)
         m = torch.stack([gaussian_mi(z.float(), target, args.mi_eps) for z in zs])
         loss_mi = -(m.mean() if args.mi_levels == "all" else m[0])
-        order = torch.randperm(n_lv, device=device, generator=gen) if args.rank_order == "shuffled" else None
+        order = torch.randperm(n_lv, device=device, generator=gen_shuffle) if args.rank_order == "shuffled" else None
         l_rank, viol = rank_loss(m, args.margin, order)
         loss = loss_mi + args.rank_weight * l_rank
         if not torch.isfinite(loss):
@@ -387,6 +416,12 @@ def main(argv=None):
         _, nat_viol = rank_loss(m.detach(), 0.0)
         stats = {"loss": float(loss), "loss_rank": float(l_rank), "viol": float(nat_viol)}
         stats.update({f"M{k}": float(v) for k, v in zip(ks, m.detach())})
+        with torch.no_grad():  # how much of the full-level MI is time-specific
+            z_full = zs[0].detach().float()
+            shifted = data.ref_tr[(ts + args.null_shift) % data.T_tr][:, b_idx]
+            permuted = target[torch.randperm(len(target), device=device, generator=gen_shuffle)]
+            stats["M_shift"] = float(gaussian_mi(z_full, shifted, args.mi_eps))
+            stats["M_perm"] = float(gaussian_mi(z_full, permuted, args.mi_eps))
         recent.append(stats)
         recent = recent[-200:]
         for k, v in stats.items():
@@ -399,7 +434,8 @@ def main(argv=None):
             history["log"].append(row)
             mis = " ".join(f"M{k}={row[f'M{k}']:.3f}" for k in ks)
             print(f"step {step:6d} loss {row['loss']:+.4f} rank {row['loss_rank']:.4f} wrong-order "
-                  f"{100 * row['viol']:.1f}% | {mis} | eff_rank {row['eff_rank']:.1f} ({time.time() - t0:.0f}s)")
+                  f"{100 * row['viol']:.1f}% | {mis} | shifted-B {row['M_shift']:.3f} permuted-B "
+                  f"{row['M_perm']:.3f} | eff_rank {row['eff_rank']:.1f} ({time.time() - t0:.0f}s)")
             acc = {}
         if step % args.eval_every == 0 and step < args.steps:
             ev = evaluate(model, data, eval_sets, amp)
@@ -414,7 +450,7 @@ def main(argv=None):
     summary = {
         "session": data.name, "n_neurons": n, "n_b": n_b, "n_a": n_a, "levels": ks,
         "eval_neurons": "all" if fixed_b is None else "A (fixed B excluded)",
-        "raw_r2": raw_r2, "raw_r2_dims": raw_dims,
+        "raw_r2": raw_r2, "raw_r2_dims": raw_dims, "raw_window_r2": raw_win_r2, "raw_window_r2_dims": raw_win_dims,
         "init_r2_all": init["r2_all"], "init_r2_subset": init.get("r2_subset"),
         "final_r2_all": final["r2_all"], "final_r2_subset": final.get("r2_subset"),
         "final_r2_all_dims": final["r2_all_dims"],
@@ -428,6 +464,7 @@ def main(argv=None):
     print("\n" + "=" * 70)
     print(f"{data.name} | ridge R2 on valid (behavior dims averaged)")
     print(f"  raw neurons (smoothed)         : {raw_r2:.4f}")
+    print(f"  raw neurons over the window    : {raw_win_r2:.4f}")
     print(f"  random-init encoder            : {init['r2_all']:.4f}")
     print(f"  trained encoder, all neurons   : {final['r2_all']:.4f}")
     if "r2_subset" in final:
@@ -436,6 +473,7 @@ def main(argv=None):
         print(f"  trained encoder, MLP probe     : {final['mlp_r2_all']:.4f}")
     if last:
         print("  last 200 steps: " + " ".join(f"M{k}={last[f'M{k}']:.3f}" for k in ks)
+              + f" | shifted-B {last['M_shift']:.3f} | permuted-B {last['M_perm']:.3f}"
               + f" | wrong-order pairs {100 * last['viol']:.1f}%")
     print(f"saved {out_dir}/final.json, history.json, model.pt")
     return summary
