@@ -23,6 +23,7 @@ CONDITIONS = [
     ("mi_full",       "--mi_levels full",          "MI only on the full level, other levels only ranked"),
     ("decoy_zero",    "--decoy zero",              "no 'resize': missing neurons are constant (size visible)"),
     ("decoy_drop",    "--decoy drop",              "no 'resize': smaller sets (original proposal)"),
+    ("drop_no_rank",  "--decoy drop --rank_weight 0", "smaller sets, no ranking (2x2 with main / no_rank / decoy_drop)"),
     ("fixed_b",       "--fixed_b",                 "Exp. 1: one fixed reference population B"),
 ]
 # one or two sessions per monkey / task, small and large (J has < 40 neurons and is left out)
@@ -106,6 +107,7 @@ def summary(args):
 
     first = {s: next((res[(s, c)] for c, _, _ in conds if (s, c) in res), None) for s in sessions}
     rows.append(line("raw neurons", lambda s: first[s]["raw_r2"] if first[s] else None) + (None,))
+    rows.append(line("raw window", lambda s: first[s].get("raw_window_r2") if first[s] else None) + (None,))
     rows.append(line("random init", lambda s: first[s]["init_r2_all"] if first[s] else None) + (None,))
     for c, _, _ in conds:
         name, vals, mean = line(c, lambda s, c=c: res[(s, c)]["final_r2_all"] if (s, c) in res else None)
@@ -116,18 +118,24 @@ def summary(args):
               + f"{mean:9.4f}" + (f"{gain:+8.4f}" if gain is not None else f"{'':>8s}"))
 
     print("\nsubset-averaged embedding (|A|-sized random neuron sets), and training diagnostics (mean over sessions)")
-    print(f"{'condition':<15s}{'R2 subset':>10s}{'wrong-order %':>15s}  MI per level (nats, last 200 steps)")
+    print(f"{'condition':<15s}{'R2 subset':>10s}{'wrong-order %':>15s}{'shifted-B':>11s}{'perm-B':>8s}"
+          f"  MI per level (nats, last 200 steps)")
     for c, _, _ in conds:
         runs = [res[(s, c)] for s in sessions if (s, c) in res]
         if not runs:
             continue
         sub = [r["final_r2_subset"] for r in runs if r.get("final_r2_subset") is not None]
         viol = [r["train_last200"].get("viol") for r in runs if r.get("train_last200")]
-        mis = [[v for k, v in r["train_last200"].items() if k.startswith("M")] for r in runs if r.get("train_last200")]
+        mis = [[v for k, v in r["train_last200"].items() if k.startswith("M") and k[1:].isdigit()]
+               for r in runs if r.get("train_last200")]
+        shift = [r["train_last200"].get("M_shift") for r in runs if r.get("train_last200", {}).get("M_shift") is not None]
+        perm = [r["train_last200"].get("M_perm") for r in runs if r.get("train_last200", {}).get("M_perm") is not None]
         n_lv = min((len(m) for m in mis), default=0)
         mi_mean = [sum(m[i] for m in mis) / len(mis) for i in range(n_lv)]
         print(f"{c:<15s}" + (f"{sum(sub) / len(sub):10.4f}" if sub else f"{'-':>10s}")
               + (f"{100 * sum(viol) / len(viol):15.1f}" if viol else f"{'-':>15s}")
+              + (f"{sum(shift) / len(shift):11.3f}" if shift else f"{'-':>11s}")
+              + (f"{sum(perm) / len(perm):8.3f}" if perm else f"{'-':>8s}")
               + "  " + " ".join(f"{v:.3f}" for v in mi_mean))
 
     path = os.path.join(args.root, "summary.csv")
