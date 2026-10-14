@@ -1,28 +1,24 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Acorn-dprime Exp3: 12 independent models per seed on 4 CUDA GPUs.
 
-"""C-CO12: four-arm d'-APGD controlled ablation on FOUR independent GPUs.
+Run this script once per seed (42, 43, 44), using a DIFFERENT persistent
+--output-dir for each seed: total 12 x 3 = 36 models.
 
-Four runs (one per GPU):
-    MADRY_FIXED1
-    MADRY_AUTO_INSTANCE
-    TRADES_FIXED1
-    TRADES_AUTO_INSTANCE
+Models: CLEAN, PGD_L2_EPS3, MADRY_D{0,1,3,8},
+TRADES_D{0,1,3,8}, TRADES_ISO_D{1,3}.
 
-Everything besides objective (Madry / TRADES) and epsilon mode
-(fixed d'=1 / auto instance-adaptive) is held constant.
+D0 means epsilon=1e-6, not literally zero. TRADES_D0 thus probes
+(dropout) consistency, not an exact no-attack control.
 
-TRAIN: CEBRA.fit(x_train) only. Labels used ONLY by decoder.
-Original architecture/decoder hyperparameters and seed 42 are preserved.
-Each experiment immediately saves an atomic JSON record, a full dprime report,
-and refreshed results.csv/results.txt to a persistent directory.
+Only neural x_train is used in CEBRA.fit; behavioral labels are used
+for the downstream MLP decoder and validation R2 only.
 
-Usage (must have FOUR GPUs allocated):
-    python -u dprime_ablation_4gpu.py --gpu-workers 4 --resume
-
-Do not mix this output with earlier 24-model results. No clean model is run.
-WARNING: "auto instance" does not guarantee different realized epsilons:
-when NN constraints do not bind, all windows can have epsilon=1.
+Every completed model writes its own atomic record + dprime report,
+then refreshes results.csv/results.txt on a mounted persistent home PVC.
+Resume reuses successful records with the same manifest; never reuse
+this output directory with a changed fork/script/seed.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -57,7 +53,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_FORK_DIR = ROOT / "Acorn-dprime"
 DEFAULT_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 DEFAULT_SESSION = "C-CO12"
-DEFAULT_RESULTS_DIR = ROOT / "DPRIME_CCO12_ABLATION_4MODELS"
+DEFAULT_RESULTS_DIR = ROOT / "DPRIME_CCO12_EXP3_SEED42"
 
 SEED = 42
 PGD_EPS = 3.0
@@ -87,22 +83,22 @@ class Experiment:
 
 
 def experiments() -> List[Experiment]:
-    """Strict 2x2 design: objective x budget choice, all else held fixed.
+    """Exp3: 12 arms/seed to disentangle TRADES, dropout consistency,
+    attack budget, and covariance-aware versus isotropic d-prime geometry.
 
-    Both fixed and auto use the exact same stationary d'-APGD geometry,
-    Ledoit-Wolf/Welch noise model, no guards, 1 restart, beta=6,
-    and warmup/curriculum set to zero. In the Acorn fork current_epsilon()
-    still uses min(0.25, eps_star) for the first training step.
+    The nearly-zero control uses d-prime epsilon=1e-6 (not exactly zero).
+    All d-prime arms share APGD, 1 restart, no guards, no warmup/curriculum.
+    The clean baseline uses standard CEBRA (time-only). 
     """
     common = dict(
         adv_epsilon_mode="dprime",
         adv_dprime_layer="stationary",
-        adv_dprime_jnd=1.0,
-        adv_dprime_residuals="whole",  # No behavior labels used by CEBRA.
+        adv_dprime_residuals="whole",
         adv_dprime_spatial="ledoit_wolf",
         adv_dprime_temporal="welch",
         adv_dprime_optimizer="apgd",
         adv_dprime_restarts=1,
+        adv_dprime_instance_adaptive=False,
         adv_dprime_guards=(),
         adv_dprime_guard_mode="off",
         adv_dprime_warmup=0.0,
@@ -110,20 +106,29 @@ def experiments() -> List[Experiment]:
         adv_dprime_trades_beta=6.0,
     )
 
-    def arm(name: str, objective: str, epsilon: Any, adaptive: bool) -> Experiment:
-        return Experiment(name=name, overrides={
-            **common,
-            "adv_dprime_objective": objective,
-            "adv_dprime_epsilon": epsilon,
-            "adv_dprime_instance_adaptive": adaptive,
-        }, core=True)
+    def arm(name: str, **kw: Any) -> Experiment:
+        return Experiment(name=name, overrides={**common, **kw}, core=True)
 
-    return [
-        arm("MADRY_FIXED1", "madry", 1.0, False),
-        arm("MADRY_AUTO_INSTANCE", "madry", "auto", True),
-        arm("TRADES_FIXED1", "trades", 1.0, False),
-        arm("TRADES_AUTO_INSTANCE", "trades", "auto", True),
+    result = [
+        Experiment("CLEAN", {"training_mode": "standard"}, True),
+        Experiment("PGD_L2_EPS3", {
+            "training_mode": "adversarial",
+            "adv_epsilon_mode": "constant",
+            "attack_norm": "l2",
+        }, True),
     ]
+    for objective in ("madry", "trades"):
+        for tag, budget in (("0", 1e-6), ("1", 1.0), ("3", 3.0), ("8", 8.0)):
+            result.append(arm(f"{objective.upper()}_D{tag}",
+                              adv_dprime_objective=objective,
+                              adv_dprime_epsilon=budget))
+    for tag, budget in (("1", 1.0), ("3", 3.0)):
+        result.append(arm(f"TRADES_ISO_D{tag}",
+                          adv_dprime_objective="trades",
+                          adv_dprime_epsilon=budget,
+                          adv_dprime_spatial="isotropic",
+                          adv_dprime_temporal="white"))
+    return result
 
 
 def seed_all(seed: int) -> None:
@@ -162,6 +167,10 @@ def load_fork(fork_dir: Path):
     missing = sorted(required - set(params))
     if missing:
         raise RuntimeError(f"This fork lacks Acorn-dprime parameters: {missing}")
+    from cebra.dprime.noise import SPATIAL_ESTIMATORS
+    if "isotropic" not in SPATIAL_ESTIMATORS:
+        raise RuntimeError("This is an OLD Acorn-dprime fork; Exp3 needs isotropic covariance."
+                           " Extract the newly supplied Acorn-dprime ZIP.")
     return cebra
 
 
@@ -271,7 +280,9 @@ def epsilon_summary(report: Optional[Dict[str, Any]]) -> str:
     e = report.get("epsilon", {})
     nn = report.get("eps_nn", {})
     t = report.get("training", {})
-    return (f"eps_star={e.get('eps_star')} "
+    dist = t.get("epsilon_per_reference", {}) or {}
+    return (f"eps_dist={dist} "
+            f"eps_star={e.get('eps_star')} "
             f"source={e.get('source')} "
             f"eps_NN={nn.get('value')} "
             f"NN_binding={t.get('eps_nn_binding_rate')} "
@@ -326,7 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="List selected arms without fitting")
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--epsilon", type=float, default=PGD_EPS,
-                   help="Unused for dprime arms (kept for compatibility with previous runner)")
+                   help="Original input-space PGD L2 baseline epsilon (default 3)")
     p.add_argument("--max-iterations", type=int, default=MAX_ITER)
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     p.add_argument("--mlp-epochs", type=int, default=MLP_EPOCHS)
@@ -446,6 +457,12 @@ def config_manifest(args, selected: List[Experiment]) -> dict:
     return json.loads(json.dumps({
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "fork_dir": str(args.fork_dir.resolve()),
+        "fork_fingerprints": {
+            rel: hashlib.sha256((args.fork_dir / rel).read_bytes()).hexdigest()
+            for rel in ("cebra/distributions/base.py", "cebra/dprime/training.py",
+                        "cebra/dprime/noise.py", "cebra/dprime/attacks.py",
+                        "cebra/integrations/sklearn/cebra.py")
+        },
         "data_path": str(data_path),
         "session": args.session,
         "seed": args.seed,
