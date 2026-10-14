@@ -1,30 +1,33 @@
-"""C-CO12: compare raw PGD (L2 / Linf, epsilon=3) against Acorn-dprime ideas.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""C-CO12: 4-GPU parallel Acorn-dprime comparison with crash-safe results.
 
-Place NEXT TO the folder Acorn-dprime and run:
-    python run_CCO12_Acorn_dprime_all.py
+Place next to Acorn-dprime/ and execute on a node/pod ALLOCATED FOUR GPUs:
+    python -u dprime_4gpu.py --gpu-workers 4
 
-By default the comprehensive suite runs. Optional:
-    python run_CCO12_Acorn_dprime_all.py --suite core
-    python run_CCO12_Acorn_dprime_all.py --list
-    python run_CCO12_Acorn_dprime_all.py --only DPRIME_AUTO_INSTANCE DPRIME_TRIAL_MASK
-    python run_CCO12_Acorn_dprime_all.py --report-eps
+24 DISTINCT experiments: original raw PGD L2/Linf eps=3 and 22 dprime arms.
+Each worker is a SEPARATE subprocess that sees exactly one GPU, so the four
+independent experiments run concurrently. This is NOT multi-GPU data-parallel
+training of a single encoder. All results are persisted after EACH experiment
+under --output-dir (default: DPRIME_CCO12_4GPU_RESULTS beside this script).
 
-The results are printed as each run finishes. No models, checkpoints, CSVs,
-plots, predictions or other result files are saved by this runner.
+If a workload is interrupted, restart the SAME script using --resume and
+--output-dir pointing to the old, persistent directory. Completed records
+are skipped; failed/incomplete ones are retried. Runs with different settings
+must use different output directories.
 
-IMPORTANT: Acorn-dprime implements d' attacks using a WHITENED L2 budget.
-The `attack_norm` parameter is NOT USED in d' mode. Therefore it is wrong
-(and redundant) to run d' as if it supported both ordinary L2 and Linf.
-Both norms ARE exercised for the original PGD epsilon=3 baselines.
-
-The encoder is fitted on x_train ALONE (time-only). Behavioral labels are
-used only by the decoder, unlike the reference SVD runner which passed them
-into CEBRA.fit(). This is intentional to avoid behavioral-label leakage.
+IMPORTANT: Acorn-dprime uses whitened L2 in dprime mode, regardless of
+attack_norm. Raw baselines support L2 and Linf; dprime-Linf is NOT implemented.
+Data-only CEBRA.fit(x_train); y_train goes only to the downstream decoder.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+from datetime import datetime, timezone
+import hashlib
 import contextlib
 from dataclasses import dataclass, field
 import gc
@@ -32,6 +35,12 @@ import inspect
 import os
 from pathlib import Path
 import random
+import queue
+import subprocess
+import tempfile
+import threading
+import time
+import traceback
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +55,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_FORK_DIR = ROOT / "Acorn-dprime"
 DEFAULT_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 DEFAULT_SESSION = "C-CO12"
+DEFAULT_RESULTS_DIR = ROOT / "DPRIME_CCO12_4GPU_RESULTS"
 
 SEED = 42
 PGD_EPS = 3.0
@@ -358,29 +368,321 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default=DEVICE)
     p.add_argument("--report-eps", action="store_true",
                    help="Print dprime calibration diagnostics to stderr after each run")
+    p.add_argument("--gpu-workers", type=int, default=4,
+                   help="Number of independently allocated GPUs to use (default 4)")
+    p.add_argument("--cpu-threads", type=int, default=2,
+                   help="CPU threads per GPU subprocess (default 2)")
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_RESULTS_DIR,
+                   help="PERSISTENT results directory. MUST reside on a shared/host volume")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip successful experiment records, retry interrupted/failed runs")
     p.add_argument("--continue-on-error", action="store_true",
-                   help="Keep running remaining arms if an individual arm fails")
+                   help="Kept for CLI compatibility; the 4-GPU suite always records each error and continues")
+    # Internal worker arguments; not intended for direct use.
+    p.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--_experiment", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_gpu_slot", type=int, default=-1, help=argparse.SUPPRESS)
     return p
 
 
-def main():
-    args = build_parser().parse_args()
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Commit one entire file; readers see either old or new version."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2,
+                                       allow_nan=False, sort_keys=True) + "\n")
+
+
+def record_path(root: Path, name: str) -> Path:
+    if not name.replace("_", "").isalnum():
+        raise ValueError(f"Unsafe experiment name: {name!r}")
+    return root / "records" / f"{name}.json"
+
+
+def read_record(root: Path, name: str):
+    path = record_path(root, name)
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if obj.get("experiment") != name:
+        raise RuntimeError(f"Mismatched record in {path}")
+    return obj
+
+
+def write_snapshots(root: Path, selected: List[Experiment]) -> None:
+    """Consolidate atomic per-arm records into CSV and readable text."""
+    import io
+    rows = []
+    summaries = []
+    for exp in selected:
+        record = read_record(root, exp.name)
+        if record is None:
+            continue
+        rows.append({
+            "experiment": exp.name,
+            "status": record.get("status", "unknown"),
+            "r2": record.get("r2", ""),
+            "gpu_slot": record.get("gpu_slot", ""),
+            "cuda_visible_devices": record.get("cuda_visible_devices", ""),
+            "elapsed_seconds": record.get("elapsed_seconds", ""),
+            "finished_utc": record.get("finished_utc", ""),
+            "epsilon_summary": record.get("epsilon_summary", ""),
+            "error": record.get("error", ""),
+        })
+        if record.get("status") == "success":
+            summaries.append(f"{exp.name}: R2 = {record['r2']:.6f}"
+                             f" | GPU slot {record.get('gpu_slot')}"
+                             f" | elapsed {record.get('elapsed_seconds',0):.1f}s")
+        else:
+            summaries.append(f"{exp.name}: ERROR: {record.get('error')}")
+    stream = io.StringIO()
+    fields = ["experiment", "status", "r2", "gpu_slot", "cuda_visible_devices",
+              "elapsed_seconds", "finished_utc", "epsilon_summary", "error"]
+    writer = csv.DictWriter(stream, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_write_text(root / "results.csv", stream.getvalue())
+    atomic_write_text(root / "results.txt", "\n".join(summaries) + ("\n" if summaries else ""))
+
+
+def selected_experiments(args):
     all_exp = experiments()
     names = {e.name for e in all_exp}
-    if args.list:
-        for e in all_exp:
-            print(f"{e.name} [{'core' if e.core else 'all'}]")
-        return 0
     if args.only:
         unknown = sorted(set(args.only) - names)
         if unknown:
             raise ValueError(f"Unknown experiments: {unknown}; inspect --list")
-        selected = [e for e in all_exp if e.name in set(args.only)]
-    elif args.suite == "core":
-        selected = [e for e in all_exp if e.core]
-    else:
-        selected = all_exp
+        return [e for e in all_exp if e.name in set(args.only)]
+    if args.suite == "core":
+        return [e for e in all_exp if e.core]
+    return all_exp
 
+
+def config_manifest(args, selected: List[Experiment]) -> dict:
+    """Prevent accidentally mixing incomparable R2 values across restarts."""
+    data_path = (args.data_dir / f"{args.session}.npz").resolve()
+    return json.loads(json.dumps({
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "fork_dir": str(args.fork_dir.resolve()),
+        "data_path": str(data_path),
+        "session": args.session,
+        "seed": args.seed,
+        "epsilon": args.epsilon,
+        "batch_size": args.batch_size,
+        "max_iterations": args.max_iterations,
+        "mlp_epochs": args.mlp_epochs,
+        "architecture": ARCH,
+        "latent_dim": LATENT_DIM,
+        "hidden": HIDDEN,
+        "temperature": TEMPERATURE,
+        "attack_steps": ATTACK_STEPS,
+        "experiments": [{"name": exp.name, "overrides": exp.overrides}
+                        for exp in selected],
+    }, sort_keys=True))
+
+
+def gpu_tokens(workers: int) -> list[str]:
+    if workers < 1:
+        raise ValueError("--gpu-workers must be at least 1")
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA GPU available in this RunAI container")
+    count = torch.cuda.device_count()
+    if count < workers:
+        raise RuntimeError(f"Requested {workers} GPU workers but only {count} CUDA devices visible. "
+                           "Submit RunAI job with --gpu 4 and check GPU allocation.")
+    visibility = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visibility and visibility != "-1":
+        tokens = [s.strip() for s in visibility.split(",") if s.strip()]
+        if len(tokens) < workers:
+            raise RuntimeError(f"CUDA_VISIBLE_DEVICES={visibility!r} has fewer than {workers} entries")
+        return tokens[:workers]
+    return [str(i) for i in range(workers)]
+
+
+def worker_run(args, exp: Experiment) -> int:
+    """Executed INSIDE subprocess already masked to one physical GPU."""
+    start = time.monotonic()
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError("Worker must see exactly ONE GPU; check CUDA_VISIBLE_DEVICES")
+    torch.set_num_threads(args.cpu_threads)
+    root = args.output_dir.resolve()
+    base = {
+        "experiment": exp.name,
+        "status": "error",
+        "r2": None,
+        "gpu_slot": args._gpu_slot,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "started_utc": now_utc(),
+        "finished_utc": None,
+        "elapsed_seconds": None,
+        "epsilon_summary": "",
+        "error": "",
+    }
+    try:
+        cebra = load_fork(args.fork_dir)
+        arrays = load_data(args.data_dir / f"{args.session}.npz")
+        value, report = run_one(cebra, exp, arrays, args)
+        base["status"] = "success"
+        base["r2"] = float(value)
+        if exp.overrides.get("adv_epsilon_mode") == "dprime":
+            base["epsilon_summary"] = epsilon_summary(report)
+        print(f"{exp.name}: R2 = {value:.6f}", flush=True)
+        if args.report_eps:
+            print(f"{exp.name} calibration: {base['epsilon_summary']}", flush=True)
+    except BaseException as exc:
+        base["error"] = f"{type(exc).__name__}: {exc}"
+        traceback.print_exc()
+    finally:
+        base["elapsed_seconds"] = round(time.monotonic() - start, 3)
+        base["finished_utc"] = now_utc()
+        atomic_write_json(record_path(root, exp.name), base)
+    return 0 if base["status"] == "success" else 1
+
+
+def orchestrate(args, selected: List[Experiment]) -> int:
+    root = args.output_dir.resolve()
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"--output-dir is not a directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "records").mkdir(exist_ok=True)
+    (root / "logs").mkdir(exist_ok=True)
+    manifest_path = root / "run_config.json"
+    manifest = config_manifest(args, selected)
+    if manifest_path.exists():
+        old = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if old != manifest:
+            raise RuntimeError("Result directory contains DIFFERENT config; use a new "
+                               "--output-dir (or restore exact previous script/config).")
+        if not args.resume and any(record_path(root, e.name).exists() for e in selected):
+            raise RuntimeError("Completed records exist. Use --resume or a new --output-dir; "
+                               "never overwrite old experimental results unintentionally.")
+    else:
+        if any((root / "records").glob("*.json")):
+            raise RuntimeError("Records exist without config manifest; choose a new output dir")
+        atomic_write_json(manifest_path, manifest)
+
+    pending = [e for e in selected if not (args.resume and
+               (rec := read_record(root, e.name)) is not None and rec.get("status") == "success")]
+    write_snapshots(root, selected)
+    if not pending:
+        print(f"All {len(selected)} results already present in {root}", flush=True)
+        return 0
+    tokens = gpu_tokens(args.gpu_workers)
+    todo = queue.Queue()
+    for e in pending:
+        todo.put(e)
+    print(f"Starting {len(pending)} experiments on {args.gpu_workers} GPUs. "
+          f"Durable output: {root}", flush=True)
+    for e in selected:
+        if e not in pending:
+            print(f"SKIP {e.name}: previously successful", flush=True)
+
+    # Only the coordinator (this process) writes consolidated CSV/text files.
+    # Every child writes its own JSON record atomically before it terminates.
+    update_lock = threading.Lock()
+    failures: list[str] = []
+
+    def gpu_loop(slot: int, cuda_token: str) -> None:
+        while True:
+            try:
+                exp = todo.get_nowait()
+            except queue.Empty:
+                return
+            filename = root / "logs" / f"{exp.name}.log"
+            cmd = [sys.executable, "-u", str(Path(__file__).resolve()),
+                   "--_worker", "--_experiment", exp.name,
+                   "--_gpu_slot", str(slot),
+                   "--fork-dir", str(args.fork_dir.resolve()),
+                   "--data-dir", str(args.data_dir.resolve()),
+                   "--session", args.session, "--seed", str(args.seed),
+                   "--epsilon", str(args.epsilon),
+                   "--max-iterations", str(args.max_iterations),
+                   "--batch-size", str(args.batch_size),
+                   "--mlp-epochs", str(args.mlp_epochs),
+                   "--device", args.device,
+                   "--cpu-threads", str(args.cpu_threads),
+                   "--output-dir", str(root)]
+            if args.report_eps:
+                cmd.append("--report-eps")
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = cuda_token
+            for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                        "NUMEXPR_NUM_THREADS"):
+                env[key] = str(args.cpu_threads)
+            with update_lock:
+                print(f"[GPU {slot}] START {exp.name}", flush=True)
+            try:
+                with filename.open("w", encoding="utf-8") as log:
+                    completed = subprocess.run(cmd, env=env, stdout=log,
+                                               stderr=subprocess.STDOUT, check=False)
+                record = read_record(root, exp.name)
+                if record is None:
+                    # Includes unexpected termination, e.g. a killed worker.
+                    record = dict(experiment=exp.name, status="error", r2=None,
+                                  gpu_slot=slot, cuda_visible_devices=cuda_token,
+                                  started_utc="", finished_utc=now_utc(),
+                                  elapsed_seconds=None, epsilon_summary="",
+                                  error=f"Worker exited with code {completed.returncode}; see {filename}")
+                    atomic_write_json(record_path(root, exp.name), record)
+                if completed.returncode != 0 and record["status"] == "success":
+                    record["status"] = "error"
+                    record["error"] = f"Worker returned nonzero {completed.returncode}"
+                    atomic_write_json(record_path(root, exp.name), record)
+            except Exception as exc:
+                record = dict(experiment=exp.name, status="error", r2=None,
+                              gpu_slot=slot, cuda_visible_devices=cuda_token,
+                              started_utc="", finished_utc=now_utc(),
+                              elapsed_seconds=None, epsilon_summary="",
+                              error=f"Coordinator exception: {type(exc).__name__}: {exc}")
+                atomic_write_json(record_path(root, exp.name), record)
+            with update_lock:
+                write_snapshots(root, selected)
+                if record["status"] == "success":
+                    print(f"[GPU {slot}] DONE {exp.name}: R2 = {record['r2']:.6f} "
+                          f"({record.get('elapsed_seconds')}s)", flush=True)
+                else:
+                    failures.append(exp.name)
+                    print(f"[GPU {slot}] FAILED {exp.name}: {record.get('error')} "
+                          f"[log={filename}]", flush=True)
+            todo.task_done()
+
+    threads = [threading.Thread(target=gpu_loop, args=(i, tokens[i]), daemon=False)
+               for i in range(args.gpu_workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    write_snapshots(root, selected)
+    print(f"Finished: {len(selected) - len(failures)} successful/previously completed "
+          f"out of {len(selected)}; {len(failures)} failed. "
+          f"Results: {root / 'results.csv'}", flush=True)
+    return 1 if failures else 0
+
+
+def main():
+    args = build_parser().parse_args()
+    selected = selected_experiments(args)
+    if args.list:
+        for e in experiments():
+            print(f"{e.name} [{'core' if e.core else 'all'}]")
+        return 0
     if args.dry_run:
         for e in selected:
             print(e.name)
@@ -389,28 +691,16 @@ def main():
         raise ValueError("Iterations, MLP epochs and batch size must be >= 1")
     if not np.isfinite(args.epsilon) or args.epsilon < 0:
         raise ValueError("PGD epsilon must be finite and nonnegative")
-
-    with open(os.devnull, "w", encoding="utf-8") as sink:
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            cebra = load_fork(args.fork_dir)
-            arrays = load_data(args.data_dir / f"{args.session}.npz")
-
-    failed = 0
-    for exp in selected:
-        try:
-            with open(os.devnull, "w", encoding="utf-8") as sink:
-                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                    r2, report = run_one(cebra, exp, arrays, args)
-            print(f"{exp.name}: R2 = {r2:.6f}", flush=True)
-            if args.report_eps and exp.overrides.get("adv_epsilon_mode") == "dprime":
-                print(f"  [{exp.name}] {epsilon_summary(report)}", file=sys.stderr, flush=True)
-        except Exception as exc:
-            failed += 1
-            print(f"{exp.name}: ERROR ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
-            if not args.continue_on_error:
-                raise
-
-    return 1 if failed else 0
+    if args.cpu_threads < 1:
+        raise ValueError("--cpu-threads must be at least 1")
+    if args.device not in ("cuda_if_available", "cuda", "cuda:0"):
+        raise ValueError("With isolated one-GPU workers, --device must be cuda_if_available, cuda, or cuda:0")
+    if args._worker:
+        candidates = [exp for exp in experiments() if exp.name == args._experiment]
+        if len(candidates) != 1:
+            raise ValueError(f"Unknown internal worker name {args._experiment!r}")
+        return worker_run(args, candidates[0])
+    return orchestrate(args, selected)
 
 
 if __name__ == "__main__":
