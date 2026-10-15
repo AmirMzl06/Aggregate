@@ -1,6 +1,6 @@
 """C-CO12: clean vs PGD vs spectral-gap adversarial CEBRA (Acorn-SVD fork).
 
-Run from anywhere; the script imports the fork from its own directory:
+Place this script next to the Acorn-SVD/ directory; run from anywhere:
     python -u run_acorn_svd.py --data /path/to/C-CO12.npz
 
 Arms (--arms):
@@ -39,6 +39,7 @@ from torch import nn
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parent
+FORK_DIR = ROOT / "Acorn-SVD"
 DEFAULT_DATA = Path("/data/hossein/mm_project/perich_data_valid_final_raw/C-CO12.npz")
 
 EPSILON = 3.0
@@ -99,16 +100,18 @@ def seed_all(seed: int) -> None:
 
 
 def load_fork():
-    if not (ROOT / "cebra" / "__init__.py").is_file():
-        raise FileNotFoundError(f"Expected the Acorn-SVD fork next to this script: {ROOT}")
+    if not (FORK_DIR / "cebra" / "__init__.py").is_file():
+        raise FileNotFoundError(
+            f"Expected the Acorn-SVD fork next to this script: {FORK_DIR}"
+        )
     # Avoid accidentally using an installed/unrelated version of CEBRA.
     for key in list(sys.modules):
         if key == "cebra" or key.startswith("cebra."):
             del sys.modules[key]
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(FORK_DIR.resolve()))
     import cebra
     import cebra.solver.spectral_gap
-    if not Path(cebra.__file__).resolve().is_relative_to(ROOT):
+    if not Path(cebra.__file__).resolve().is_relative_to(FORK_DIR.resolve()):
         raise RuntimeError(f"Incorrect CEBRA package imported: {cebra.__file__}")
     params = inspect.signature(cebra.CEBRA.__init__).parameters
     required = {"adv_spectral_mode", "adv_spectral_gamma", "adv_diagnostics_every"}
@@ -425,7 +428,7 @@ def main():
     print(f"[DATA] Valid X={arrays[1].shape}, Y={arrays[3].shape}", flush=True)
 
     config = {
-        "data_path": str(args.data), "fork": str(ROOT), "cebra_import": str(cebra.__file__),
+        "data_path": str(args.data), "fork": str(FORK_DIR), "cebra_import": str(cebra.__file__),
         "arms": args.arms, "seeds": args.seeds, "iterations": args.iterations,
         "encoder_configs": {arm: encoder_config(arm, args.iterations) for arm in args.arms},
         "decoder": {"architecture": "Linear -> LayerNorm -> ReLU -> Dropout -> Linear",
