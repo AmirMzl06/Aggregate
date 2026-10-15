@@ -10,7 +10,7 @@ reference and isotropic metrics. The evaluator attacks x_valid using y_valid
 ONLY during validation after unsupervised CEBRA and supervised decoder fitting.
 
 Do NOT mix these results with old EXP3 directories. Default fork-dir points to
-a SEPARATE, extracted copy of the newly supplied fork.
+Acorn-dprime/ next to dprime.py.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ from torch import nn
 from sklearn.metrics import r2_score
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_FORK_DIR = ROOT / "DPRIME_EXP4_FORK" / "Acorn-dprime"
+DEFAULT_FORK_DIR = ROOT / "Acorn-dprime"
 DEFAULT_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
 DEFAULT_SESSION = "C-CO12"
 DEFAULT_RESULTS_DIR = ROOT / "DPRIME_EXP4" / DEFAULT_SESSION / "seed42"
@@ -743,6 +743,7 @@ def main():
         for e in selected:
             print(e.name)
         return 0
+    print(f"[Exp4] Loaded runner: {Path(__file__).resolve()}; fork dir: {args.fork_dir.resolve()}", flush=True)
     if args.max_iterations < 1 or args.mlp_epochs < 1 or args.batch_size < 1:
         raise ValueError("Iterations, MLP epochs and batch size must be >= 1")
     if (args.eval_steps < 1 or args.eval_batch_size < 1 or
@@ -770,6 +771,8 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
 
 # #!/usr/bin/env python3
