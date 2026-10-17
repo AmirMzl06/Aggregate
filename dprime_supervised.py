@@ -1,15 +1,21 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Behavior-supervised Perich CEBRA comparison with Exp6b attack arms.
+"""Behavior-supervised Perich CEBRA comparison with Exp6b attack arms (Exp8).
 
 This is a separate and explicitly SUPERVISED experiment: the CEBRA encoder is fit
 via ``encoder.fit(train_data, train_label)`` (not ``encoder.fit(train_data)``).
 The continuous-label sampler is CEBRA's ``time_delta`` conditional (hybrid=False).
 The decoder is subsequently fitted on TRAIN labels only and validated on VALID labels.
 
-A CLEAN supervised baseline, raw-L2 PGD6, ISO8, SP8, SPDIFF8 and SP8_POOL use
-identical training/evaluation settings within this experiment. Reference and
-isotropic robustness are evaluated using the identical *label-free whole*
+Arms (``--suite core`` = exactly Exp6b's six frozen arms; default ``all`` = 8):
+  core:  CLEAN, PGD_L2_EPS6, MADRY_ISO_D8, MADRY_SP_D8, MADRY_SPDIFF_D8, MADRY_SP_D8_POOL
+  extra: PGD_L2_EPS3     raw-L2 PGD at ACORN's own supervised default (eps=3, used in the
+                         earlier 50-session supervised study). PGD6 was tuned on TIME-ONLY
+                         CEBRA; without eps=3 the supervised baseline could be mis-tuned.
+         MADRY_SPREG_D8  SP8 with the note's own residuals for continuous labels
+                         ("trial minus class mean" -> minus a regression on behaviour).
+                         With a supervised encoder the labels are already used in fit(),
+                         so the noise model may use them too; in time-only CEBRA it could not.
+
+Reference and isotropic robustness are evaluated using the identical *label-free whole*
 noise models from Exp5/6b, but the time-only contrastive margin is excluded
 because it would not test the supervised contrastive positive distribution.
 
@@ -79,7 +85,7 @@ class Experiment:
 
 
 def experiments() -> List[Experiment]:
-    """Frozen six-arm supervised Perich comparison; exactly Exp6b's six selected arms."""
+    """Exp6b's six frozen arms (core=True) plus two supervised-specific arms (core=False)."""
     common = dict(
         adv_epsilon_mode="dprime", adv_dprime_layer="stationary",
         adv_dprime_residuals="whole", adv_dprime_spatial="ledoit_wolf",
@@ -95,20 +101,28 @@ def experiments() -> List[Experiment]:
     def arm(name: str, **kw) -> Experiment:
         return Experiment(name, {**common, **kw}, True)
 
+    def pgd(eps: float, core: bool) -> Experiment:
+        return Experiment(f"PGD_L2_EPS{eps:g}", {
+            "training_mode": "adversarial", "adv_epsilon_mode": "constant",
+            "attack_norm": "l2", "adv_epsilon": eps, "adv_alpha": eps / 5.0,
+        }, core)
+
     arms = [
         Experiment("CLEAN", {"training_mode": "standard"}, True),
-        Experiment("PGD_L2_EPS6", {
-            "training_mode": "adversarial", "adv_epsilon_mode": "constant",
-            "attack_norm": "l2", "adv_epsilon": 6.0, "adv_alpha": 6.0 / 5.0,
-        }, True),
+        pgd(6.0, True),
         arm("MADRY_ISO_D8", adv_dprime_epsilon=8.0, **iso),
         arm("MADRY_SP_D8", adv_dprime_epsilon=8.0, **spatial),
         arm("MADRY_SPDIFF_D8", adv_dprime_epsilon=8.0,
             adv_dprime_residuals="difference", **spatial),
         arm("MADRY_SP_D8_POOL", adv_dprime_epsilon=8.0,
             adv_dprime_cov_pool=("isotropic",), **spatial),
+        # Supervised-specific additions (not part of the frozen Exp6b set).
+        pgd(3.0, False),
+        Experiment("MADRY_SPREG_D8", {**common, "adv_dprime_epsilon": 8.0,
+                                      "adv_dprime_residuals": "regression", **spatial}, False),
     ]
-    assert len(arms) == len({e.name for e in arms}) == 6
+    assert len(arms) == len({e.name for e in arms}) == 8
+    assert sum(e.core for e in arms) == 6
     return arms
 
 
@@ -136,7 +150,7 @@ def load_fork(fork_dir: Path):
     import cebra
 
     actual = Path(cebra.__file__).resolve()
-    if not actual.is_relative_to(fork_dir.resolve()):
+    if not str(actual).startswith(str(fork_dir.resolve()) + os.sep):
         raise RuntimeError(f"Wrong CEBRA imported: {actual}")
     params = inspect.signature(cebra.CEBRA.__init__).parameters
     required = {
@@ -151,8 +165,9 @@ def load_fork(fork_dir: Path):
         raise RuntimeError(f"This fork lacks Acorn-dprime parameters: {missing}")
     from cebra.dprime.noise import SPATIAL_ESTIMATORS, RESIDUAL_MODES
     from cebra.dprime.training import AUTO_MODES
-    if "auto_blind" not in AUTO_MODES or "difference" not in RESIDUAL_MODES:
-        raise RuntimeError("Wrong fork: Exp5 auto_blind or difference missing")
+    if ("auto_blind" not in AUTO_MODES or "difference" not in RESIDUAL_MODES
+            or "regression" not in RESIDUAL_MODES):
+        raise RuntimeError("Wrong fork: Exp5 auto_blind, difference or regression missing")
     if "isotropic" not in SPATIAL_ESTIMATORS:
         raise RuntimeError("Fork does not implement isotropic geometry")
     from cebra.dprime import evaluation
@@ -822,7 +837,7 @@ def orchestrate(args, selected: List[Experiment]) -> int:
             env = dict(os.environ)
             env["CUDA_VISIBLE_DEVICES"] = token
             for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-                        "NUMEXPR_THREADS"):
+                        "NUMEXPR_NUM_THREADS"):
                 env[key] = str(args.cpu_threads)
             with update_lock:
                 print(f"[GPU {slot}] START {exp.name}", flush=True)
