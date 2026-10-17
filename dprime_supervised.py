@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Behavior-supervised Perich CEBRA comparison with Exp6b attack arms.
+
+This is a separate and explicitly SUPERVISED experiment: the CEBRA encoder is fit
+via ``encoder.fit(train_data, train_label)`` (not ``encoder.fit(train_data)``).
+The continuous-label sampler is CEBRA's ``time_delta`` conditional (hybrid=False).
+The decoder is subsequently fitted on TRAIN labels only and validated on VALID labels.
+
+A CLEAN supervised baseline, raw-L2 PGD6, ISO8, SP8, SPDIFF8 and SP8_POOL use
+identical training/evaluation settings within this experiment. Reference and
+isotropic robustness are evaluated using the identical *label-free whole*
+noise models from Exp5/6b, but the time-only contrastive margin is excluded
+because it would not test the supervised contrastive positive distribution.
+
+DO NOT write into DPRIME_EXP5/ or DPRIME_EXP6/. Default: DPRIME_SUPERVISED_PERICH.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from datetime import datetime, timezone
+import hashlib
+import contextlib
+from dataclasses import dataclass, field
+import gc
+import inspect
+import os
+from pathlib import Path
+import random
+import queue
+import subprocess
+import tempfile
+import threading
+import time
+import traceback
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+sys.dont_write_bytecode = True
+
+import numpy as np
+import torch
+from torch import nn
+from sklearn.metrics import r2_score
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_FORK_DIR = ROOT / "Acorn-dprime"
+DEFAULT_DATA_DIR = Path("/data/hossein/mm_project/perich_data_valid_final_raw/")
+DEFAULT_SESSION = "C-CO12"
+DEFAULT_RESULTS_DIR = ROOT / "DPRIME_SUPERVISED_PERICH" / DEFAULT_SESSION / "seed42"
+
+SEED = 42
+PGD_EPS = 3.0
+ATTACK_STEPS = 10
+PGD_ALPHA = PGD_EPS / 5.0
+
+LATENT_DIM = 64
+HIDDEN = 64
+BATCH_SIZE = 2048
+MAX_ITER = 3000
+TEMPERATURE = 0.4
+ARCH = "offset36-model-more-dropout"
+DEVICE = "cuda_if_available"
+
+MLP_EPOCHS = 2500
+MLP_HIDDEN = 64
+MLP_DROP = 0.4
+MLP_LR = 1e-3
+EVAL_BATCH_SIZE = 8192
+
+
+@dataclass(frozen=True)
+class Experiment:
+    name: str
+    overrides: Dict[str, Any] = field(default_factory=dict)
+    core: bool = False
+
+
+def experiments() -> List[Experiment]:
+    """Frozen six-arm supervised Perich comparison; exactly Exp6b's six selected arms."""
+    common = dict(
+        adv_epsilon_mode="dprime", adv_dprime_layer="stationary",
+        adv_dprime_residuals="whole", adv_dprime_spatial="ledoit_wolf",
+        adv_dprime_temporal="welch", adv_dprime_optimizer="apgd",
+        adv_dprime_restarts=1, adv_dprime_objective="madry",
+        adv_dprime_instance_adaptive=False, adv_dprime_guards=(),
+        adv_dprime_guard_mode="off", adv_dprime_warmup=0.0,
+        adv_dprime_curriculum=0.0,
+    )
+    iso = dict(adv_dprime_spatial="isotropic", adv_dprime_temporal="white")
+    spatial = dict(adv_dprime_temporal="white")
+
+    def arm(name: str, **kw) -> Experiment:
+        return Experiment(name, {**common, **kw}, True)
+
+    arms = [
+        Experiment("CLEAN", {"training_mode": "standard"}, True),
+        Experiment("PGD_L2_EPS6", {
+            "training_mode": "adversarial", "adv_epsilon_mode": "constant",
+            "attack_norm": "l2", "adv_epsilon": 6.0, "adv_alpha": 6.0 / 5.0,
+        }, True),
+        arm("MADRY_ISO_D8", adv_dprime_epsilon=8.0, **iso),
+        arm("MADRY_SP_D8", adv_dprime_epsilon=8.0, **spatial),
+        arm("MADRY_SPDIFF_D8", adv_dprime_epsilon=8.0,
+            adv_dprime_residuals="difference", **spatial),
+        arm("MADRY_SP_D8_POOL", adv_dprime_epsilon=8.0,
+            adv_dprime_cov_pool=("isotropic",), **spatial),
+    ]
+    assert len(arms) == len({e.name for e in arms}) == 6
+    return arms
+
+
+def seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def load_fork(fork_dir: Path):
+    package = fork_dir / "cebra" / "__init__.py"
+    if not package.is_file():
+        raise FileNotFoundError(
+            f"Expected fork at {fork_dir}. Place this runner next to Acorn-dprime "
+            "or set --fork-dir PATH."
+        )
+    for key in list(sys.modules):
+        if key == "cebra" or key.startswith("cebra."):
+            del sys.modules[key]
+    sys.path.insert(0, str(fork_dir.resolve()))
+    import cebra
+
+    actual = Path(cebra.__file__).resolve()
+    if not actual.is_relative_to(fork_dir.resolve()):
+        raise RuntimeError(f"Wrong CEBRA imported: {actual}")
+    params = inspect.signature(cebra.CEBRA.__init__).parameters
+    required = {
+        "training_mode", "adv_epsilon", "adv_alpha", "adv_steps", "attack_norm",
+        "adv_epsilon_mode", "adv_dprime_epsilon", "adv_dprime_layer",
+        "adv_dprime_optimizer", "adv_dprime_instance_adaptive", "adv_dprime_temporal",
+        "adv_dprime_spatial", "adv_dprime_guards", "adv_dprime_objective",
+        "adv_dprime_cov_pool",
+    }
+    missing = sorted(required - set(params))
+    if missing:
+        raise RuntimeError(f"This fork lacks Acorn-dprime parameters: {missing}")
+    from cebra.dprime.noise import SPATIAL_ESTIMATORS, RESIDUAL_MODES
+    from cebra.dprime.training import AUTO_MODES
+    if "auto_blind" not in AUTO_MODES or "difference" not in RESIDUAL_MODES:
+        raise RuntimeError("Wrong fork: Exp5 auto_blind or difference missing")
+    if "isotropic" not in SPATIAL_ESTIMATORS:
+        raise RuntimeError("Fork does not implement isotropic geometry")
+    from cebra.dprime import evaluation
+    if not callable(getattr(evaluation, "evaluate_decoding", None)):
+        raise RuntimeError("Fork lacks Exp5's evaluate_decoding")
+    if not callable(getattr(evaluation, "common_metrics", None)):
+        raise RuntimeError("Fork lacks Exp5's common_metrics")
+    return cebra
+
+
+def load_data(data_path: Path):
+    if not data_path.is_file():
+        raise FileNotFoundError(f"No session file at: {data_path}")
+    with np.load(data_path, allow_pickle=False) as f:
+        x_train, x_valid, y_train, y_valid = (
+            np.asarray(f[k], dtype=np.float32)
+            for k in ("train_data", "valid_data", "train_label", "valid_label")
+        )
+
+    if y_train.ndim == 1:
+        y_train = y_train[:, None]
+    if y_valid.ndim == 1:
+        y_valid = y_valid[:, None]
+    for key, arr in (("train_data", x_train), ("valid_data", x_valid),
+                     ("train_label", y_train), ("valid_label", y_valid)):
+        if arr.ndim != 2 or 0 in arr.shape or not np.isfinite(arr).all():
+            raise ValueError(f"Invalid shape / nonfinite {key}: {arr.shape}")
+    if (x_train.shape[1] != x_valid.shape[1]
+            or y_train.shape[1] != y_valid.shape[1]):
+        raise ValueError("Train/valid feature or label dimensions differ")
+    if len(x_train) != len(y_train) or len(x_valid) != len(y_valid):
+        raise ValueError("Neural data and decoder labels have different lengths")
+    if min(len(x_train), len(x_valid)) < 36:
+        raise ValueError("The offset36 model needs at least 36 bins in each split")
+    for name, x in (("train_data", x_train), ("valid_data", x_valid)):
+        if np.any(x < 0) or not np.array_equal(x, np.rint(x)):
+            raise ValueError(f"{name} must be RAW nonnegative integer spike counts")
+    return tuple(np.ascontiguousarray(a) for a in (x_train, x_valid, y_train, y_valid))
+
+
+def encoder_config(exp: Experiment, iterations: int, batch_size: int,
+                   device: str, seed: int, pgd_eps: float) -> Dict[str, Any]:
+    overrides = dict(exp.overrides)
+    return {
+        "model_architecture": ARCH,
+        "batch_size": batch_size,
+        "temperature": TEMPERATURE,
+        "time_offsets": 1,
+        "conditional": "time_delta",  # continuous behavioral label conditional
+        "hybrid": False,            # pure supervised CEBRA, NOT hybrid time+behavior
+        "max_iterations": iterations,
+        "output_dimension": LATENT_DIM,
+        "num_hidden_units": HIDDEN,
+        "learning_rate": 3e-4,
+        "temperature_mode": "constant",
+        "training_mode": "adversarial",
+        "adv_epsilon": pgd_eps,
+        "adv_alpha": pgd_eps / 5.0,
+        "adv_steps": ATTACK_STEPS,
+        "attack_norm": "l2",   # A placeholder ignored by d' training.
+        "adv_dprime_seed": seed,
+        "device": device,
+        "verbose": False,
+        **overrides,
+    }
+
+
+class TwoLayerMLP(nn.Module):
+    def __init__(self, dim: int, out: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, MLP_HIDDEN),
+            nn.LayerNorm(MLP_HIDDEN),
+            nn.ReLU(),
+            nn.Dropout(MLP_DROP),
+            nn.Linear(MLP_HIDDEN, out),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def train_decoder(z_train, y_train, seed: int, device, epochs: int):
+    seed_all(seed)
+    decoder = TwoLayerMLP(z_train.shape[1], y_train.shape[1]).to(device)
+    opt = torch.optim.Adam(decoder.parameters(), lr=MLP_LR)
+    criterion = nn.MSELoss()
+    z = torch.as_tensor(z_train, dtype=torch.float32, device=device)
+    y = torch.as_tensor(y_train, dtype=torch.float32, device=device)
+    decoder.train()
+    for epoch in range(epochs):
+        opt.zero_grad(set_to_none=True)
+        loss = criterion(decoder(z), y)
+        if not torch.isfinite(loss).item():
+            raise FloatingPointError(f"Nonfinite decoder loss at epoch {epoch + 1}")
+        loss.backward()
+        opt.step()
+    return decoder
+
+
+def predict_decoder(decoder, embeddings):
+    decoder.eval()
+    device = next(decoder.parameters()).device
+    preds = []
+    with torch.inference_mode():
+        for first in range(0, len(embeddings), EVAL_BATCH_SIZE):
+            z = torch.as_tensor(embeddings[first:first + EVAL_BATCH_SIZE],
+                                dtype=torch.float32, device=device)
+            preds.append(decoder(z).cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+def epsilon_summary(report: Optional[Dict[str, Any]]) -> str:
+    if not report:
+        return "no-dprime-report"
+    e = report.get("epsilon", {})
+    nn = report.get("eps_nn", {})
+    t = report.get("training", {})
+    dist = t.get("epsilon_per_reference", {}) or {}
+    return (f"eps_dist={dist} "
+            f"eps_star={e.get('eps_star')} "
+            f"source={e.get('source')} "
+            f"eps_NN={nn.get('value')} "
+            f"NN_binding={t.get('eps_nn_binding_rate')} "
+            f"mean_dprime={t.get('mean_dprime')} "
+            f"final_epsilon={t.get('final_epsilon')} "
+            f"warmup_steps={t.get('warmup_steps')} "
+            f"curriculum_steps={t.get('curriculum_steps')}")
+
+
+def _atomic_model_save(encoder, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".pt", dir=path.parent)
+    os.close(fd)
+    try:
+        encoder.save(tmp, backend="sklearn")
+        if not Path(tmp).is_file() or Path(tmp).stat().st_size == 0:
+            raise RuntimeError("CEBRA.save produced an empty checkpoint")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _atomic_decoder_save(decoder, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".pt", dir=path.parent)
+    os.close(fd)
+    try:
+        torch.save(decoder.state_dict(), tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _checkpoint_paths(root: Path, name: str) -> Tuple[Path, Path, Path]:
+    return (root / "models" / f"{name}_encoder.pt",
+            root / "models" / f"{name}_decoder.pt",
+            root / "training" / f"{name}.json")
+
+
+def _score(encoder, decoder, x_valid, y_valid) -> float:
+    z = np.asarray(encoder.transform(x_valid), dtype=np.float32)
+    if len(z) != len(x_valid) or not np.isfinite(z).all():
+        raise ValueError("Invalid encoder validation embedding/alignment")
+    predictions = predict_decoder(decoder, z)
+    if predictions.shape != y_valid.shape or not np.isfinite(predictions).all():
+        raise ValueError("Invalid decoder validation predictions")
+    result = float(np.atleast_1d(r2_score(y_valid, predictions,
+                                           multioutput="raw_values")).mean())
+    if not np.isfinite(result):
+        raise ValueError("Non-finite clean R2")
+    return result
+
+
+def _validate_training_report(exp: Experiment, report: Optional[Dict[str, Any]]) -> None:
+    if exp.overrides.get("adv_epsilon_mode") != "dprime":
+        return
+    realized = (report or {}).get("training", {}).get("realized")
+    if not isinstance(realized, dict) or any(k not in realized for k in
+        ("raw_l2", "dprime_reference", "dprime_isotropic", "loss_gain")):
+        raise RuntimeError("Missing required new-fork training.realized diagnostics")
+    if exp.name == "MADRY_SP_AUTOBLIND":
+        eps = (report or {}).get("epsilon", {})
+        if eps.get("binding") not in ("blind_det", "nn"):
+            raise RuntimeError(f"Expected auto_blind calibration binding, got {eps!r}")
+
+
+def _new_train(cebra, exp: Experiment, arrays, args, root: Path):
+    x_train, x_valid, y_train, y_valid = arrays
+    seed_all(args.seed)
+    encoder = cebra.CEBRA(**encoder_config(exp, args.max_iterations, args.batch_size,
+                                           args.device, args.seed, args.epsilon))
+    # SUPERVISED encoder: the only functional training-mode change from Exp6b.
+    # The VALIDATION labels are NEVER passed to fit().
+    print(f"SUPERVISED CEBRA.fit(X_train={x_train.shape}, "
+          f"y_train={y_train.shape}; conditional=time_delta, hybrid=False)", flush=True)
+    encoder.fit(x_train, y_train)
+    if len(getattr(encoder, "label_types_", [])) != 1:
+        raise RuntimeError("Encoder did not register exactly one continuous behavior label")
+    report = getattr(encoder, "dprime_report_", None)
+    _validate_training_report(exp, report)
+    z_train = np.asarray(encoder.transform(x_train), dtype=np.float32)
+    if len(z_train) != len(x_train) or not np.isfinite(z_train).all():
+        raise ValueError("Invalid encoder training embedding/alignment")
+    decoder = train_decoder(z_train, y_train, args.seed + 100_000,
+                            torch.device(encoder.device_), args.mlp_epochs)
+    value = _score(encoder, decoder, x_valid, y_valid)
+
+    ep, dp, mp = _checkpoint_paths(root, exp.name)
+    _atomic_model_save(encoder, ep)
+    _atomic_decoder_save(decoder, dp)
+    # Save reports first; metadata acts as the final transaction commit.
+    if report is not None:
+        atomic_write_json(root / "reports" / f"{exp.name}.json", report)
+    meta = {
+        "experiment": exp.name, "session": args.session, "seed": args.seed,
+        "encoder_supervision": "behavior_continuous",
+        "fit_call": "CEBRA.fit(x_train,y_train)",
+        "conditional": "time_delta", "hybrid": False,
+        "train_label_shape": list(y_train.shape),
+        "clean_r2": value, "epsilon_summary": epsilon_summary(report),
+        "encoder_path": str(ep), "decoder_path": str(dp),
+        "encoder_sha256": file_sha256(ep), "decoder_sha256": file_sha256(dp),
+        "finished_utc": now_utc(), "stage": "trained",
+    }
+    atomic_write_json(mp, meta)
+    print(f"CHECKPOINT {exp.name}: clean R2={value:.6f} at {ep}", flush=True)
+    return encoder, decoder, meta, report
+
+
+def _restore_train(cebra, exp: Experiment, arrays, args, root: Path):
+    _, x_valid, _, y_valid = arrays
+    ep, dp, mp = _checkpoint_paths(root, exp.name)
+    meta = json.loads(mp.read_text(encoding="utf-8"))
+    if (meta.get("experiment") != exp.name or meta.get("session") != args.session
+            or meta.get("seed") != args.seed
+            or meta.get("encoder_supervision") != "behavior_continuous"):
+        raise RuntimeError(f"Supervised checkpoint metadata mismatch for {exp.name}")
+    if file_sha256(ep) != meta["encoder_sha256"] or file_sha256(dp) != meta["decoder_sha256"]:
+        raise RuntimeError(f"Checkpoint hash mismatch for {exp.name}; refusing corrupted files")
+    # This checkpoint is produced by our trusted local fork, not an untrusted download.
+    encoder = cebra.CEBRA.load(str(ep), backend="sklearn", weights_only=False)
+    decoder = TwoLayerMLP(LATENT_DIM, y_valid.shape[1]).to(torch.device(encoder.device_))
+    try:
+        state = torch.load(dp, map_location=encoder.device_, weights_only=True)
+    except TypeError:
+        state = torch.load(dp, map_location=encoder.device_)
+    decoder.load_state_dict(state)
+    value = _score(encoder, decoder, x_valid, y_valid)
+    if abs(value - float(meta["clean_r2"])) > 0.0005:
+        raise RuntimeError(f"Restored checkpoint changed R2: {value} vs {meta['clean_r2']}")
+    report_path = root / "reports" / f"{exp.name}.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else getattr(encoder, "dprime_report_", None)
+    _validate_training_report(exp, report)
+    if report is not None and not report_path.is_file():
+        atomic_write_json(report_path, report)
+    return encoder, decoder, meta, report
+
+
+def run_one(cebra, exp: Experiment, arrays, args, root: Path):
+    encoder = decoder = None
+    try:
+        ep, dp, mp = _checkpoint_paths(root, exp.name)
+        if mp.is_file() and ep.is_file() and dp.is_file():
+            print(f"REUSE {exp.name}: loading saved encoder and decoder", flush=True)
+            encoder, decoder, meta, report = _restore_train(cebra, exp, arrays, args, root)
+        elif args.eval_only:
+            raise FileNotFoundError(f"Cannot --eval-only: no complete checkpoint for {exp.name} ({mp})")
+        else:
+            print(f"TRAIN {exp.name}: seed={args.seed}, session={args.session}", flush=True)
+            encoder, decoder, meta, report = _new_train(cebra, exp, arrays, args, root)
+
+        x_train, x_valid, _, y_valid = arrays
+        from cebra.dprime.evaluation import evaluate_decoding
+        # The reference and ISO metrics use the SAME 'whole' residual definition
+        # for every model, including difference-residual TRAINING controls.
+        robust = evaluate_decoding(
+            encoder, decoder, x_train, x_valid, y_valid,
+            epsilons=args.eval_epsilons, metrics=("reference", "isotropic"),
+            steps=args.eval_steps, batch_size=args.eval_batch_size,
+            margin_windows=args.eval_margin_windows,
+            margin_steps=args.eval_margin_steps,
+            shift_threshold=args.eval_shift_threshold,
+            contrastive=False,  # do not compute TIME-only contrastive margin for supervised CEBRA
+            residuals="whole", labels_train=None,  # identical label-free eval geometry to Exp6b
+            seed=args.seed + 200_000,
+        )
+        if abs(float(robust["clean_r2"]) - float(meta["clean_r2"])) > 0.0005:
+            raise RuntimeError(f"Clean R2 mismatch: training={meta['clean_r2']:.6f}, "
+                               f"evaluator={robust['clean_r2']:.6f}; alignment mismatch")
+        return float(meta["clean_r2"]), report, robust, meta
+    finally:
+        del encoder, decoder
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--fork-dir", type=Path, default=DEFAULT_FORK_DIR)
+    p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    p.add_argument("--session", default=DEFAULT_SESSION)
+    p.add_argument("--suite", choices=("all", "core"), default="all")
+    p.add_argument("--only", nargs="+", help="Run named arms; use --list to inspect names")
+    p.add_argument("--list", action="store_true", help="List all experiments and exit")
+    p.add_argument("--dry-run", action="store_true", help="List selected arms without fitting")
+    p.add_argument("--check-labels", action="store_true",
+                   help="Validate train_label, valid_label and shapes for the session, then exit")
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--epsilon", type=float, default=PGD_EPS,
+                   help="Original input-space PGD L2 baseline epsilon (default 3)")
+    p.add_argument("--max-iterations", type=int, default=MAX_ITER)
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    p.add_argument("--mlp-epochs", type=int, default=MLP_EPOCHS)
+    p.add_argument("--device", default=DEVICE)
+    p.add_argument("--eval-epsilons", nargs="+", type=float,
+                   default=[0.5, 1.0, 2.0, 4.0, 8.0, 16.0],
+                   help="Common dprime budgets for held-out robustness curves")
+    p.add_argument("--eval-steps", type=int, default=20)
+    p.add_argument("--eval-batch-size", type=int, default=512)
+    p.add_argument("--eval-margin-windows", type=int, default=1024)
+    p.add_argument("--eval-margin-steps", type=int, default=100)
+    p.add_argument("--eval-shift-threshold", type=float, default=0.5)
+    p.add_argument("--no-contrastive-margin", action="store_true",
+                   help="Disable slow contrastive DDN only if explicitly requested")
+    p.add_argument("--report-eps", action="store_true",
+                   help="Print dprime calibration diagnostics to stderr after each run")
+    p.add_argument("--gpu-workers", type=int, default=2,
+                   help="Number of independently allocated GPUs to use (default 2)")
+    p.add_argument("--cpu-threads", type=int, default=2,
+                   help="CPU threads per GPU subprocess (default 2)")
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_RESULTS_DIR,
+                   help="PERSISTENT results directory. MUST reside on a shared/host volume")
+    p.add_argument("--eval-only", action="store_true",
+                   help="Require existing checkpoints; reevaluate without retraining")
+    p.add_argument("--eval-tag", default="v1",
+                   help="Distinct tag for an evaluator version; use v2 if evaluation code changes")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip successful experiment records, retry interrupted/failed runs")
+    p.add_argument("--continue-on-error", action="store_true",
+                   help="Kept for CLI compatibility; workers always record each error and continue")
+    # Internal worker arguments; not intended for direct use.
+    p.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--_experiment", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_gpu_slot", type=int, default=-1, help=argparse.SUPPRESS)
+    return p
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Commit one entire file; readers see either old or new version."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2,
+                                       allow_nan=False, sort_keys=True) + "\n")
+
+
+def record_path(root: Path, name: str) -> Path:
+    if not name.replace("_", "").isalnum():
+        raise ValueError(f"Unsafe experiment name: {name!r}")
+    return root / "records" / f"{name}.json"
+
+
+def read_record(root: Path, name: str):
+    path = record_path(root, name)
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if obj.get("experiment") != name:
+        raise RuntimeError(f"Mismatched record in {path}")
+    return obj
+
+
+def evaluation_dir(root: Path, area: str, tag: str) -> Path:
+    return root / (area if tag == "v1" else f"{area}_{tag}")
+
+
+def write_snapshots(root: Path, selected: List[Experiment], tag: str) -> None:
+    """Consolidate per-arm records into CSV and readable text, without extra files."""
+    import io
+    rows, summaries = [], []
+    record_dir = evaluation_dir(root, "records", tag)
+    for exp in selected:
+        record = read_record(record_dir, exp.name)
+        if record is None:
+            continue
+        rows.append({
+            "experiment": exp.name, "status": record.get("status", "unknown"),
+            "r2": record.get("r2", ""), "gpu_slot": record.get("gpu_slot", ""),
+            "elapsed_seconds": record.get("elapsed_seconds", ""),
+            "epsilon_summary": record.get("epsilon_summary", ""),
+            "raw_l2_median": record.get("raw_l2_median", ""),
+            "dprime_reference_median": record.get("dprime_reference_median", ""),
+            "robust_eval_path": record.get("robust_eval_path", ""),
+            "encoder_path": record.get("encoder_path", ""),
+            "decoder_path": record.get("decoder_path", ""),
+            "error": record.get("error", ""),
+        })
+        if record.get("status") == "success":
+            summaries.append(f"{exp.name}: R2 = {record['r2']:.6f} "
+                             f"| GPU slot {record.get('gpu_slot')} "
+                             f"| elapsed {record.get('elapsed_seconds')}s")
+        else:
+            summaries.append(f"{exp.name}: ERROR: {record.get('error')}")
+    stream = io.StringIO()
+    fields = ["experiment", "status", "r2", "gpu_slot", "elapsed_seconds",
+              "epsilon_summary", "raw_l2_median", "dprime_reference_median",
+              "robust_eval_path", "encoder_path", "decoder_path", "error"]
+    writer = csv.DictWriter(stream, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    suffix = "" if tag == "v1" else f"_{tag}"
+    atomic_write_text(root / f"results{suffix}.csv", stream.getvalue())
+    atomic_write_text(root / f"results{suffix}.txt", "\n".join(summaries) + ("\n" if summaries else ""))
+
+
+def selected_experiments(args):
+    all_exp = experiments()
+    names = {e.name for e in all_exp}
+    if args.only:
+        unknown = sorted(set(args.only) - names)
+        if unknown:
+            raise ValueError(f"Unknown experiments: {unknown}; inspect --list")
+        return [e for e in all_exp if e.name in set(args.only)]
+    if args.suite == "core":
+        return [e for e in all_exp if e.core]
+    return all_exp
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# Training fingerprints are separate from evaluator fingerprints, permitting
+# --eval-only with changed evaluator code while preserving trained checkpoints.
+FORK_TRAIN_FILES = (
+    "cebra/distributions/base.py", "cebra/dprime/training.py",
+    "cebra/dprime/noise.py", "cebra/dprime/attacks.py",
+    "cebra/dprime/calibration.py", "cebra/integrations/sklearn/cebra.py",
+    "cebra/solver/base.py",
+)
+FORK_EVAL_FILES = FORK_TRAIN_FILES + ("cebra/dprime/evaluation.py",)
+
+
+def _fingerprints(fork_dir: Path, paths: Tuple[str, ...]) -> dict:
+    return {rel: file_sha256(fork_dir / rel) for rel in paths}
+
+
+def config_manifest(args) -> dict:
+    """Training settings only; evaluation revisions do not force retraining."""
+    data_path = (args.data_dir / f"{args.session}.npz").resolve()
+    return json.loads(json.dumps({
+        "schema": "perich-behavior-supervised-v1",
+        "encoder_supervision": "behavior_continuous",
+        "fit_call": "cebra.CEBRA.fit(train_data, train_label)",
+        "conditional": "time_delta", "hybrid": False,
+        "labels_used_for_fit": "train_label only",
+        "fork_dir": str(args.fork_dir.resolve()),
+        "fork_fingerprints": _fingerprints(args.fork_dir, FORK_TRAIN_FILES),
+        "data_path": str(data_path), "data_sha256": file_sha256(data_path),
+        "session": args.session, "seed": args.seed, "epsilon": args.epsilon,
+        "batch_size": args.batch_size, "max_iterations": args.max_iterations,
+        "mlp_epochs": args.mlp_epochs, "architecture": ARCH,
+        "latent_dim": LATENT_DIM, "hidden": HIDDEN,
+        "temperature": TEMPERATURE, "attack_steps": ATTACK_STEPS,
+        "experiments": [{"name": e.name, "overrides": e.overrides}
+                        for e in experiments()],
+    }, sort_keys=True))
+
+
+def eval_manifest(args) -> dict:
+    return json.loads(json.dumps({
+        "schema": "perich-behavior-supervised-eval-v1", "eval_tag": args.eval_tag,
+        "fork_dir": str(args.fork_dir.resolve()),
+        "fork_fingerprints": _fingerprints(args.fork_dir, FORK_EVAL_FILES),
+        "evaluation": {
+            "epsilons": args.eval_epsilons, "steps": args.eval_steps,
+            "batch_size": args.eval_batch_size,
+            "margin_windows": args.eval_margin_windows,
+            "margin_steps": args.eval_margin_steps,
+            "shift_threshold": args.eval_shift_threshold,
+            "contrastive": False, "contrastive_note": "time-only proxy not valid for supervised fits",
+            "residuals": "whole", "labels_train": None,
+            "evaluation_seed_offset": 200_000,
+        },
+    }, sort_keys=True))
+
+
+def gpu_tokens(workers: int) -> list[str]:
+    if workers < 1:
+        raise ValueError("--gpu-workers must be at least 1")
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA GPU available in this RunAI container")
+    count = torch.cuda.device_count()
+    if count < workers:
+        raise RuntimeError(f"Requested {workers} GPU workers but only {count} CUDA devices visible. "
+                           f"Submit with at least --gpu {workers} and check GPU allocation.")
+    visibility = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visibility and visibility != "-1":
+        tokens = [s.strip() for s in visibility.split(",") if s.strip()]
+        if len(tokens) < workers:
+            raise RuntimeError(f"CUDA_VISIBLE_DEVICES={visibility!r} has fewer than {workers} entries")
+        return tokens[:workers]
+    return [str(i) for i in range(workers)]
+
+
+def worker_run(args, exp: Experiment) -> int:
+    """Exactly one physical GPU visible to this process."""
+    begin = time.monotonic()
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError("Worker must see exactly one CUDA GPU")
+    torch.set_num_threads(args.cpu_threads)
+    root = args.output_dir.resolve()
+    rdir = evaluation_dir(root, "records", args.eval_tag)
+    ed = evaluation_dir(root, "robust_eval", args.eval_tag)
+    base = {
+        "experiment": exp.name, "status": "error", "r2": None,
+        "gpu_slot": args._gpu_slot,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "started_utc": now_utc(), "error": "",
+    }
+    try:
+        cebra = load_fork(args.fork_dir)
+        arrays = load_data(args.data_dir / f"{args.session}.npz")
+        value, report, robust, meta = run_one(cebra, exp, arrays, args, root)
+        rpath = ed / f"{exp.name}.json"
+        atomic_write_json(rpath, robust)
+        base.update(r2=float(value), robust_eval_path=str(rpath),
+                    robust_eval_clean_r2=float(robust["clean_r2"]),
+                    encoder_path=meta["encoder_path"], decoder_path=meta["decoder_path"],
+                    epsilon_summary=meta.get("epsilon_summary", ""))
+        if exp.overrides.get("adv_epsilon_mode") == "dprime":
+            realized = report["training"]["realized"]
+            base["raw_l2_median"] = realized["raw_l2"]["median"]
+            base["dprime_reference_median"] = realized["dprime_reference"]["median"]
+        base["status"] = "success"
+        print(f"{exp.name}: R2={value:.6f} | checkpoint saved | evaluator={args.eval_tag}", flush=True)
+        if args.report_eps:
+            print(f"{exp.name} calibration: {base['epsilon_summary']}", flush=True)
+    except BaseException as exc:
+        base["status"] = "error"
+        base["error"] = f"{type(exc).__name__}: {exc}"
+        traceback.print_exc()
+    finally:
+        base["elapsed_seconds"] = round(time.monotonic() - begin, 3)
+        base["finished_utc"] = now_utc()
+        atomic_write_json(record_path(rdir, exp.name), base)
+    return 0 if base["status"] == "success" else 1
+
+
+def orchestrate(args, selected: List[Experiment]) -> int:
+    root = args.output_dir.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "models").mkdir(exist_ok=True)
+    (root / "training").mkdir(exist_ok=True)
+    (root / "reports").mkdir(exist_ok=True)
+    rdir = evaluation_dir(root, "records", args.eval_tag)
+    ldir = evaluation_dir(root, "logs", args.eval_tag)
+    ed = evaluation_dir(root, "robust_eval", args.eval_tag)
+    for p in (rdir, ldir, ed):
+        p.mkdir(exist_ok=True)
+
+    train_manifest_path = root / "run_config.json"
+    manifest = config_manifest(args)
+    if train_manifest_path.exists():
+        old = json.loads(train_manifest_path.read_text(encoding="utf-8"))
+        if old != manifest:
+            if not args.eval_only:
+                raise RuntimeError("Training configuration or fork changed in this output "
+                                   "directory. Use a NEW output directory for training. "
+                                   "For saved-model reevaluation use --eval-only --eval-tag v2.")
+            print("WARNING: train fork/config differs from the saved-model manifest; "
+                  "--eval-only will load original checkpoints without retraining.", flush=True)
+    else:
+        if args.eval_only:
+            raise RuntimeError("--eval-only requires existing run_config.json and checkpoints")
+        if any((root / "models").glob("*.pt")):
+            raise RuntimeError("Unmanifested model checkpoints found; use a new directory")
+        atomic_write_json(train_manifest_path, manifest)
+
+    eval_manifest_path = root / f"evaluation_config_{args.eval_tag}.json"
+    e_manifest = eval_manifest(args)
+    if eval_manifest_path.exists():
+        if json.loads(eval_manifest_path.read_text(encoding="utf-8")) != e_manifest:
+            raise RuntimeError(f"Evaluation configuration changed for tag {args.eval_tag!r}. "
+                               "Choose a NEW --eval-tag rather than overwrite the old results.")
+    else:
+        if any(rdir.glob("*.json")):
+            raise RuntimeError("Evaluation records without config; use a new --eval-tag")
+        atomic_write_json(eval_manifest_path, e_manifest)
+
+    pending = [e for e in selected if not (
+        args.resume and (r := read_record(rdir, e.name)) is not None and r.get("status") == "success")]
+    if not args.resume and any(read_record(rdir, e.name) for e in selected):
+        raise RuntimeError("Records already exist; add --resume or use a fresh --eval-tag")
+    write_snapshots(root, selected, args.eval_tag)
+    if not pending:
+        print(f"All {len(selected)} selected results already successful for tag={args.eval_tag}", flush=True)
+        return 0
+    tokens = gpu_tokens(args.gpu_workers)
+    todo = queue.Queue()
+    for e in pending:
+        todo.put(e)
+    print(f"[SUPERVISED PERICH] Loaded runner {Path(__file__).resolve()} | fork={args.fork_dir.resolve()} ", flush=True)
+    print(f"Starting {len(pending)} supervised experiments on {args.gpu_workers} GPUs; "
+          f"session={args.session}; eval_tag={args.eval_tag}; eval_only={args.eval_only}; "
+          f"output={root}", flush=True)
+    update_lock = threading.Lock()
+    failures: list[str] = []
+
+    def gpu_loop(slot: int, token: str):
+        while True:
+            try:
+                exp = todo.get_nowait()
+            except queue.Empty:
+                return
+            filename = ldir / f"{exp.name}.log"
+            cmd = [sys.executable, "-u", str(Path(__file__).resolve()),
+                   "--_worker", "--_experiment", exp.name,
+                   "--_gpu_slot", str(slot),
+                   "--fork-dir", str(args.fork_dir.resolve()),
+                   "--data-dir", str(args.data_dir.resolve()),
+                   "--session", args.session, "--seed", str(args.seed),
+                   "--epsilon", str(args.epsilon),
+                   "--max-iterations", str(args.max_iterations),
+                   "--batch-size", str(args.batch_size),
+                   "--mlp-epochs", str(args.mlp_epochs),
+                   "--device", args.device,
+                   "--cpu-threads", str(args.cpu_threads),
+                   "--eval-steps", str(args.eval_steps),
+                   "--eval-batch-size", str(args.eval_batch_size),
+                   "--eval-margin-windows", str(args.eval_margin_windows),
+                   "--eval-margin-steps", str(args.eval_margin_steps),
+                   "--eval-shift-threshold", str(args.eval_shift_threshold),
+                   "--eval-epsilons", *[str(v) for v in args.eval_epsilons],
+                   "--eval-tag", args.eval_tag, "--output-dir", str(root)]
+            if args.eval_only:
+                cmd.append("--eval-only")
+            if args.no_contrastive_margin:
+                cmd.append("--no-contrastive-margin")
+            if args.report_eps:
+                cmd.append("--report-eps")
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = token
+            for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                        "NUMEXPR_THREADS"):
+                env[key] = str(args.cpu_threads)
+            with update_lock:
+                print(f"[GPU {slot}] START {exp.name}", flush=True)
+            try:
+                with filename.open("w", encoding="utf-8") as f:
+                    result = subprocess.run(cmd, env=env, stdout=f,
+                                            stderr=subprocess.STDOUT, check=False)
+                record = read_record(rdir, exp.name)
+                if record is None:
+                    record = dict(experiment=exp.name, status="error", r2=None,
+                                  error=f"Worker exited {result.returncode}; see {filename}")
+                    atomic_write_json(record_path(rdir, exp.name), record)
+                if result.returncode != 0 and record["status"] == "success":
+                    record["status"] = "error"
+                    record["error"] = f"Worker exited {result.returncode}"
+                    atomic_write_json(record_path(rdir, exp.name), record)
+            except Exception as exc:
+                record = dict(experiment=exp.name, status="error", r2=None,
+                              error=f"Coordinator {type(exc).__name__}: {exc}")
+                atomic_write_json(record_path(rdir, exp.name), record)
+            with update_lock:
+                write_snapshots(root, selected, args.eval_tag)
+                if record["status"] == "success":
+                    print(f"[GPU {slot}] DONE {exp.name}: R2={record['r2']:.6f} "
+                          f"({record.get('elapsed_seconds')}s)", flush=True)
+                else:
+                    failures.append(exp.name)
+                    print(f"[GPU {slot}] FAILED {exp.name}: {record.get('error')} "
+                          f"[log={filename}]", flush=True)
+            todo.task_done()
+
+    threads = [threading.Thread(target=gpu_loop, args=(i, tokens[i]))
+               for i in range(args.gpu_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    write_snapshots(root, selected, args.eval_tag)
+    ok = sum(1 for e in selected if (r := read_record(rdir, e.name)) is not None
+             and r.get("status") == "success")
+    print(f"Finished: {ok}/{len(selected)} selected successful; "
+          f"{len(failures)} failed; results={root / ('results.csv' if args.eval_tag == 'v1' else 'results_' + args.eval_tag + '.csv')}", flush=True)
+    return 1 if failures else 0
+
+
+def main():
+    args = build_parser().parse_args()
+    selected = selected_experiments(args)
+    if args.list:
+        for e in experiments():
+            print(f"{e.name} [{'core' if e.core else 'all'}]")
+        return 0
+    if args.dry_run:
+        for e in selected:
+            print(e.name)
+        return 0
+    if args.check_labels:
+        x_train, x_valid, y_train, y_valid = load_data(args.data_dir / f"{args.session}.npz")
+        print(f"LABEL CHECK OK {args.session}: train_data={x_train.shape} "
+              f"train_label={y_train.shape} valid_data={x_valid.shape} "
+              f"valid_label={y_valid.shape}; label-dtype={y_train.dtype}", flush=True)
+        return 0
+    if args.max_iterations < 1 or args.mlp_epochs < 1 or args.batch_size < 1:
+        raise ValueError("Iterations, MLP epochs and batch size must be >= 1")
+    if (args.eval_steps < 1 or args.eval_batch_size < 1 or
+            args.eval_margin_windows < 1 or args.eval_margin_steps < 1):
+        raise ValueError("Evaluation steps, batch size and margin controls must be positive")
+    if (not args.eval_epsilons or any(not np.isfinite(e) or e < 0 for e in args.eval_epsilons)
+            or len(set(args.eval_epsilons)) != len(args.eval_epsilons)
+            or args.eval_epsilons != sorted(args.eval_epsilons)):
+        raise ValueError("--eval-epsilons must be unique sorted nonnegative numbers")
+    if not np.isfinite(args.eval_shift_threshold) or args.eval_shift_threshold <= 0:
+        raise ValueError("--eval-shift-threshold must be finite and > 0")
+    if not np.isfinite(args.epsilon) or args.epsilon < 0:
+        raise ValueError("PGD epsilon must be finite and nonnegative")
+    if args.cpu_threads < 1:
+        raise ValueError("--cpu-threads must be at least 1")
+    if args.device not in ("cuda_if_available", "cuda", "cuda:0"):
+        raise ValueError("With isolated one-GPU workers, --device must be cuda_if_available, cuda, or cuda:0")
+    if not args.eval_tag.replace("_", "").replace("-", "").isalnum() or len(args.eval_tag) > 48:
+        raise ValueError("--eval-tag must be a short alphanumeric/-/_ label")
+    if args._worker:
+        candidates = [exp for exp in experiments() if exp.name == args._experiment]
+        if len(candidates) != 1:
+            raise ValueError(f"Unknown internal worker name {args._experiment!r}")
+        return worker_run(args, candidates[0])
+    return orchestrate(args, selected)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
