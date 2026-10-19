@@ -1,12 +1,12 @@
 """C-CO12: clean vs PGD vs spectral-gap adversarial CEBRA (Acorn-SVD fork).
 
-Run from anywhere; place this file BESIDE the Acorn-SVD/ (new V4 code) fork:
-    python -u run_acorn_svd.py --data /path/to/C-CO12.npz
+Place this runner NEXT TO the Acorn-SVD/ directory:
+    Aggregate/run_acorn_svd.py
+    Aggregate/Acorn-SVD/cebra/
+Run from anywhere, e.g. python -u run_acorn_svd.py --data /path/to/C-CO12.npz
 
-Also accepts Acorn-SVD-v4/ as an alternative folder name.
-It also works directly from inside the new fork.
-By default V4 outputs go to the separate ACORN_SVD_RESULTS_V4/ directory.
-Use --plan-only to inspect the number of training jobs WITHOUT loading data or CEBRA.
+Multi-GPU: --gpu-workers N assigns one independent experiment per GPU.
+Plan safely with --plan-only. --run-dir + --resume preserve completed runs.
 
 Arms (--arms):
     clean             CEBRA without adversarial updates.
@@ -19,18 +19,22 @@ Arms (--arms):
     svd_subspace      Subspace projection with the fixed budget eps=3.
     svd_subspace_cert Same, final perturbation projected onto ||D||_2 <= gamma * gap.
     svd_cert_every    Same, projected after every PGD step (uses more of the budget).
-    svd_cert_radial   Ablation: final perturbation shrunk as a whole (the earlier certificate).
+    svd_cert_radial   Same, final perturbation shrunk as a whole (Weyl radius, as in v3).
+    svd_cert_collapse Same, final perturbation scaled to the exact collapse radius.
     svd_split_half    svd_split with half of the complement budget (trade-off knob).
     svd_split_every   svd_split, jointly certified after every PGD step.
     svd_tangent_fixed Ablation: tangent projection with the fixed budget eps.
     svd_gap_budget    Ablation: gap budget without the projection.
+    pgd_match_split   Control: unrestricted PGD with svd_split's per-window perturbation norm.
+    pgd_match_radial  Control: unrestricted PGD with svd_cert_radial's per-window norm.
 
 For every (seed, arm) the runner:
     - fits the encoder and trains the same MLP decoder on clean train embeddings;
     - reports validation R2;
     - unless --no-eval-attack, reports R2 under held-out attacks on the validation
       windows (plain PGD, spectral gap, tangent, and complement vs tangent at the same
-      radius; --eval-epsilon, --eval-steps, --eval-restarts);
+      radius; --eval-epsilon, --eval-steps, --eval-restarts; plain PGD also at the
+      radii of --eval-radii);
     - reports R2 on corrupted recordings: Poisson resampling, gain drift, random and
       nested 5-50% unit loss, and loss of the 20% most active, variable or important units.
 
@@ -38,18 +42,16 @@ For every (seed, arm) the runner:
 centred training windows, so that sessions are comparable. --scale-only prints
 that norm, the budgets in both units and the spectral gaps of the session, then
 exits without training. Results are saved after every arm in a new, unique run
-directory; no encoder/decoder checkpoints are stored. Independent arms run in
-parallel processes with one CUDA-visible GPU per worker (--gpu-workers N).
---run-dir and --resume allow resuming *finished* arms after preemption.
+directory; no checkpoints are stored. Default output is a separate
+ACORN_SVD_RESULTS_V5/ directory alongside Acorn-SVD/.
 """
 
 import argparse
-import csv
 import hashlib
-import threading
-import subprocess
 import queue
-import traceback
+import subprocess
+import threading
+import csv
 import gc
 import inspect
 import json
@@ -69,40 +71,27 @@ from torch import nn
 # Prevent the local fork import from generating __pycache__ files.
 sys.dont_write_bytecode = True
 
-# Detect the user's original Aggregate/run_acorn_svd.py + Aggregate/Acorn-SVD/
-# layout, but also support the earlier V4 package layout. If BOTH folders exist,
-# prefer Acorn-SVD-v4/ so an old Acorn-SVD/ cannot be chosen accidentally.
 SCRIPT_DIR = Path(__file__).resolve().parent
-if (SCRIPT_DIR / "cebra" / "__init__.py").is_file():
-    ROOT = SCRIPT_DIR
-elif (SCRIPT_DIR / "Acorn-SVD-v4" / "cebra" / "__init__.py").is_file():
-    ROOT = SCRIPT_DIR / "Acorn-SVD-v4"
-elif (SCRIPT_DIR / "Acorn-SVD" / "cebra" / "__init__.py").is_file():
+# User-required original layout, with a secondary standalone fork option for tests.
+if (SCRIPT_DIR / "Acorn-SVD" / "cebra" / "__init__.py").is_file():
     ROOT = SCRIPT_DIR / "Acorn-SVD"
+elif (SCRIPT_DIR / "cebra" / "__init__.py").is_file():
+    ROOT = SCRIPT_DIR
 else:
     raise FileNotFoundError(
-        "Cannot find the CEBRA fork. Expected a folder named Acorn-SVD/ "
-        "(containing cebra/) next to run_acorn_svd.py; also accepts Acorn-SVD-v4/. "
-        "Copy/extract the entire V4 fork, not only the runner. "
-        f"Script directory: {SCRIPT_DIR}"
+        "Expected Acorn-SVD/cebra/ alongside run_acorn_svd.py. "
+        f"Runner directory: {SCRIPT_DIR}"
     )
-
-# Guard even --plan-only against silently testing/planning on the older fork.
-# This check reads a single code file; it does NOT import the model, open data,
-# or consume GPU. The full import signature is checked by load_fork().
-V4_CEBRA_CONFIG = ROOT / "cebra" / "integrations" / "sklearn" / "cebra.py"
-if not V4_CEBRA_CONFIG.is_file() or not all(
-    name in V4_CEBRA_CONFIG.read_text(encoding="utf-8")
-    for name in ("adv_spectral_certify", "adv_spectral_split_complement")
-):
-    raise RuntimeError(
-        f"Found {ROOT}, but it does not appear to contain the NEW V4 spectral engine. "
-        "The V4 runner needs the full new fork with exact projection. "
-        "Install V4 in Acorn-SVD/ (or Acorn-SVD-v4/) next to run_acorn_svd.py. "
-        "Do not train with the older engine."
-    )
-
-DEFAULT_OUTPUT = ROOT.parent / "ACORN_SVD_RESULTS_V4"
+# Reject older forks even in plan-only mode, without loading data or touching CUDA.
+engine = ROOT / "cebra" / "solver" / "spectral_gap.py"
+integration = ROOT / "cebra" / "integrations" / "sklearn" / "cebra.py"
+if not engine.is_file() or not integration.is_file() or not all(
+    key in engine.read_text(encoding="utf-8")
+    for key in ("certify_collapse", "adv_top_unit_energy", "adv_spectral_energy_match")
+) or "adv_spectral_energy_match" not in integration.read_text(encoding="utf-8"):
+    raise RuntimeError(f"This is not the updated V5 spectral fork: {ROOT}. "
+                       "Install the full updated Acorn-SVD/ before using this runner.")
+DEFAULT_OUTPUT = ROOT.parent / "ACORN_SVD_RESULTS_V5"
 DEFAULT_DATA = Path("/data/hossein/mm_project/perich_data_valid_final_raw/C-CO12.npz")
 
 EPSILON = 3.0  # Training budget (cap for the spectral arms); --train-epsilon overrides.
@@ -167,9 +156,14 @@ ARMS = {
     "svd_split_every": dict(adv_spectral_mode="split", adv_spectral_certify="every"),
     "svd_tangent_fixed": dict(adv_spectral_mode="tangent_fixed"),
     "svd_gap_budget": dict(adv_spectral_mode="gap_budget"),
+    "svd_cert_collapse": dict(adv_spectral_mode="subspace_cert", adv_spectral_certify="collapse"),
+    # Same per-window energy as the spectral arm, unrestricted direction.
+    "pgd_match_split": dict(adv_spectral_mode="split", adv_spectral_energy_match=True),
+    "pgd_match_radial": dict(adv_spectral_mode="subspace_cert", adv_spectral_certify="radial",
+                             adv_spectral_energy_match=True),
 }
-DEFAULT_ARMS = ("clean", "pgd", "svd_subspace_cert", "svd_cert_every", "svd_tangent", "svd_split",
-                "svd_split_half")
+DEFAULT_ARMS = ("clean", "pgd", "svd_cert_radial", "svd_cert_collapse", "svd_split",
+                "pgd_match_split", "pgd_match_radial")
 
 
 def seed_all(seed: int) -> None:
@@ -196,7 +190,7 @@ def load_fork():
         raise RuntimeError(f"Incorrect CEBRA package imported: {cebra.__file__}")
     params = inspect.signature(cebra.CEBRA.__init__).parameters
     required = {"adv_spectral_mode", "adv_spectral_gamma", "adv_diagnostics_every",
-                "adv_spectral_certify", "adv_spectral_split_complement"}
+                "adv_spectral_certify", "adv_spectral_energy_match"}
     missing = required - params.keys()
     if missing:
         raise RuntimeError(f"Acorn-SVD fork lacks expected parameters: {sorted(missing)}")
@@ -408,8 +402,13 @@ def attack_eval_configs(spectral_gap, epsilon=EVAL_EPSILON, steps=EVAL_STEPS):
 
 
 def robustness(cebra, encoder, decoder, x_valid, y_valid, z_valid, epsilon=EVAL_EPSILON,
-               steps=EVAL_STEPS, restarts=EVAL_RESTARTS):
-    """Validation R2 of the frozen encoder + decoder under held-out attacks."""
+               steps=EVAL_STEPS, restarts=EVAL_RESTARTS, radii=()):
+    """Validation R2 of the frozen encoder + decoder under held-out attacks.
+
+    ``radii`` holds ``(label, radius)`` pairs at which plain PGD is also run
+    (``r2_pgd_eps<label>``); each attack restarts from the same seed, so extra
+    radii do not change the other results.
+    """
     spectral_gap = cebra.solver.spectral_gap
     model = encoder.solver_.model
     device = next(model.parameters()).device
@@ -426,6 +425,9 @@ def robustness(cebra, encoder, decoder, x_valid, y_valid, z_valid, epsilon=EVAL_
 
     out = {"window_mismatch": mismatch, "num_windows": int(len(windows))}
     configs = attack_eval_configs(spectral_gap, epsilon, steps)
+    for label, radius in radii:
+        configs[f"pgd_eps{label}"] = spectral_gap.AttackConfig(
+            mode="none", epsilon=radius, alpha=2.5 * radius / steps, steps=steps, norm="l2")
     for name, config in [("clean", None)] + list(configs.items()):
         seed_all(EVAL_SEED)
         preds, budgets = [], []
@@ -471,7 +473,8 @@ def attack_statistics(solver) -> dict:
     for key in ("adv_loss", "adv_delta_norm", "adv_delta_norm_p10", "adv_delta_norm_p50",
                 "adv_delta_norm_p90", "adv_eps_mean", "adv_eps_min", "adv_gap_limited",
                 "adv_k_mean", "adv_gap_mean", "adv_tangent_norm", "adv_complement_norm",
-                "adv_tangent_eps_mean", "adv_cert_active", "adv_cert_retained"):
+                "adv_tangent_eps_mean", "adv_cert_active", "adv_cert_retained",
+                "adv_cert_weyl_gain", "adv_top_unit_energy", "adv_top_unit_signal"):
         if log.get(key):
             stats[f"train_{key}"] = float(np.mean(log[key]))
     diagnostics = log.get("adv_diagnostics", [])
@@ -563,11 +566,12 @@ def run_model(cebra, arm, seed, arrays, iterations, eval_attack, epsilon=EPSILON
             row.update(robustness(cebra, encoder, decoder, x_valid, y_valid, z_valid,
                                   **(evaluation or {})))
             row["eval_attack_seconds"] = float(time.perf_counter() - eval_start)
+            curve = "".join(f" | PGD@{key[10:]} = {row[key]:.4f}" for key in radius_columns([row]))
             print(f"[ROBUST] {arm} seed={seed}: R2 clean windows = {row['r2_clean']:.4f} | "
                   f"PGD = {row['r2_pgd']:.4f} | SVD-gap = {row['r2_svd_gap']:.4f} | "
                   f"SVD-tangent = {row['r2_svd_tangent']:.4f} | complement = "
-                  f"{row['r2_complement']:.4f} | tangent (eps) = {row['r2_tangent_fixed']:.4f}",
-                  flush=True)
+                  f"{row['r2_complement']:.4f} | tangent (eps) = {row['r2_tangent_fixed']:.4f}"
+                  f"{curve}", flush=True)
         row["total_seconds"] = float(time.perf_counter() - arm_start)
         return row
     finally:
@@ -583,8 +587,10 @@ SCALAR_COLUMNS = (
     "eval_eps_svd_gap_mean", "r2_svd_tangent", "r2_complement", "r2_tangent_fixed",
     "r2_poisson", "r2_dropout10", "r2_dropout30", "r2_gain30", "r2_nested5", "r2_nested10",
     "r2_nested20", "r2_nested30", "r2_nested40", "r2_nested50", "r2_droptop20", "r2_dropvar20",
-    "r2_dropimp20", "unit_importance_top_share", "train_adv_eps_mean", "train_adv_gap_limited", "train_adv_cert_active",
-    "train_adv_cert_retained", "train_adv_k_mean", "train_adv_delta_norm",
+    "r2_dropimp20", "unit_importance_top_share", "train_adv_eps_mean", "train_adv_gap_limited",
+    "train_adv_cert_active", "train_adv_cert_retained", "train_adv_cert_weyl_gain",
+    "train_adv_top_unit_energy", "train_adv_top_unit_signal", "train_adv_k_mean",
+    "train_adv_delta_norm",
     "train_adv_delta_norm_p10", "train_adv_delta_norm_p90", "train_adv_loss",
     "train_adv_tangent_norm", "train_adv_complement_norm", "diag_sv_err_max",
     "diag_left_subspace_err_max", "diag_right_subspace_err_max", "diag_spectral_drift_mean",
@@ -593,6 +599,12 @@ SCALAR_COLUMNS = (
     "diag_tangent_chance_fraction", "seconds_per_iteration", "encoder_seconds",
     "decoder_seconds", "total_seconds",
 )
+
+
+def radius_columns(results: list) -> list:
+    """Names of the PGD results at the extra evaluation radii (--eval-radii)."""
+    return sorted({key for row in results for key in row
+                   if key.startswith("r2_pgd_eps") and not key.endswith("_per_label")})
 
 
 def save_results(out: Path, results: list):
@@ -604,10 +616,10 @@ def save_results(out: Path, results: list):
     csv_path, temp_csv = out / "results_so_far.csv", out / ".results_so_far.csv.tmp"
     with temp_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(list(SCALAR_COLUMNS) + [f"r2_label_{i}" for i in range(num_labels)])
+        columns = list(SCALAR_COLUMNS) + radius_columns(results)
+        writer.writerow(columns + [f"r2_label_{i}" for i in range(num_labels)])
         for row in results:
-            writer.writerow([row.get(key, "") for key in SCALAR_COLUMNS] +
-                            row["valid_r2_per_label"])
+            writer.writerow([row.get(key, "") for key in columns] + row["valid_r2_per_label"])
     os.replace(temp_csv, csv_path)
 
 
@@ -626,7 +638,11 @@ def summarize(results: list) -> list:
         for key in ("valid_mean_r2", "r2_pgd", "r2_svd_gap", "r2_svd_tangent", "r2_complement",
                     "r2_tangent_fixed", "r2_poisson", "r2_dropout30", "r2_nested30",
                     "r2_nested50", "r2_droptop20", "r2_dropimp20", "r2_gain30",
-                    "train_adv_delta_norm", "train_adv_cert_active", "seconds_per_iteration"):
+                    "train_adv_delta_norm", "train_adv_cert_active", "train_adv_cert_retained",
+                    "train_adv_cert_weyl_gain", "train_adv_top_unit_energy",
+                    "train_adv_top_unit_signal", "r2_dropvar20",
+                    "seconds_per_iteration",
+                    *radius_columns(rows)):
             values = [row[key] for row in rows if key in row]
             if values:
                 entry[f"{key}_mean"] = float(np.mean(values))
@@ -706,6 +722,12 @@ def _worker_main(run_dir: Path, task_index: int, cpu_threads: int) -> int:
     meta = {"epsilon_nominal": task["nominal"], "epsilon_unit": cfg["epsilon_unit"],
             "window_norm_median": cfg["window_norm_median"],
             "eval_epsilon": cfg["evaluation"]["epsilon"]}
+    # Validate fork and runner fingerprints again inside each isolated process.
+    for rel, expected_hash in cfg["fork_sha256"].items():
+        if hashlib.sha256((ROOT / rel).read_bytes()).hexdigest() != expected_hash:
+            raise RuntimeError(f"Fork file changed during experiment: {rel}")
+    if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != cfg["runner_sha256"]:
+        raise RuntimeError("Runner changed during experiment; refusing mixed-version results")
     row = run_model(cebra, task["arm"], task["seed"], arrays, cfg["iterations"],
                     not cfg["no_eval_attack"], task["epsilon"], cfg["spectral"],
                     cfg["evaluation"], meta)
@@ -791,40 +813,27 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     parser.add_argument("--arms", nargs="+", default=list(DEFAULT_ARMS), choices=list(ARMS))
     parser.add_argument("--iterations", type=int, default=MAX_ITER)
-    parser.add_argument("--train-epsilon", type=float, nargs="+", default=[EPSILON],
-                        help="Training budget(s) of the pgd/svd arms (step = budget/5); several "
-                             "values give a budget sweep.")
-    parser.add_argument("--eval-epsilon", type=float, default=EVAL_EPSILON,
-                        help="Radius of the held-out attacks (the same for every arm).")
+    parser.add_argument("--train-epsilon", type=float, nargs="+", default=[EPSILON])
+    parser.add_argument("--eval-epsilon", type=float, default=EVAL_EPSILON)
     parser.add_argument("--eval-steps", type=int, default=EVAL_STEPS)
-    parser.add_argument("--eval-restarts", type=int, default=EVAL_RESTARTS,
-                        help="Random restarts of each held-out attack; the worst is kept.")
-    parser.add_argument("--epsilon-unit", choices=("absolute", "window"), default="absolute",
-                        help="'window': --train-epsilon and --eval-epsilon are fractions of the "
-                             "median norm of centred training windows, comparable across sessions.")
-    parser.add_argument("--gamma", type=float, default=GAMMA,
-                        help="Training gap fraction; evaluation attacks keep gamma=0.9.")
+    parser.add_argument("--eval-restarts", type=int, default=EVAL_RESTARTS)
+    parser.add_argument("--eval-radii", type=float, nargs="*", default=[],
+                        help="Additional PGD robustness radii, e.g. --eval-radii 1 6; main radius 3 by default")
+    parser.add_argument("--epsilon-unit", choices=("absolute", "window"), default="absolute")
+    parser.add_argument("--gamma", type=float, default=GAMMA)
     parser.add_argument("--k-min", type=int, default=K_MIN)
     parser.add_argument("--k-max", type=int, default=K_MAX)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT,
-                        help="Results directory (default: sibling ACORN_SVD_RESULTS_V4; "
-                             "old results are never overwritten).")
-    parser.add_argument("--plan-only", action="store_true",
-                        help="List every planned training job and exit; no model imports, "
-                             "data access, or GPU usage.")
-    parser.add_argument("--no-eval-attack", action="store_true",
-                        help="Skip the held-out attacked-R2 evaluation.")
-    parser.add_argument("--scale-only", action="store_true",
-                        help="Print the window norm, both budget units and the spectral gaps, "
-                             "then exit without training.")
+                        help="Persistent V5 output root; distinct from 72-run V4 results")
+    parser.add_argument("--run-dir", type=Path, help="Fixed subfolder of --out, for resumable experiments")
+    parser.add_argument("--resume", action="store_true", help="Skip fully committed tasks after preemption")
     parser.add_argument("--gpu-workers", type=int, default=1,
-                        help="Number of GPU processes, one independently trained model per GPU (default 1).")
+                        help="Number of independent GPU subprocesses (request same count in RunAI)")
     parser.add_argument("--cpu-threads", type=int, default=8,
-                        help="CPU threads allocated to each GPU worker (default 8).")
-    parser.add_argument("--run-dir", type=Path,
-                        help="Fixed experiment directory under --out; required for resuming a stopped job.")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume a --run-dir by skipping previously committed per-arm results.")
+                        help="CPU threads for each GPU subprocess")
+    parser.add_argument("--plan-only", action="store_true", help="Show plan; NO data, GPU or fork import")
+    parser.add_argument("--scale-only", action="store_true", help="Show dataset/window scale; NO training")
+    parser.add_argument("--no-eval-attack", action="store_true")
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_task-index", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--_run-dir", type=Path, help=argparse.SUPPRESS)
@@ -833,54 +842,52 @@ def main():
         if args._run_dir is None or args._task_index < 1:
             parser.error("Internal worker requires --_run-dir and --_task-index")
         return _worker_main(args._run_dir, args._task_index, args.cpu_threads)
+
     if args.gpu_workers < 1 or args.cpu_threads < 1:
         parser.error("--gpu-workers and --cpu-threads must be >= 1")
     if args.resume and args.run_dir is None:
-        parser.error("--resume requires a fixed --run-dir")
-
-    # Fail fast on configuration mistakes before importing the model or using GPU.
+        parser.error("--resume requires --run-dir")
     if args.iterations < 1 or args.eval_steps < 1 or args.eval_restarts < 1:
-        parser.error("--iterations, --eval-steps and --eval-restarts must be >= 1")
+        parser.error("iterations, eval-steps and eval-restarts must be positive")
     if not args.train_epsilon or any(not np.isfinite(v) or v <= 0 for v in args.train_epsilon):
-        parser.error("--train-epsilon must contain positive finite values")
+        parser.error("train-epsilon must contain positive finite numbers")
     if not np.isfinite(args.eval_epsilon) or args.eval_epsilon <= 0:
-        parser.error("--eval-epsilon must be a positive finite value")
-    if not np.isfinite(args.gamma) or not 0 < args.gamma < 1:
-        parser.error("--gamma must be between 0 and 1")
+        parser.error("eval-epsilon must be positive and finite")
+    if (any(not np.isfinite(v) or v <= 0 for v in args.eval_radii)
+            or len(set(args.eval_radii)) != len(args.eval_radii)
+            or args.eval_epsilon in args.eval_radii):
+        parser.error("eval-radii must be distinct positive finite radii, not repeating eval-epsilon")
+    if not 0 < args.gamma < 1:
+        parser.error("Require 0 < gamma < 1")
     if args.k_min < 1 or args.k_max < args.k_min:
-        parser.error("Require 1 <= --k-min <= --k-max")
-    if len(set(args.seeds)) != len(args.seeds):
-        parser.error("--seeds contains duplicates")
-    if len(set(args.arms)) != len(args.arms):
-        parser.error("--arms contains duplicates")
-    if len(set(args.train_epsilon)) != len(args.train_epsilon):
-        parser.error("--train-epsilon contains duplicates")
+        parser.error("Require 1 <= k-min <= k-max")
+    for name, values in (("seeds", args.seeds), ("arms", args.arms),
+                         ("train-epsilon", args.train_epsilon)):
+        if len(values) != len(set(values)):
+            parser.error(f"Duplicate values in --{name}")
 
-    # List exactly the work the user requested; one dataset per invocation.
+    # Exactly one session for each invocation. Clean is not repeated for the second epsilon.
     planned_jobs = [(seed, nominal, arm)
                     for seed in args.seeds
                     for i, nominal in enumerate(args.train_epsilon)
                     for arm in args.arms
                     if i == 0 or arm not in ("clean", "svd_gap_uncapped")]
-    print(f"[PLAN] V4 fork: {ROOT}", flush=True)
+    print(f"[PLAN] V5 fork: {ROOT}", flush=True)
     print(f"[PLAN] Dataset: {args.data} | output root: {args.out}", flush=True)
     print(f"[PLAN] GPU workers: {args.gpu_workers} (one independent encoder per GPU)", flush=True)
-    print(f"[PLAN] {len(planned_jobs)} encoder training jobs; "
-          f"{len(args.seeds)} seeds x arms={args.arms} x "
-          f"train epsilons={args.train_epsilon} ({args.epsilon_unit})", flush=True)
+    print(f"[PLAN] {len(planned_jobs)} encoder training jobs; {len(args.seeds)} seeds x "
+          f"arms={args.arms} x train epsilons={args.train_epsilon} ({args.epsilon_unit})", flush=True)
     for index, (seed, nominal, arm) in enumerate(planned_jobs, 1):
-        print(f"[PLAN] {index:>3}/{len(planned_jobs)}  "
-              f"seed={seed}  arm={arm}  train_epsilon={nominal:g} {args.epsilon_unit}",
-              flush=True)
+        print(f"[PLAN] {index:>3}/{len(planned_jobs)} seed={seed} arm={arm} "
+              f"train_epsilon={nominal:g} {args.epsilon_unit}", flush=True)
     if args.epsilon_unit == "window":
-        print("[WARNING] --epsilon-unit window treats 1.0 as ONE ENTIRE median centred "
-              "window Frobenius norm; 3.0 = THREE times that norm, not 3%.", flush=True)
+        print("[WARNING] window epsilon=3 is 3x the median window norm, NOT absolute epsilon 3.", flush=True)
     if args.plan_only:
         print("[PLAN ONLY] No data loaded; no training or evaluation performed.", flush=True)
-        return
+        return 0
     if not args.scale_only:
-        tokens = _gpu_tokens(args.gpu_workers)  # Fail BEFORE creating an experiment directory.
-        print(f"[GPU PREFLIGHT] {args.gpu_workers} GPUs available: {tokens}", flush=True)
+        tokens = _gpu_tokens(args.gpu_workers)
+        print(f"[GPU PREFLIGHT] {len(tokens)} GPUs available: {tokens}", flush=True)
 
     spectral = dict(gamma=args.gamma, k_min=args.k_min, k_max=args.k_max)
     cebra = load_fork()
@@ -893,72 +900,76 @@ def main():
     gaps = window_gaps(cebra.solver.spectral_gap, windows, **spectral)
     scale = norm if args.epsilon_unit == "window" else 1.0
     train_eps = [nominal * scale for nominal in args.train_epsilon]
+    unit = "w" if args.epsilon_unit == "window" else ""
     evaluation = dict(epsilon=args.eval_epsilon * scale, steps=args.eval_steps,
-                      restarts=args.eval_restarts)
+                      restarts=args.eval_restarts,
+                      radii=[[f"{radius:g}{unit}", radius * scale] for radius in args.eval_radii])
     print(f"[SCALE] median centred window norm = {norm:.3f} | training eps = "
           f"{[round(e, 4) for e in train_eps]} | evaluation eps = {evaluation['epsilon']:.4f} "
           f"({args.eval_steps} steps, {args.eval_restarts} restart(s))", flush=True)
-    fractions = [float(f"{e / norm:.4g}") for e in train_eps]
-    print(f"[SCALE] as window fractions: training eps = {fractions} | evaluation eps = "
-          f"{evaluation['epsilon'] / norm:.4g}", flush=True)
-    print(f"[SCALE] gap g_k (k in [{args.k_min}, {args.k_max}]) p10/p50/p90 = "
-          f"{gaps['gap_p10']:.3f} / {gaps['gap_p50']:.3f} / {gaps['gap_p90']:.3f} | median k = "
-          f"{gaps['k_median']:g} | gamma * median gap = {args.gamma * gaps['gap_p50']:.3f}",
+    print(f"[SCALE] extra PGD evaluation radii = "
+          f"{[round(r, 4) for _, r in evaluation['radii']]}", flush=True)
+    print(f"[SCALE] as window fractions: training eps = {[round(e/norm,5) for e in train_eps]} "
+          f"| evaluation eps = {evaluation['epsilon'] / norm:.5f}", flush=True)
+    print(f"[SCALE] gap g_k p10/p50/p90 = {gaps['gap_p10']:.3f} / "
+          f"{gaps['gap_p50']:.3f} / {gaps['gap_p90']:.3f} | k median = {gaps['k_median']:g}",
           flush=True)
     if args.scale_only:
-        return
+        return 0
 
-    # A fixed --run-dir makes preemption-resume exact, with plan/config validation.
     args.out.mkdir(parents=True, exist_ok=True)
     if args.run_dir is not None:
         out = args.run_dir.resolve()
         if not out.is_relative_to(args.out.resolve()):
-            raise RuntimeError("--run-dir MUST be under --out to avoid overwriting unrelated files")
+            raise RuntimeError("--run-dir MUST be a subdirectory of --out")
         if args.resume:
             if not (out / "run_config.json").is_file():
-                raise FileNotFoundError(f"No prior run_config.json to resume in {out}")
+                raise FileNotFoundError(f"Cannot resume missing run: {out}")
         else:
-            out.mkdir(parents=True, exist_ok=False)  # Never overwrite even an empty directory.
+            out.mkdir(parents=True, exist_ok=False)  # cannot overwrite results
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out = Path(tempfile.mkdtemp(prefix=f"{args.data.stem}_{stamp}_", dir=args.out))
     print(f"[START] Experiment: {args.data.stem} | output: {out}", flush=True)
 
     config = {
-        "data_path": str(args.data), "fork": str(ROOT), "cebra_import": str(cebra.__file__),
-        "runner_file": str(Path(__file__).resolve()), "runner_version": "v4-multigpu-independent-v1",
+        "data_path": str(args.data.resolve()), "fork": str(ROOT.resolve()),
+        "cebra_import": str(Path(cebra.__file__).resolve()),
+        "runner_file": str(Path(__file__).resolve()),
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "runner_version": "v5-multigpu-independent-v1",
         "planned_jobs": len(planned_jobs),
-        "tasks": [{"seed": int(seed), "nominal": float(nominal), "epsilon": float(nominal * scale),
-                   "arm": arm} for seed, nominal, arm in planned_jobs],
+        "tasks": [{"seed": int(seed), "nominal": float(nominal),
+                   "epsilon": float(nominal * scale), "arm": arm}
+                  for seed, nominal, arm in planned_jobs],
         "no_eval_attack": bool(args.no_eval_attack), "spectral": spectral,
         "fork_sha256": {rel: hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
-                          for rel in ("cebra/solver/spectral_gap.py", "cebra/integrations/sklearn/cebra.py")},
+                        for rel in ("cebra/solver/spectral_gap.py", "cebra/integrations/sklearn/cebra.py")},
         "arms": args.arms, "seeds": args.seeds, "iterations": args.iterations,
         "window_norm_median": norm, "window_gap": gaps, "epsilon_unit": args.epsilon_unit,
         "evaluation": evaluation,
         "encoder_configs": {f"{arm}@{nominal:g}": encoder_config(arm, args.iterations, eps,
-                                                                 spectral["gamma"],
-                                                                 spectral["k_min"],
+                                                                 spectral["gamma"], spectral["k_min"],
                                                                  spectral["k_max"])
                             for nominal, eps in zip(args.train_epsilon, train_eps)
                             for arm in args.arms},
         "decoder": {"architecture": "Linear -> LayerNorm -> ReLU -> Dropout -> Linear",
-                    "epochs": MLP_EPOCHS, "hidden": MLP_HIDDEN, "dropout": MLP_DROP,
-                    "learning_rate": MLP_LR},
+                    "epochs": MLP_EPOCHS, "hidden": MLP_HIDDEN,
+                    "dropout": MLP_DROP, "learning_rate": MLP_LR},
         "eval_attack": None if args.no_eval_attack else {
             name: vars(c) for name, c in attack_eval_configs(
                 cebra.solver.spectral_gap, evaluation["epsilon"], args.eval_steps).items()},
         "shapes": {"x_train": arrays[0].shape, "x_valid": arrays[1].shape,
                    "y_train": arrays[2].shape, "y_valid": arrays[3].shape},
     }
-    config = json.loads(json.dumps(config))  # Normalize tuples to JSON arrays for exact resume checks.
+    config = json.loads(json.dumps(config))
     config_path = out / "run_config.json"
     if args.resume:
         previous = json.loads(config_path.read_text(encoding="utf-8"))
         if previous != config:
-            raise RuntimeError("Resume configuration differs from original (data, engine, "
-                               "arms, budget or evaluation changed). Use a NEW --run-dir.")
-        print(f"[RESUME] Verified the original plan and engine fingerprint: {out}", flush=True)
+            raise RuntimeError("Resume configuration differs: fork, runner, dataset, tasks, "
+                               "or evaluation changed. Use a NEW --run-dir.")
+        print(f"[RESUME] Matched original plan, fork fingerprint and runner SHA: {out}", flush=True)
     else:
         _atomic_json(config_path, config)
     for folder in ("jobs", "logs"):
@@ -967,24 +978,24 @@ def main():
     failure_count = _parallel_execute(out, config["tasks"], args.gpu_workers, args.cpu_threads)
     results, missing = _read_finished(out, config["tasks"])
     if missing or failure_count:
-        print(f"[PARTIAL] {len(results)}/{len(config['tasks'])} saved; "
-              f"{len(missing)} incomplete, {failure_count} failed. Resume with --run-dir "
-              f"{out} --resume; see {out / 'logs'}", flush=True)
-        raise RuntimeError("Not all GPU workers completed; persistent results are intact")
-    # No results overwrite: --resume sees the existing final files and leaves them as-is.
+        print(f"[PARTIAL] {len(results)}/{len(config['tasks'])} saved, "
+              f"{len(missing)} incomplete and {failure_count} failed. Resume with --run-dir "
+              f"{out} --resume; inspect {out / 'logs'}", flush=True)
+        raise RuntimeError("Some independent GPU workers failed")
     if not (out / "results.json").is_file():
         os.replace(out / "results_so_far.csv", out / "results.csv")
         os.replace(out / "results_so_far.json", out / "results.json")
     summary = summarize(results)
-    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _atomic_json(out / "summary.json", summary)
     print("\n" + "=" * 75, flush=True)
     print("SUMMARY (mean ± std over seeds)", flush=True)
     for entry in summary:
-        text = " | ".join(
+        msg = " | ".join(
             f"{key[:-5]}={entry[key]:.4f}±{entry[key[:-5] + '_std']:.4f}"
             for key in entry if key.endswith("_mean"))
-        print(f"{entry['model']:22s} n={entry['num_seeds']} | {text}", flush=True)
+        print(f"{entry['model']:22s} n={entry['num_seeds']} | {msg}", flush=True)
     print(f"[COMPLETE] Results saved in: {out}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
