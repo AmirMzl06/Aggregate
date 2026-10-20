@@ -27,6 +27,10 @@ Arms (--arms):
     svd_gap_budget    Ablation: gap budget without the projection.
     pgd_match_split   Control: unrestricted PGD with svd_split's per-window perturbation norm.
     pgd_match_radial  Control: unrestricted PGD with svd_cert_radial's per-window norm.
+    pgd_gap_share     Model-independent PGD budgets proportional to per-window spectral gap.
+    pgd_norm_share    Matched-mean PGD budgets proportional to per-window Frobenius norm.
+    *_shuffle         Shuffle the corresponding per-window budgets across batch.
+    *_mean            Constant per-window budget equal to batch mean.
 
 For every (seed, arm) the runner:
     - fits the encoder and trains the same MLP decoder on clean train embeddings;
@@ -43,7 +47,7 @@ centred training windows, so that sessions are comparable. --scale-only prints
 that norm, the budgets in both units and the spectral gaps of the session, then
 exits without training. Results are saved after every arm in a new, unique run
 directory; no checkpoints are stored. Default output is a separate
-ACORN_SVD_RESULTS_V5/ directory alongside Acorn-SVD/.
+ACORN_SVD_RESULTS_V6/ directory alongside Acorn-SVD/.
 """
 
 import argparse
@@ -85,13 +89,16 @@ else:
 # Reject older forks even in plan-only mode, without loading data or touching CUDA.
 engine = ROOT / "cebra" / "solver" / "spectral_gap.py"
 integration = ROOT / "cebra" / "integrations" / "sklearn" / "cebra.py"
-if not engine.is_file() or not integration.is_file() or not all(
-    key in engine.read_text(encoding="utf-8")
-    for key in ("certify_collapse", "adv_top_unit_energy", "adv_spectral_energy_match")
-) or "adv_spectral_energy_match" not in integration.read_text(encoding="utf-8"):
-    raise RuntimeError(f"This is not the updated V5 spectral fork: {ROOT}. "
-                       "Install the full updated Acorn-SVD/ before using this runner.")
-DEFAULT_OUTPUT = ROOT.parent / "ACORN_SVD_RESULTS_V5"
+# Pin the supplied V6 engine exactly; fail fast even for --plan-only if a mixed fork is installed.
+EXPECTED_V6_SHA256 = {
+    "cebra/solver/spectral_gap.py": "8a8d44808f6231cfbc2cac70221e238f2a9456547d79e063f0404c8939634899",
+    "cebra/integrations/sklearn/cebra.py": "d15ecf8313a49038e1eba5f424768356ecbcacad995903fc87e965420f61c7b2",
+}
+for rel, expected in EXPECTED_V6_SHA256.items():
+    p = ROOT / rel
+    if not p.is_file() or hashlib.sha256(p.read_bytes()).hexdigest() != expected:
+        raise RuntimeError(f"This is not the supplied V6 spectral fork (bad SHA for {rel}): {ROOT}")
+DEFAULT_OUTPUT = ROOT.parent / "ACORN_SVD_RESULTS_V6"
 DEFAULT_DATA = Path("/data/hossein/mm_project/perich_data_valid_final_raw/C-CO12.npz")
 
 EPSILON = 3.0  # Training budget (cap for the spectral arms); --train-epsilon overrides.
@@ -161,9 +168,17 @@ ARMS = {
     "pgd_match_split": dict(adv_spectral_mode="split", adv_spectral_energy_match=True),
     "pgd_match_radial": dict(adv_spectral_mode="subspace_cert", adv_spectral_certify="radial",
                              adv_spectral_energy_match=True),
+    # Per-window budgets from the spectral gap; mean budget eps, as plain PGD.
+    "pgd_gap_share": dict(adv_spectral_mode="gap_share"),
+    "pgd_norm_share": dict(adv_spectral_mode="norm_share"),
 }
-DEFAULT_ARMS = ("clean", "pgd", "svd_cert_radial", "svd_cert_collapse", "svd_split",
-                "pgd_match_split", "pgd_match_radial")
+# Controls of the per-window budgets: the same budgets randomly permuted over the
+# windows of each batch ("shuffle") or all equal to the batch mean ("mean").
+for _arm in ("pgd_match_split", "pgd_match_radial", "pgd_gap_share", "pgd_norm_share"):
+    for _allocation in ("shuffle", "mean"):
+        ARMS[f"{_arm}_{_allocation}"] = dict(ARMS[_arm], adv_spectral_allocation=_allocation)
+DEFAULT_ARMS = ("pgd", "pgd_gap_share", "pgd_gap_share_shuffle", "pgd_norm_share",
+                "pgd_match_radial", "pgd_match_radial_shuffle", "pgd_match_radial_mean")
 
 
 def seed_all(seed: int) -> None:
@@ -190,7 +205,7 @@ def load_fork():
         raise RuntimeError(f"Incorrect CEBRA package imported: {cebra.__file__}")
     params = inspect.signature(cebra.CEBRA.__init__).parameters
     required = {"adv_spectral_mode", "adv_spectral_gamma", "adv_diagnostics_every",
-                "adv_spectral_certify", "adv_spectral_energy_match"}
+                "adv_spectral_certify", "adv_spectral_energy_match", "adv_spectral_allocation"}
     missing = required - params.keys()
     if missing:
         raise RuntimeError(f"Acorn-SVD fork lacks expected parameters: {sorted(missing)}")
@@ -471,7 +486,8 @@ def attack_statistics(solver) -> dict:
     log = solver.log
     stats = {}
     for key in ("adv_loss", "adv_delta_norm", "adv_delta_norm_p10", "adv_delta_norm_p50",
-                "adv_delta_norm_p90", "adv_eps_mean", "adv_eps_min", "adv_gap_limited",
+                "adv_delta_norm_p90", "adv_eps_mean", "adv_eps_min", "adv_eps_max",
+                "adv_gap_limited",
                 "adv_k_mean", "adv_gap_mean", "adv_tangent_norm", "adv_complement_norm",
                 "adv_tangent_eps_mean", "adv_cert_active", "adv_cert_retained",
                 "adv_cert_weyl_gain", "adv_top_unit_energy", "adv_top_unit_signal"):
@@ -481,7 +497,7 @@ def attack_statistics(solver) -> dict:
     for key in ("sv_err_max", "left_subspace_err_max", "right_subspace_err_max",
                 "spectral_drift_mean", "delta_over_gap_max", "gap_kept_min",
                 "collapse_fraction", "mode_exchange_fraction", "tangent_energy_fraction",
-                "tangent_chance_fraction"):
+                "tangent_chance_fraction", "norm_cv", "norm_gap_corr"):
         values = [d[key] for d in diagnostics if np.isfinite(d.get(key, np.nan))]
         if values:
             reduce = np.max if key.endswith("_max") else np.min if key.endswith("_min") else np.mean
@@ -591,12 +607,14 @@ SCALAR_COLUMNS = (
     "train_adv_cert_active", "train_adv_cert_retained", "train_adv_cert_weyl_gain",
     "train_adv_top_unit_energy", "train_adv_top_unit_signal", "train_adv_k_mean",
     "train_adv_delta_norm",
-    "train_adv_delta_norm_p10", "train_adv_delta_norm_p90", "train_adv_loss",
+    "train_adv_delta_norm_p10", "train_adv_delta_norm_p90", "train_adv_eps_max",
+    "train_adv_loss",
     "train_adv_tangent_norm", "train_adv_complement_norm", "diag_sv_err_max",
     "diag_left_subspace_err_max", "diag_right_subspace_err_max", "diag_spectral_drift_mean",
     "diag_delta_over_gap_max", "diag_gap_kept_min", "diag_collapse_fraction",
     "diag_mode_exchange_fraction", "diag_tangent_energy_fraction",
-    "diag_tangent_chance_fraction", "seconds_per_iteration", "encoder_seconds",
+    "diag_tangent_chance_fraction", "diag_norm_cv", "diag_norm_gap_corr",
+    "seconds_per_iteration", "encoder_seconds",
     "decoder_seconds", "total_seconds",
 )
 
@@ -638,11 +656,8 @@ def summarize(results: list) -> list:
         for key in ("valid_mean_r2", "r2_pgd", "r2_svd_gap", "r2_svd_tangent", "r2_complement",
                     "r2_tangent_fixed", "r2_poisson", "r2_dropout30", "r2_nested30",
                     "r2_nested50", "r2_droptop20", "r2_dropimp20", "r2_gain30",
-                    "train_adv_delta_norm", "train_adv_cert_active", "train_adv_cert_retained",
-                    "train_adv_cert_weyl_gain", "train_adv_top_unit_energy",
-                    "train_adv_top_unit_signal", "r2_dropvar20",
-                    "seconds_per_iteration",
-                    *radius_columns(rows)):
+                    "train_adv_delta_norm", "train_adv_cert_active", "diag_norm_gap_corr",
+                    "seconds_per_iteration", *radius_columns(rows)):
             values = [row[key] for row in rows if key in row]
             if values:
                 entry[f"{key}_mean"] = float(np.mean(values))
@@ -824,7 +839,7 @@ def main():
     parser.add_argument("--k-min", type=int, default=K_MIN)
     parser.add_argument("--k-max", type=int, default=K_MAX)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT,
-                        help="Persistent V5 output root; distinct from 72-run V4 results")
+                        help="Persistent V6 output root, separate from V4/V5")
     parser.add_argument("--run-dir", type=Path, help="Fixed subfolder of --out, for resumable experiments")
     parser.add_argument("--resume", action="store_true", help="Skip fully committed tasks after preemption")
     parser.add_argument("--gpu-workers", type=int, default=1,
@@ -872,7 +887,7 @@ def main():
                     for i, nominal in enumerate(args.train_epsilon)
                     for arm in args.arms
                     if i == 0 or arm not in ("clean", "svd_gap_uncapped")]
-    print(f"[PLAN] V5 fork: {ROOT}", flush=True)
+    print(f"[PLAN] V6 fork: {ROOT}", flush=True)
     print(f"[PLAN] Dataset: {args.data} | output root: {args.out}", flush=True)
     print(f"[PLAN] GPU workers: {args.gpu_workers} (one independent encoder per GPU)", flush=True)
     print(f"[PLAN] {len(planned_jobs)} encoder training jobs; {len(args.seeds)} seeds x "
@@ -937,14 +952,14 @@ def main():
         "cebra_import": str(Path(cebra.__file__).resolve()),
         "runner_file": str(Path(__file__).resolve()),
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "runner_version": "v5-multigpu-independent-v1",
+        "runner_version": "v6-multigpu-independent-v1",
         "planned_jobs": len(planned_jobs),
         "tasks": [{"seed": int(seed), "nominal": float(nominal),
                    "epsilon": float(nominal * scale), "arm": arm}
                   for seed, nominal, arm in planned_jobs],
         "no_eval_attack": bool(args.no_eval_attack), "spectral": spectral,
         "fork_sha256": {rel: hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
-                        for rel in ("cebra/solver/spectral_gap.py", "cebra/integrations/sklearn/cebra.py")},
+                        for rel in ("cebra/solver/spectral_gap.py", "cebra/integrations/sklearn/cebra.py", "cebra/solver/base.py")},
         "arms": args.arms, "seeds": args.seeds, "iterations": args.iterations,
         "window_norm_median": norm, "window_gap": gaps, "epsilon_unit": args.epsilon_unit,
         "evaluation": evaluation,
