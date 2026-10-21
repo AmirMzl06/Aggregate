@@ -1,12 +1,7 @@
 """C-CO12: clean vs PGD vs spectral-gap adversarial CEBRA (Acorn-SVD fork).
 
-Place this runner NEXT TO the Acorn-SVD/ directory:
-    Aggregate/run_acorn_svd.py
-    Aggregate/Acorn-SVD/cebra/
-Run from anywhere, e.g. python -u run_acorn_svd.py --data /path/to/C-CO12.npz
-
-Multi-GPU: --gpu-workers N assigns one independent experiment per GPU.
-Plan safely with --plan-only. --run-dir + --resume preserve completed runs.
+Place run_acorn_svd.py BESIDE Acorn-SVD/ (or run it inside the fork):
+    python -u run_acorn_svd.py --data /path/to/C-CO12.npz
 
 Arms (--arms):
     clean             CEBRA without adversarial updates.
@@ -25,12 +20,15 @@ Arms (--arms):
     svd_split_every   svd_split, jointly certified after every PGD step.
     svd_tangent_fixed Ablation: tangent projection with the fixed budget eps.
     svd_gap_budget    Ablation: gap budget without the projection.
-    pgd_match_split   Control: unrestricted PGD with svd_split's per-window perturbation norm.
-    pgd_match_radial  Control: unrestricted PGD with svd_cert_radial's per-window norm.
-    pgd_gap_share     Model-independent PGD budgets proportional to per-window spectral gap.
-    pgd_norm_share    Matched-mean PGD budgets proportional to per-window Frobenius norm.
-    *_shuffle         Shuffle the corresponding per-window budgets across batch.
-    *_mean            Constant per-window budget equal to batch mean.
+    pgd_match_split   Unrestricted PGD with svd_split's per-window perturbation norm.
+    pgd_match_radial  Unrestricted PGD with svd_cert_radial's per-window norm.
+    pgd_gap_share     Unrestricted PGD, per-window budget eps * gap_i / mean(gap): every window
+                      at the same fraction of its collapse radius, mean budget eps.
+    pgd_norm_share    Control: the same with the centred window norm instead of the gap.
+    pgd_cert          PGD at eps, scaled along its direction to a verified no-collapse radius.
+    svd_tangent_cert  Tangent PGD at eps, scaled the same way (larger than svd_tangent's budget).
+    *_shuffle, *_mean Controls of the per-window budgets above: the same budgets randomly
+                      permuted over the batch, or all set to the batch mean.
 
 For every (seed, arm) the runner:
     - fits the encoder and trains the same MLP decoder on clean train embeddings;
@@ -40,14 +38,18 @@ For every (seed, arm) the runner:
       radius; --eval-epsilon, --eval-steps, --eval-restarts; plain PGD also at the
       radii of --eval-radii);
     - reports R2 on corrupted recordings: Poisson resampling, gain drift, random and
-      nested 5-50% unit loss, and loss of the 20% most active, variable or important units.
+      nested 5-50% unit loss, and loss of the 20% most active, variable or important units;
+    - measures where the decoder is sensitive: the share of its input-gradient energy in
+      the tangent space of each window's dominant structure, along per-neuron means, and
+      over units.
 
 --epsilon-unit window expresses all budgets as fractions of the median norm of
 centred training windows, so that sessions are comparable. --scale-only prints
 that norm, the budgets in both units and the spectral gaps of the session, then
-exits without training. Results are saved after every arm in a new, unique run
-directory; no checkpoints are stored. Default output is a separate
-ACORN_SVD_RESULTS_V6/ directory alongside Acorn-SVD/.
+exits without training. Results are saved after each completed GPU task in independent JSON files;
+--run-dir and --resume skip committed tasks; no model checkpoints are stored.
+--gpu-workers 4 runs four separate models in parallel (one CUDA device each).
+--plan-only prints every task without loading data, model or GPU.
 """
 
 import argparse
@@ -76,29 +78,19 @@ from torch import nn
 sys.dont_write_bytecode = True
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# User-required original layout, with a secondary standalone fork option for tests.
 if (SCRIPT_DIR / "Acorn-SVD" / "cebra" / "__init__.py").is_file():
     ROOT = SCRIPT_DIR / "Acorn-SVD"
 elif (SCRIPT_DIR / "cebra" / "__init__.py").is_file():
     ROOT = SCRIPT_DIR
 else:
-    raise FileNotFoundError(
-        "Expected Acorn-SVD/cebra/ alongside run_acorn_svd.py. "
-        f"Runner directory: {SCRIPT_DIR}"
-    )
-# Reject older forks even in plan-only mode, without loading data or touching CUDA.
-engine = ROOT / "cebra" / "solver" / "spectral_gap.py"
-integration = ROOT / "cebra" / "integrations" / "sklearn" / "cebra.py"
-# Pin the supplied V6 engine exactly; fail fast even for --plan-only if a mixed fork is installed.
-EXPECTED_V6_SHA256 = {
-    "cebra/solver/spectral_gap.py": "8a8d44808f6231cfbc2cac70221e238f2a9456547d79e063f0404c8939634899",
-    "cebra/integrations/sklearn/cebra.py": "d15ecf8313a49038e1eba5f424768356ecbcacad995903fc87e965420f61c7b2",
-}
-for rel, expected in EXPECTED_V6_SHA256.items():
-    p = ROOT / rel
-    if not p.is_file() or hashlib.sha256(p.read_bytes()).hexdigest() != expected:
-        raise RuntimeError(f"This is not the supplied V6 spectral fork (bad SHA for {rel}): {ROOT}")
-DEFAULT_OUTPUT = ROOT.parent / "ACORN_SVD_RESULTS_V6"
+    raise FileNotFoundError("Expected Acorn-SVD/cebra/ next to run_acorn_svd.py")
+# Pin the supplied V7 engine, including core solver; reject mixed old/new forks.
+EXPECTED_V7_SHA256 = {'cebra/solver/spectral_gap.py': '9b6c79d2d2379e16ce43a63bd81ffb668a110d6c12e034fcbdbdb4b187189546', 'cebra/integrations/sklearn/cebra.py': 'eca3ac772e3622678eefc4d8eee5c277bd7a35e614acf5e43a6f0ddd78049ebe', 'cebra/solver/base.py': '1794228c2d2784ab7c43df08650b7718be39469187c6cead03f7edc35eff4bf8'}
+for _rel, _expected in EXPECTED_V7_SHA256.items():
+    _path = ROOT / _rel
+    if not _path.is_file() or hashlib.sha256(_path.read_bytes()).hexdigest() != _expected:
+        raise RuntimeError(f"V7 fork fingerprint mismatch: {_rel} under {ROOT}")
+DEFAULT_OUTPUT = ROOT.parent / "ACORN_SVD_RESULTS_V7"
 DEFAULT_DATA = Path("/data/hossein/mm_project/perich_data_valid_final_raw/C-CO12.npz")
 
 EPSILON = 3.0  # Training budget (cap for the spectral arms); --train-epsilon overrides.
@@ -171,14 +163,17 @@ ARMS = {
     # Per-window budgets from the spectral gap; mean budget eps, as plain PGD.
     "pgd_gap_share": dict(adv_spectral_mode="gap_share"),
     "pgd_norm_share": dict(adv_spectral_mode="norm_share"),
+    # eps grows along the attack direction until the dominant structure would collapse.
+    "pgd_cert": dict(adv_spectral_mode="pgd_cert"),
+    "svd_tangent_cert": dict(adv_spectral_mode="tangent_cert"),
 }
 # Controls of the per-window budgets: the same budgets randomly permuted over the
 # windows of each batch ("shuffle") or all equal to the batch mean ("mean").
 for _arm in ("pgd_match_split", "pgd_match_radial", "pgd_gap_share", "pgd_norm_share"):
     for _allocation in ("shuffle", "mean"):
         ARMS[f"{_arm}_{_allocation}"] = dict(ARMS[_arm], adv_spectral_allocation=_allocation)
-DEFAULT_ARMS = ("pgd", "pgd_gap_share", "pgd_gap_share_shuffle", "pgd_norm_share",
-                "pgd_match_radial", "pgd_match_radial_shuffle", "pgd_match_radial_mean")
+DEFAULT_ARMS = ("clean", "pgd", "svd_cert_collapse", "svd_tangent", "svd_tangent_budget",
+                "svd_tangent_cert", "pgd_cert")
 
 
 def seed_all(seed: int) -> None:
@@ -204,8 +199,7 @@ def load_fork():
     if not Path(cebra.__file__).resolve().is_relative_to(ROOT):
         raise RuntimeError(f"Incorrect CEBRA package imported: {cebra.__file__}")
     params = inspect.signature(cebra.CEBRA.__init__).parameters
-    required = {"adv_spectral_mode", "adv_spectral_gamma", "adv_diagnostics_every",
-                "adv_spectral_certify", "adv_spectral_energy_match", "adv_spectral_allocation"}
+    required = {"adv_spectral_mode", "adv_spectral_gamma", "adv_diagnostics_every"}
     missing = required - params.keys()
     if missing:
         raise RuntimeError(f"Acorn-SVD fork lacks expected parameters: {sorted(missing)}")
@@ -481,6 +475,62 @@ def robustness(cebra, encoder, decoder, x_valid, y_valid, z_valid, epsilon=EVAL_
     return out
 
 
+def sensitivity_geometry(cebra, encoder, decoder, x_valid, y_valid):
+    """Where the frozen encoder + decoder are sensitive on the validation windows.
+
+    Uses the input gradient of every prediction, scaled by the SD of its label (the
+    scale of R2). Reports the share of the temporally centred sensitivity energy in
+    the tangent space of each window's dominant structure, with the share of a random
+    direction; the share along per-neuron mean shifts; the share of all sensitivity
+    on the 20% most sensitive units and on the 20% most active units; and the mean
+    sensitivity norm per window.
+    """
+    spectral_gap = cebra.solver.spectral_gap
+    model = encoder.solver_.model
+    device = next(model.parameters()).device
+    model.eval()
+    decoder.eval()
+    windows, _ = validation_windows(x_valid, y_valid, model.get_offset())
+    scale = torch.as_tensor(1 / np.clip(y_valid.std(axis=0), 1e-12, None), dtype=torch.float32,
+                            device=device)
+    config = spectral_gap.AttackConfig(epsilon=1.0, alpha=1.0, steps=1, norm="l2", mode="gap",
+                                       gamma=GAMMA, k_min=K_MIN, k_max=K_MAX, center=CENTER)
+    count = max(1, int(round(STRUCTURED_FRACTION * x_valid.shape[1])))
+    active = torch.as_tensor(x_valid.mean(axis=0)).topk(count).indices.to(device)
+    units = torch.zeros(x_valid.shape[1], dtype=torch.float64, device=device)
+    tangent, chance, mean, norm = [], [], [], []
+    for start in range(0, len(windows), EVAL_ATTACK_BATCH):
+        batch = windows[start:start + EVAL_ATTACK_BATCH].to(device).requires_grad_(True)
+        output = decoder(model(batch)) * scale
+        frame = spectral_gap.spectral_frame(batch.detach(), config)
+        total = centred_total = along = shift = 0
+        for label in range(output.shape[1]):
+            grad, = torch.autograd.grad(output[:, label].sum(), batch, retain_graph=True)
+            grad = grad.detach().to(frame.left.dtype)
+            centred = grad - grad.mean(dim=-1, keepdim=True)
+            total = total + grad.square().sum(dim=(1, 2))
+            centred_total = centred_total + centred.square().sum(dim=(1, 2))
+            along = along + spectral_gap.project_tangent(centred, frame).square().sum(dim=(1, 2))
+            shift = shift + (grad - centred).square().sum(dim=(1, 2))
+            units += grad.double().square().sum(dim=(0, 2))
+        valid = (frame.gap > 0) & (centred_total > 0)
+        neurons, time = batch.shape[-2:]
+        k = frame.k.to(frame.left.dtype)
+        tangent.append((along / centred_total.clamp_min(1e-30))[valid])
+        chance.append((k * (neurons + time - 1 - k) / (neurons * (time - 1)))[valid])
+        mean.append((shift / total.clamp_min(1e-30))[total > 0])
+        norm.append(total.sqrt())
+    units_total = units.sum().clamp_min(1e-300)
+    return {
+        "sens_tangent_fraction": float(torch.cat(tangent).mean()),
+        "sens_tangent_chance": float(torch.cat(chance).mean()),
+        "sens_mean_fraction": float(torch.cat(mean).mean()),
+        "sens_unit_top_share": float(units.sort(descending=True).values[:count].sum() / units_total),
+        "sens_active_share": float(units[active].sum() / units_total),
+        "sens_norm": float(torch.cat(norm).mean()),
+    }
+
+
 def attack_statistics(solver) -> dict:
     """Training-time attack statistics averaged over iterations."""
     log = solver.log
@@ -588,6 +638,11 @@ def run_model(cebra, arm, seed, arrays, iterations, eval_attack, epsilon=EPSILON
                   f"SVD-tangent = {row['r2_svd_tangent']:.4f} | complement = "
                   f"{row['r2_complement']:.4f} | tangent (eps) = {row['r2_tangent_fixed']:.4f}"
                   f"{curve}", flush=True)
+        row.update(sensitivity_geometry(cebra, encoder, decoder, x_valid, y_valid))
+        print(f"[SENSITIVITY] {arm} seed={seed}: tangent share = "
+              f"{row['sens_tangent_fraction']:.3f} (chance {row['sens_tangent_chance']:.3f}) | "
+              f"mean-shift share = {row['sens_mean_fraction']:.3f} | top-20% units = "
+              f"{row['sens_unit_top_share']:.3f}", flush=True)
         row["total_seconds"] = float(time.perf_counter() - arm_start)
         return row
     finally:
@@ -614,6 +669,8 @@ SCALAR_COLUMNS = (
     "diag_delta_over_gap_max", "diag_gap_kept_min", "diag_collapse_fraction",
     "diag_mode_exchange_fraction", "diag_tangent_energy_fraction",
     "diag_tangent_chance_fraction", "diag_norm_cv", "diag_norm_gap_corr",
+    "sens_tangent_fraction", "sens_tangent_chance", "sens_mean_fraction", "sens_unit_top_share",
+    "sens_active_share", "sens_norm",
     "seconds_per_iteration", "encoder_seconds",
     "decoder_seconds", "total_seconds",
 )
@@ -839,7 +896,7 @@ def main():
     parser.add_argument("--k-min", type=int, default=K_MIN)
     parser.add_argument("--k-max", type=int, default=K_MAX)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT,
-                        help="Persistent V6 output root, separate from V4/V5")
+                        help="Persistent V7 output root, separate from V4/V5/V6")
     parser.add_argument("--run-dir", type=Path, help="Fixed subfolder of --out, for resumable experiments")
     parser.add_argument("--resume", action="store_true", help="Skip fully committed tasks after preemption")
     parser.add_argument("--gpu-workers", type=int, default=1,
@@ -887,7 +944,7 @@ def main():
                     for i, nominal in enumerate(args.train_epsilon)
                     for arm in args.arms
                     if i == 0 or arm not in ("clean", "svd_gap_uncapped")]
-    print(f"[PLAN] V6 fork: {ROOT}", flush=True)
+    print(f"[PLAN] V7 fork: {ROOT}", flush=True)
     print(f"[PLAN] Dataset: {args.data} | output root: {args.out}", flush=True)
     print(f"[PLAN] GPU workers: {args.gpu_workers} (one independent encoder per GPU)", flush=True)
     print(f"[PLAN] {len(planned_jobs)} encoder training jobs; {len(args.seeds)} seeds x "
@@ -896,7 +953,7 @@ def main():
         print(f"[PLAN] {index:>3}/{len(planned_jobs)} seed={seed} arm={arm} "
               f"train_epsilon={nominal:g} {args.epsilon_unit}", flush=True)
     if args.epsilon_unit == "window":
-        print("[WARNING] window epsilon=3 is 3x the median window norm, NOT absolute epsilon 3.", flush=True)
+        print("[INFO] window epsilon fractions refer to the median centered window Frobenius norm.", flush=True)
     if args.plan_only:
         print("[PLAN ONLY] No data loaded; no training or evaluation performed.", flush=True)
         return 0
@@ -952,7 +1009,7 @@ def main():
         "cebra_import": str(Path(cebra.__file__).resolve()),
         "runner_file": str(Path(__file__).resolve()),
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "runner_version": "v6-multigpu-independent-v1",
+        "runner_version": "v7-multigpu-independent-v1",
         "planned_jobs": len(planned_jobs),
         "tasks": [{"seed": int(seed), "nominal": float(nominal),
                    "epsilon": float(nominal * scale), "arm": arm}
