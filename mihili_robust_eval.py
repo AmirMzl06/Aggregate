@@ -3,7 +3,8 @@
 Exp17/18 reported clean cross-day R² only. This script attacks every saved model end to end
 (encoder -> GRU decoder -> R²) with two per-bin threat models, the conventions used in training:
 
-* ``iso``:   ``||delta_t||_2 <= eps`` in every 50-ms bin (the geometry of standard PGD).
+* ``iso``:   ``||delta_t||_2 <= eps`` in every 50-ms bin (common EVALUATION geometry;
+               original trainer's PGD projection axis must be verified separately).
 * ``noise``: ``||Sigma^(-1/2) delta_t||_2 <= eps`` in every bin (the noise-aware geometry), with
   ``Sigma`` = Ledoit-Wolf covariance of Day-0 training bin differences ``x[t+1] - x[t]``, times
   ``--diff-scale`` (0.5: the covariance of the noise if it is white in time).
@@ -27,11 +28,11 @@ Server usage. SRC is the Exp17 runner source, the folder with ``models.py``, ``d
 ``utils/``.
 
     python mihili_robust_eval.py --inspect
-    python mihili_robust_eval.py --source-dir SRC --include 's42-(pgd|noise-0p1)$'     # pilot
+    python mihili_robust_eval_fixed.py --source-dir SRC --include 's42-(pgd-0p5|noise-0p1)$'  # pilot
     for i in 0 1 2 3; do
-        CUDA_VISIBLE_DEVICES=$i python mihili_robust_eval.py --source-dir SRC --shard $i/4 &
+        CUDA_VISIBLE_DEVICES=$i python mihili_robust_eval_fixed.py --source-dir SRC --shard $i/4 --no-auto-summarize &
     done; wait
-    python mihili_robust_eval.py --summarize
+    python mihili_robust_eval_fixed.py --summarize
 
 Exp18 (raw counts): add ``--no-zscore --runs-root <EXP18 runs> --out EXP18_ROBUST``.
 """
@@ -376,7 +377,17 @@ def reference_operators(day0, args, device):
             "condition": float(eig.max() / eig.min()), "zscore": not args.no_zscore}
     print(f"[sigma] {origin}: mean variance {info['mean_var']:.4f}, participation ratio "
           f"{info['participation']:.1f} of {info['dim']}, condition {info['condition']:.3g}")
-    np.save(args.out / "reference_sigma.npy", cov)
+    # One shared file may be written by several GPU workers: write completely, then atomically replace.
+    # No concurrent worker can observe a partially written reference_sigma.npy.
+    import tempfile
+    args.out.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=args.out, prefix="sigma-", suffix=".npy", delete=False) as tmp:
+        sigma_tmp = Path(tmp.name)
+        np.save(tmp, cov)
+    try:
+        os.replace(sigma_tmp, args.out / "reference_sigma.npy")
+    finally:
+        sigma_tmp.unlink(missing_ok=True)
     return {"iso": None, "noise": torch.as_tensor(root, dtype=torch.float32, device=device)}, info
 
 
@@ -416,20 +427,14 @@ def refit_decoder(src, model, info, day0, seed, args, device):
     kwargs = {"seed": seed, "use_val_checkpoint": not args.no_decoder_val,
               "adv_dec": not args.no_adv_dec, "adv_dec_eps": args.adv_dec_eps}
     fit = src.train_session_decoder
-    if fit is not None and set(kwargs) | {"big_dec"} <= set(inspect.signature(fit).parameters):
-        seed_all(seed)
-        return fit(model, info["key"], day0.train_x, day0.train_y, info["n_labels"], device,
-                   args.decoder_steps, big_dec=args.big_dec, **kwargs)
-    print("[decoder] train_session_decoder unavailable or different; using MonkeyDecoder.fit")
-    with torch.no_grad():
-        emb = model.transform(day0.train_x.to(device), info["key"]).float()
-    hp = ({"hidden": 1024, "layers": 5, "bidir": True} if args.big_dec
-          else {"hidden": 512, "layers": 2, "bidir": False})
+    required = set(kwargs) | {"big_dec"}
+    # Never silently switch to an unverified fallback training protocol.
+    if fit is None or not required <= set(inspect.signature(fit).parameters):
+        raise RuntimeError("Original embedding_decoder.train_session_decoder is unavailable or "
+                           "its signature differs. Stopping to avoid an incomparable decoder refit.")
     seed_all(seed)
-    decoder = src.Decoder(ceb_out=emb.shape[1], n_labels=info["n_labels"], dropout=0.4,
-                          n_train_steps=args.decoder_steps, device=device, verbose=False, **hp)
-    decoder.to(device).fit(emb, day0.train_y.to(device), **kwargs)
-    return decoder
+    return fit(model, info["key"], day0.train_x, day0.train_y, info["n_labels"], device,
+               args.decoder_steps, big_dec=args.big_dec, **kwargs)
 
 
 def get_decoder(src, model, ckpt, state, info, day0, run, args, device):
@@ -725,6 +730,18 @@ def evaluate_run(run, src, days, roots, sigma_info, args, device):
     rep = (f"(reported D0 {reported['D0']:.4f}, D1-{len(targets)} {reported['X']:.4f})"
            if reported and reported["D0"] is not None else "(no reported R² found)")
     print(f"[clean] {run.name}: D0 {clean['D0']:.4f}, D1-{len(targets)} {clean_x:.4f} {rep}")
+    # A newly fit decoder may be substantially different from the original.
+    # Reject the evaluation if clean R² cannot be reproduced within tolerance.
+    if reported:
+        gaps = {"D1-D10": abs(clean_x - reported["X"])}
+        if reported.get("D0") is not None:
+            gaps["D0"] = abs(clean["D0"] - reported["D0"])
+        if any((not math.isfinite(g)) or g > args.max_clean_gap for g in gaps.values()):
+            raise RuntimeError(
+                f"Clean-R2 mismatch for {run.name}: gaps={gaps}, "
+                f"tolerance={args.max_clean_gap}. Review original decoder/protocol; "
+                "do not interpret robustness results until this is resolved."
+            )
 
     result = {
         "name": run.name, "run_dir": str(run.dir), "arm": run.arm, "family": run.family,
@@ -965,7 +982,7 @@ def build_parser():
     p.add_argument("--source-dir", help="Exp17 runner source (models.py, data.py, utils/)")
     p.add_argument("--workdir", help="working directory for the data loader (default: --source-dir)")
     p.add_argument("--runs-root", nargs="+", default=list(DEFAULT_RUNS))
-    p.add_argument("--out", default="EXP17_ROBUST")
+    p.add_argument("--out", default="/data/hossein/mm_project/EXP17_ROBUST")
     p.add_argument("--data-dir", help="dataset root (default: utils.constants.DATA_DIR of the source)")
     p.add_argument("--dataset", default=DATASET)
     p.add_argument("--num-days", type=int)
@@ -996,6 +1013,9 @@ def build_parser():
     p.add_argument("--inspect", action="store_true", help="describe checkpoints and exit")
     p.add_argument("--inspect-limit", type=int, default=2)
     p.add_argument("--summarize", action="store_true", help="only aggregate existing results")
+    p.add_argument("--no-auto-summarize", action="store_true", help="skip summary writing inside parallel workers")
+    p.add_argument("--max-clean-gap", type=float, default=0.02,
+                   help="abort a model if its refit clean D0 or cross-day R2 differs more than this from training report")
     return p
 
 
@@ -1006,6 +1026,12 @@ def main(argv=None):
         if getattr(args, name):
             setattr(args, name, str(Path(getattr(args, name)).resolve()))
     args.grid = sorted(set(args.grid))
+    if not args.grid or args.grid[0] <= 0:
+        raise SystemExit("--grid must contain strictly positive budgets")
+    if args.steps < 1 or args.restarts < 0 or args.refine < 0 or args.random_draws < 0:
+        raise SystemExit("bad steps/restarts/refine/random-draws")
+    if args.max_clean_gap < 0:
+        raise SystemExit("--max-clean-gap must be non-negative")
     roots = [Path(r).resolve() for r in args.runs_root]
     if args.summarize:
         summarize(args.out, args.reference_arm)
@@ -1022,7 +1048,8 @@ def main(argv=None):
     todo = [r for r in runs[k::n] if args.overwrite or not (args.out / "runs" / f"{r.name}.json").exists()]
     print(f"[runs] {len(runs)} found, shard {k}/{n}: {len(todo)} to evaluate -> {args.out}")
     if not todo:
-        summarize(args.out, args.reference_arm)
+        if not args.no_auto_summarize:
+            summarize(args.out, args.reference_arm)
         return
     args.out.mkdir(parents=True, exist_ok=True)
     src = Source(args.source_dir, args.workdir)
@@ -1042,7 +1069,10 @@ def main(argv=None):
             (args.out / "failed" / f"{run.name}.txt").write_text(message)
     if failed:
         print(f"[runs] failed: {failed} (tracebacks in {args.out / 'failed'})")
-    summarize(args.out, args.reference_arm)
+    if not args.no_auto_summarize:
+        summarize(args.out, args.reference_arm)
+    if failed:
+        raise SystemExit(f"{len(failed)} model(s) failed. Check {args.out / 'failed'}")
 
 
 if __name__ == "__main__":
